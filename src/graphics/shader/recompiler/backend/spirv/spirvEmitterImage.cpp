@@ -713,8 +713,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			const auto coord = CoordF32(ctx, mem, *address, layout.coord,
 			                            dimension_info.coordinate_components, image.cube);
 			if (dimension == ImageDimension::Dim1D) {
-				if (dref || !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+				if (dref || HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 					ctx.Fail(inst, "has an unsupported 1D gather variant");
 					return;
