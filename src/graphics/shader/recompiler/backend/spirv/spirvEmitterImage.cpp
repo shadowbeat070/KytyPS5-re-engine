@@ -802,9 +802,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 		}
 		if (op == IR::ValueOpcode::ImageGatherRaw) {
 			if (dimension == ImageDimension::Dim1D) {
-				if (image.indirect_root == mem.resource || dref ||
-				    !HasFlag(mem, Decoder::ImageSampleFlagLevelZero) ||
-				    HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
+				if (dref || HasFlag(mem, Decoder::ImageSampleFlagOffset) ||
 				    HasFlag(mem, Decoder::ImageSampleFlagGatherHorizontal)) {
 					ctx.Fail(inst, "has an unsupported 1D gather variant");
 					return;
