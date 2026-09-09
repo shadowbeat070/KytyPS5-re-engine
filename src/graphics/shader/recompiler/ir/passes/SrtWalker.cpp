@@ -105,8 +105,12 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::ISub64:
 		case ValueOpcode::IMul32:
 		case ValueOpcode::IMul64:
-		case ValueOpcode::UMulHi:
 		case ValueOpcode::UMin32:
+		case ValueOpcode::SMulHi:
+		case ValueOpcode::UMulHi:
+		case ValueOpcode::SMin32:
+		case ValueOpcode::SMax32:
+		case ValueOpcode::UMax32:
 		case ValueOpcode::ShiftLeftLogical32:
 		case ValueOpcode::ShiftLeftLogical64:
 		case ValueOpcode::ShiftRightLogical32:
@@ -122,11 +126,20 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::SelectU32:
 		case ValueOpcode::SelectF32:
 		case ValueOpcode::ULessThan32:
-		case ValueOpcode::ULessThanEqual32:
 		case ValueOpcode::IEqual32:
 		case ValueOpcode::UGreaterThan32:
 		case ValueOpcode::SGreaterThanEqual32:
 		case ValueOpcode::INotEqual32:
+		case ValueOpcode::SLessThan32:
+		case ValueOpcode::SLessThan64:
+		case ValueOpcode::ULessThan64:
+		case ValueOpcode::IEqual64:
+		case ValueOpcode::SLessThanEqual32:
+		case ValueOpcode::ULessThanEqual32:
+		case ValueOpcode::SGreaterThan32:
+		case ValueOpcode::UGreaterThan64:
+		case ValueOpcode::INotEqual64:
+		case ValueOpcode::UGreaterThanEqual32:
 		case ValueOpcode::LogicalOr:
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
@@ -540,6 +553,9 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 	const auto ternary = [&]() {
 		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
 	};
+	const auto s32 = [](uint64_t value) {
+		return std::bit_cast<int32_t>(static_cast<uint32_t>(value));
+	};
 	switch (inst.GetOpcode()) {
 		case ValueOpcode::GetUserData: {
 			const auto reg = RegIndex(inst.Arg(0).ScalarRegister());
@@ -567,6 +583,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
 		case ValueOpcode::CompositeConstructU64:
+		// A U32x2 packs into the same 64-bit word the extract cases read back.
+		case ValueOpcode::CompositeConstructU32x2:
 			if (!binary()) {
 				return false;
 			}
@@ -633,12 +651,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::UMulHi:
-			if (binary()) {
-				result = (static_cast<uint64_t>(static_cast<uint32_t>(a)) * static_cast<uint32_t>(b)) >> 32u;
-				return true;
-			}
-			return false;
 		case ValueOpcode::UMin32:
 			if (binary()) {
 				result = std::min(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
@@ -671,15 +683,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::FPTrunc32:
 			if (Arg(inst, 0, a)) {
 				result = std::bit_cast<uint32_t>(std::trunc(Float32(a)));
-				return true;
-			}
-			return false;
-		case ValueOpcode::FPRecipIFlag32:
-			if (Arg(inst, 0, a)) {
-				const auto exponent = (a >> 23u) & 0xffu;
-				// Normal positive powers of two have exact normal reciprocals in every FP mode.
-				if ((a & 0x807fffffu) != 0u || exponent == 0u || exponent >= 254u) return false;
-				result = (254u - exponent) << 23u;
 				return true;
 			}
 			return false;
@@ -853,12 +856,6 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
-		case ValueOpcode::ULessThanEqual32:
-			if (binary()) {
-				result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
-				return true;
-			}
-			return false;
 		case ValueOpcode::UGreaterThan32:
 			if (binary()) {
 				result = static_cast<uint32_t>(a) > static_cast<uint32_t>(b);
@@ -867,8 +864,117 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::SGreaterThanEqual32:
 			if (binary()) {
-				result = std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >=
-				         std::bit_cast<int32_t>(static_cast<uint32_t>(b));
+				result = s32(a) >= s32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::IAddCarry32:
+			// Low half the truncated sum, high half the carry out: the 64-bit sum is both, and
+			// matches what EvaluateExtract computes when this feeds a CompositeExtractU32x2.
+			if (!binary()) {
+				return false;
+			}
+			result = static_cast<uint64_t>(static_cast<uint32_t>(a)) + static_cast<uint32_t>(b);
+			return true;
+		case ValueOpcode::SMulHi:
+			if (binary()) {
+				const auto product = static_cast<int64_t>(s32(a)) * static_cast<int64_t>(s32(b));
+				result = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::UMulHi:
+			if (binary()) {
+				const auto product = static_cast<uint64_t>(static_cast<uint32_t>(a)) *
+				                     static_cast<uint64_t>(static_cast<uint32_t>(b));
+				result = static_cast<uint32_t>(product >> 32u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::SMin32:
+			if (binary()) {
+				result = static_cast<uint32_t>(std::min(s32(a), s32(b)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::SMax32:
+			if (binary()) {
+				result = static_cast<uint32_t>(std::max(s32(a), s32(b)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::UMax32:
+			if (binary()) {
+				result = std::max(static_cast<uint32_t>(a), static_cast<uint32_t>(b));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPRecipIFlag32:
+			if (Arg(inst, 0, a)) {
+				const auto exponent = (a >> 23u) & 0xffu;
+				// Only normal positive powers of two invert exactly under the backend's division.
+				if ((a & 0x807fffffu) != 0u || exponent == 0u || exponent >= 254u) return false;
+				result = (254u - exponent) << 23u;
+				return true;
+			}
+			return false;
+		case ValueOpcode::IEqual64:
+			if (binary()) {
+				result = a == b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::INotEqual64:
+			if (binary()) {
+				result = a != b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::SLessThan32:
+			if (binary()) {
+				result = s32(a) < s32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::SLessThan64:
+			if (binary()) {
+				result = std::bit_cast<int64_t>(a) < std::bit_cast<int64_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ULessThan64:
+			if (binary()) {
+				result = a < b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::SLessThanEqual32:
+			if (binary()) {
+				result = s32(a) <= s32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::ULessThanEqual32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) <= static_cast<uint32_t>(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::SGreaterThan32:
+			if (binary()) {
+				result = s32(a) > s32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::UGreaterThan64:
+			if (binary()) {
+				result = a > b;
+				return true;
+			}
+			return false;
+		case ValueOpcode::UGreaterThanEqual32:
+			if (binary()) {
+				result = static_cast<uint32_t>(a) >= static_cast<uint32_t>(b);
 				return true;
 			}
 			return false;
@@ -912,6 +1018,10 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::UndefU64: return false;
 		default: break;
 	}
+	// Lockstep guard. Reaching here with a runtime-uniform opcode means the compile-time
+	// gate accepts one this executor cannot run: the shader would pass planning and then
+	// die at pipeline build with no opcode named. Compiled out of a final build.
+	EXIT_IF(IsRuntimeUniformOp(inst.GetOpcode()));
 	return false;
 }
 bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
