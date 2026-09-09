@@ -31000,38 +31000,50 @@ TestCase DsMiscVariants() {
   return test;
 }
 
-TestCase DsFloatMinMaxIgnoresData1() {
+TestCase DsFloatMinMaxIgnoresSecondDataOperand() {
   using O = ShaderOpcode;
 
+  // ds_min_f32 and ds_max_f32 reduce the destination against data0 only. Every slot is seeded
+  // with 4.0f and then reduced with a data0/data1 pair chosen so that a compare against data1
+  // would give a different answer than the reduction against data0.
   std::vector<u32> code;
   AppendVMovU32(&code, 1, 0);
-  AppendVMovLiteral(&code, 2, 0x40800000u);
-  code.push_back(EncodeDs0(0x0d, 0));
-  code.push_back(EncodeDs1(0, 2, 1));
-  AppendVMovLiteral(&code, 3, 0x40800000u);
-  code.push_back(EncodeDs0(0x0d, 4));
-  code.push_back(EncodeDs1(0, 3, 1));
-  AppendVMovLiteral(&code, 4, 0x41100000u);
-  AppendVMovLiteral(&code, 5, 0x40000000u);
+  AppendVMovLiteral(&code, 2, 0x40800000u); // 4.0f
+  for (u32 slot = 0; slot < 4u; slot++) {
+    code.push_back(EncodeDs0(0x0d, slot * 4u));
+    code.push_back(EncodeDs1(0, 2, 1));
+  }
+  AppendVMovLiteral(&code, 3, 0x41100000u); // 9.0f
+  AppendVMovLiteral(&code, 4, 0x40000000u); // 2.0f
+  AppendVMovLiteral(&code, 5, 0x3f800000u); // 1.0f
+  AppendVMovLiteral(&code, 6, 0x40400000u); // 3.0f
+  AppendVMovLiteral(&code, 7, 0x40c00000u); // 6.0f
+  // min(4.0f, 9.0f) keeps 4.0f; a data1 compare against 2.0f would have stored 9.0f.
   code.push_back(EncodeDs0(0x12, 0));
-  code.push_back(EncodeDs1Ex(0, 5, 4, 1));
-  AppendVMovLiteral(&code, 6, 0x3f800000u);
-  AppendVMovLiteral(&code, 7, 0x40400000u);
+  code.push_back(EncodeDs1Ex(0, 4, 3, 1));
+  // max(4.0f, 1.0f) keeps 4.0f; a data1 compare against 3.0f would have stored 1.0f.
   code.push_back(EncodeDs0(0x13, 4));
-  code.push_back(EncodeDs1Ex(0, 7, 6, 1));
-  code.push_back(EncodeDs0(0x36, 0));
-  code.push_back(EncodeDs1(8, 0, 1));
-  code.push_back(EncodeDs0(0x36, 4));
-  code.push_back(EncodeDs1(9, 0, 1));
-  AppendStoreVgpr(&code, 8, 0);
-  AppendStoreVgpr(&code, 9, 1);
+  code.push_back(EncodeDs1Ex(0, 6, 5, 1));
+  // min(4.0f, 2.0f) stores 2.0f even though data1 is above the destination.
+  code.push_back(EncodeDs0(0x12, 8));
+  code.push_back(EncodeDs1Ex(0, 3, 4, 1));
+  // max(4.0f, 6.0f) stores 6.0f even though data1 is below the destination.
+  code.push_back(EncodeDs0(0x13, 12));
+  code.push_back(EncodeDs1Ex(0, 5, 7, 1));
+  for (u32 slot = 0; slot < 4u; slot++) {
+    code.push_back(EncodeDs0(0x36, slot * 4u));
+    code.push_back(EncodeDs1(8u + slot, 0, 1));
+  }
+  for (u32 slot = 0; slot < 4u; slot++) {
+    AppendStoreVgpr(&code, 8u + slot, slot);
+  }
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsFloatMinMaxIgnoresData1";
+  test.name = "DsFloatMinMaxIgnoresSecondDataOperand";
   test.code = code;
-  test.initial = std::vector<u32>(2, 0);
-  test.expected = {0x40800000u, 0x40800000u};
+  test.initial = std::vector<u32>(4, 0);
+  test.expected = {0x40800000u, 0x40800000u, 0x40000000u, 0x40c00000u};
   test.opcodes = {O::V_MOV_B32,  O::DS_WRITE_B32, O::DS_MIN_F32,
                   O::DS_MAX_F32, O::DS_READ_B32,  O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
@@ -35344,7 +35356,7 @@ std::vector<TestCase> MakeCases() {
     }
   }
   AddCase(DsMiscVariants);
-  AddCase(DsFloatMinMaxIgnoresData1);
+  AddCase(DsFloatMinMaxIgnoresSecondDataOperand);
   AddCase([] { return DsFloatMinMaxClasses(false); });
   AddCase([] { return DsFloatMinMaxClasses(true); });
   AddCase(DsSwizzleInvalidSourceLaneZero);
