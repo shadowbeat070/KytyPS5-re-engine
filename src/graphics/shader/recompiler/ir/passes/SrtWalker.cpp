@@ -156,12 +156,32 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 
 class RuntimeValidator {
 public:
-	explicit RuntimeValidator(const ResourcePlan& program, RuntimeValueType type)
-	    : m_program(program), m_type(type) {}
+	RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
+	                 RuntimeValueFailure* failure)
+	    : m_program(program), m_type(type), m_failure(failure) {}
 
 	bool Run(Value value) { return Validate(value); }
 
 private:
+	// Records why the walk stopped and always returns false, so it can stand in for a bare false.
+	// The first rejection wins: nothing here retries a value, so the first refusal is the
+	// instruction that actually failed. A caller that wants no reason pays one null test.
+	bool Reject(RuntimeValueReject reason) {
+		if (m_failure != nullptr && m_failure->reason == RuntimeValueReject::None) {
+			m_failure->reason = reason;
+		}
+		return false;
+	}
+
+	bool Reject(RuntimeValueReject reason, ValueOpcode opcode) {
+		if (m_failure != nullptr && m_failure->reason == RuntimeValueReject::None) {
+			m_failure->reason     = reason;
+			m_failure->opcode     = opcode;
+			m_failure->has_opcode = true;
+		}
+		return false;
+	}
+
 	bool ValidateArguments(const Inst& inst, bool require_uniform) {
 		for (size_t index = 0; index < inst.NumArgs(); index++) {
 			if (!Validate(inst.Arg(index), require_uniform)) return false;
@@ -174,7 +194,10 @@ private:
 		// Host floating-point evaluation does not model shader rounding/denormal modes.
 		if (m_type == RuntimeValueType::Integer &&
 		    TypesOverlap(value.GetType(), Type::F16 | Type::F32 | Type::F32x2)) {
-			return false;
+			const auto* source = value.TryInstruction();
+			return source != nullptr
+			           ? Reject(RuntimeValueReject::FloatInIntegerChain, source->GetOpcode())
+			           : Reject(RuntimeValueReject::FloatInIntegerChain);
 		}
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr) {
@@ -186,14 +209,15 @@ private:
 				case Type::U32:
 				case Type::U64:
 				case Type::F32: return true;
-				default: return false;
+				default: return Reject(RuntimeValueReject::UnsupportedOperand);
 			}
 		}
 		if (require_uniform && !m_active_mask.IsEmpty() && value == m_active_mask) return true;
 		// Integer-only dependency checks do not depend on the active EXEC mask.
 		if (!require_uniform && m_validated_dependencies.contains(inst)) return true;
 		if (!m_visiting.insert(inst).second) {
-			return !require_uniform;
+			if (!require_uniform) return true;
+			return Reject(RuntimeValueReject::CyclicValue, inst->GetOpcode());
 		}
 		const auto finish = [&](bool valid) {
 			m_visiting.erase(inst);
@@ -208,7 +232,7 @@ private:
 			        ValueOpcode::GetSrtResource ||
 			    !slot.IsImmediate() || slot.GetType() != Type::U32 ||
 			    slot.U32() >= m_program.srt_reads.size()) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 			if (m_type == RuntimeValueType::Integer) {
 				const auto active_mask = m_active_mask;
@@ -230,22 +254,22 @@ private:
 		if (op == ValueOpcode::UndefU1 || op == ValueOpcode::UndefU8 ||
 		    op == ValueOpcode::UndefU16 || op == ValueOpcode::UndefU32 ||
 		    op == ValueOpcode::UndefU64 || op == ValueOpcode::Void) {
-			return finish(false);
+			return finish(Reject(RuntimeValueReject::UndefinedValue, op));
 		}
 		if (op == ValueOpcode::GetUserData) {
 			if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::ScalarReg) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
 			if (reg < m_program.user_data_base ||
 			    reg - m_program.user_data_base >= m_program.user_data_count) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 			return finish(true);
 		}
 		if (op == ValueOpcode::GetShaderBase) {
 			if (inst->NumArgs() != 0) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 			return finish(true);
 		}
@@ -255,14 +279,14 @@ private:
 			}
 			const auto invariant = ResolveInvariantPhi(m_program, value);
 			if (invariant.IsEmpty()) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::CyclicValue, op));
 			}
 			return finish(Validate(invariant));
 		}
 		if (op == ValueOpcode::ReadFirstLane) {
 			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
 			    inst->Arg(1).GetType() != Type::U1) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 			if (m_type == RuntimeValueType::Integer && !Validate(inst->Arg(1), false)) {
 				return finish(false);
@@ -275,7 +299,7 @@ private:
 		}
 		if (op == ValueOpcode::GetSrtResource) {
 			if (inst->NumArgs() != 0) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 			return finish(true);
 		}
@@ -287,7 +311,7 @@ private:
 			const auto* handle = inst->NumArgs() != 0 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			if (!IsRawRead(m_program, *inst) || handle == nullptr ||
 			    handle->GetOpcode() != expected) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 			if (op == ValueOpcode::LoadBufferU32) {
 				const auto guard = inst->Arg(4).Resolve();
@@ -297,7 +321,7 @@ private:
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 		} else if (op == ValueOpcode::CompositeExtractU32x2) {
 			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
@@ -306,7 +330,7 @@ private:
 			    index.U32() >= 2u ||
 			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
 			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 		}
 		if (IsDescriptorHandle(op)) {
@@ -317,17 +341,18 @@ private:
 				expected = 2u;
 			}
 			if (inst->NumArgs() != expected) {
-				return finish(false);
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
 		           op != ValueOpcode::LoadAddressU32 && !IsRuntimeUniformOp(op)) {
-			return finish(false);
+			return finish(Reject(RuntimeValueReject::UnsupportedOpcode, op));
 		}
 		return finish(ValidateArguments(*inst, true));
 	}
 
 	const ResourcePlan&             m_program;
 	RuntimeValueType                m_type;
+	RuntimeValueFailure*            m_failure = nullptr;
 	Value                           m_active_mask;
 	std::unordered_set<const Inst*> m_visiting;
 	std::unordered_set<const Inst*> m_validated_dependencies;
@@ -1092,8 +1117,26 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	return true;
 }
 
-bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type) {
-	return RuntimeValidator(program, type).Run(value);
+std::string_view RuntimeValueRejectName(RuntimeValueReject reason) {
+	switch (reason) {
+		case RuntimeValueReject::None: return "no recorded reason";
+		case RuntimeValueReject::UnsupportedOpcode: return "unsupported opcode";
+		case RuntimeValueReject::UnsupportedOperand: return "unsupported operand";
+		case RuntimeValueReject::FloatInIntegerChain: return "float value in an integer chain";
+		case RuntimeValueReject::MalformedInstruction: return "malformed instruction";
+		case RuntimeValueReject::UndefinedValue: return "undefined value";
+		case RuntimeValueReject::CyclicValue: return "cyclic value";
+		case RuntimeValueReject::NonScalarType: return "not a 32-bit scalar";
+	}
+	return "unknown reason";
+}
+
+bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
+                          RuntimeValueFailure* failure) {
+	if (failure != nullptr) {
+		*failure = {};
+	}
+	return RuntimeValidator(program, type, failure).Run(value);
 }
 
 
