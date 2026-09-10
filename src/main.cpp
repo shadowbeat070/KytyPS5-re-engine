@@ -83,7 +83,8 @@ static void PrintUsage() {
 	::printf("  --profile                            Enable the Tracy profiler.\n");
 	::printf("  --spirv-debug-printf <true|false>    Enable SPIR-V debug printf.\n");
 	::printf(
-	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n");
+	    "  --readback-linear-images <true|false> Read back writable linear images on submit.\n"
+	    "                                       Default: true.\n");
 	::printf(
 	    "  --trophy-notifications <true|false>   Show trophy unlock toasts and play their sound.\n");
 	::printf("  --playgo-hack                       Use the supplied PlayGo stub fallback.\n");
