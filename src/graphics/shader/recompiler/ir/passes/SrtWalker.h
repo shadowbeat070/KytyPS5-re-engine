@@ -5,6 +5,8 @@
 
 #include <span>
 #include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -37,7 +39,8 @@ enum class RuntimeValueReject {
 	MalformedInstruction,
 	// An undefined or void value.
 	UndefinedValue,
-	// A definition cycle with no loop-invariant phi to break it.
+	// A definition cycle whose phi carries a different value each iteration, so no single
+	// descriptor stands for it.
 	CyclicValue,
 	// Not a 32-bit scalar, so it cannot be a descriptor dword at all.
 	NonScalarType,
@@ -93,6 +96,9 @@ private:
 	SrtWalker*                      m_clean_evaluator = nullptr;
 	Value                           m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
+	// Loop-carried phi values taken on trust, inherited by any trial this walk starts.
+	std::unordered_map<const Inst*, uint64_t> m_assumed;
+	std::unordered_set<const Inst*>           m_barred;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
