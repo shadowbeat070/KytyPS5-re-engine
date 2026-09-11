@@ -73,6 +73,7 @@ struct SpirvRequirements {
 	bool buffer_u8                    = false;
 	bool buffer_u16                   = false;
 	bool shared_int64_atomics         = false;
+	// A genuine glc buffer load or store is present, so the Coherent alias is declared.
 	bool coherent_buffers             = false;
 	bool float64                      = false;
 };
@@ -117,6 +118,8 @@ struct EmitterState {
 	uint32_t                                         lane_count              = 1;
 	uint32_t                                         lane_half               = 0;
 	uint32_t                                         storage_buffer_variable = 0;
+	// Alias of the same set and binding, decorated Coherent; only glc accesses use it.
+	uint32_t                                 storage_buffer_coherent_variable = 0;
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
@@ -181,6 +184,7 @@ uint32_t TypeI32Vector(EmitterState& state, uint32_t components);
 uint32_t TypeF32Vector(EmitterState& state, uint32_t components);
 uint32_t TypePointer(EmitterState& state, spv::StorageClass storage_class, uint32_t pointee);
 uint32_t TypeFunction(EmitterState& state);
+uint32_t StorageBufferType(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElement(EmitterState& state, uint32_t bits);
 uint32_t TypeStorageBufferPointer(EmitterState& state, uint32_t bits = 32);
 uint32_t TypeStorageBufferElementPointer(EmitterState& state, uint32_t bits = 32);
@@ -428,7 +432,12 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+	// glc=1: only storage buffers and raw pointers have a cache to bypass.
+	bool             coherent         = false;
 };
+
+// True when the guest access asked to bypass the caches that are not device coherent.
+bool CoherentBufferAccess(const IR::MemoryInfo& mem);
 
 uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t mapping_offset,
                                    uint32_t search_iterations, uint32_t default_resource);
@@ -462,7 +471,7 @@ uint32_t NormalizeFormatComponent(EmitterState& state, const Format::BufferForma
 spv::Op SpirvAtomicOpcode(IR::ValueOpcode opcode);
 
 uint32_t EmitAtomicOperation(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t pointer,
-                             uint32_t scope);
+                             uint32_t scope, uint32_t semantics = spv::MemorySemanticsMaskNone);
 
 void EmitAtomicMemoryBarrier(EmitterState& state, IR::ResourceKind kind);
 
