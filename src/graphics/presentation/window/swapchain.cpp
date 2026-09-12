@@ -869,6 +869,8 @@ Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(windo
 Presenter::~Presenter() = default;
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info) {
+	// One presented frame has passed; image staleness is judged in frames.
+	m_impl->renderer.GetTextureCache().AdvanceFrame();
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid());
 	auto frame_format = info.pixel_format;
