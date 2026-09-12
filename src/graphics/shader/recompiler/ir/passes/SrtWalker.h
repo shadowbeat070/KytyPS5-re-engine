@@ -42,6 +42,12 @@ enum class RuntimeValueReject {
 	// A definition cycle whose phi carries a different value each iteration, so no single
 	// descriptor stands for it.
 	CyclicValue,
+	// A loop-carried phi web no operand enters from outside, so the loop is never entered with a
+	// value the host could stand in for. Only a GPU-side descriptor can serve this.
+	CyclicValueNoEntry,
+	// A loop-carried phi web two different values enter from outside: a merge rather than a loop.
+	// A single host binding would have to stand for both.
+	CyclicValueMerge,
 	// Not a 32-bit scalar, so it cannot be a descriptor dword at all.
 	NonScalarType,
 };
@@ -52,6 +58,13 @@ struct RuntimeValueFailure {
 	RuntimeValueReject reason     = RuntimeValueReject::None;
 	ValueOpcode        opcode     = ValueOpcode::Void;
 	bool               has_opcode = false;
+	// On CyclicValueMerge, the two operands that enter the phi web and disagree. Naming them is
+	// what separates "two spellings of one descriptor" from "two genuinely different buffers".
+	// Void stands for a leaf with no instruction behind it, which for a descriptor dword is an
+	// immediate.
+	ValueOpcode        entry_opcode      = ValueOpcode::Void;
+	ValueOpcode        other_opcode      = ValueOpcode::Void;
+	bool               has_entry_opcodes = false;
 };
 
 [[nodiscard]] std::string_view RuntimeValueRejectName(RuntimeValueReject reason);
@@ -64,6 +77,14 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
+
+// One pass of the per-lane sweep a readfirstlane runs. `dependent` stays clear for an operand
+// that never asks for the lane, which is every shader that does not go through the mask model,
+// so those pay one walk exactly as before.
+struct LaneScope {
+	uint32_t lane      = 0;
+	bool     dependent = false;
+};
 
 // One memoized evaluation session shared by the entire shader resource refresh.
 class SrtWalker {
@@ -99,6 +120,9 @@ private:
 	// Loop-carried phi values taken on trust, inherited by any trial this walk starts.
 	std::unordered_map<const Inst*, uint64_t> m_assumed;
 	std::unordered_set<const Inst*>           m_barred;
+	// Non-null only inside the per-lane sweep a readfirstlane runs, which is the one place a
+	// lane index has a value. Owned by the sweep, shared with any walk it starts.
+	LaneScope*                                m_lane = nullptr;
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
