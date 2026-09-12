@@ -7346,6 +7346,43 @@ public:
               !texture_cache.IsMeta(base + 0x28000),
               "retiring the HTile image left its metadata registered");
 
+      // SILENT HILL 2 reuses a depth allocation for a color target within a
+      // frame, with the same metadata address changing from HTile to DCC.
+      auto htile_depth = MakeMetadataDepth(0x12400, 0x13300);
+      htile_depth.info.htile_clear_mask = UINT32_MAX;
+      const auto htile_depth_id = texture_cache.FindImage(htile_depth);
+      (void)texture_cache.FindDepthTarget(htile_depth_id, htile_depth);
+      auto dcc_color = MakeLinearDesc(
+          base + 0x12500, sizeof(uint32_t), vk::Format::eR8G8B8A8Unorm,
+          Prospero::BufferFormat::k8_8_8_8UNorm, Prospero::ImageType::kColor2D,
+          {1, 1, 1}, 1, 4, 1);
+      dcc_color.type = BindingType::RenderTarget;
+      dcc_color.info.metadata.kind = ImageMetadataKind::Dcc;
+      dcc_color.info.metadata.range = {base + 0x13300, 0x20};
+      dcc_color.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
+      Require(name, "HTile state before DCC reuse",
+              texture_cache.IsMetaCleared(base + 0x13300, 0),
+              "depth binding did not register its HTile clear state");
+      const auto dcc_color_id = texture_cache.FindImage(dcc_color);
+      (void)texture_cache.FindRenderTarget(dcc_color_id, dcc_color);
+      Require(
+          name, "HTile allocation reused as DCC",
+          texture_cache.IsMeta(base + 0x13300) &&
+              !texture_cache.IsMetaCleared(base + 0x13300, 0) &&
+              !texture_cache.ClearMeta(base + 0x13300),
+          "color binding retained incompatible HTile clear state");
+      texture_cache.UnmapMemory(htile_depth.info.data.address,
+                                htile_depth.info.data.size);
+      Require(name, "reused DCC owner survives HTile retirement",
+              texture_cache.IsMeta(base + 0x13300) &&
+                  !texture_cache.ClearMeta(base + 0x13300),
+              "retiring the old HTile image erased the live DCC metadata");
+      texture_cache.UnmapMemory(dcc_color.info.data.address,
+                                dcc_color.info.data.size);
+      Require(name, "reused DCC final retirement",
+              !texture_cache.IsMeta(base + 0x13300),
+              "retiring the DCC image left its metadata registered");
+
       constexpr uint64_t partial_unmap_image_offset = 0x2700000;
       auto partial_unmap_image =
           MakeLinearDesc(base + partial_unmap_image_offset, 0x2000,
