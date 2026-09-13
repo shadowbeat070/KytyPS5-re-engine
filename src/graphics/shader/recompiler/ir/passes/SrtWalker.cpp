@@ -48,17 +48,24 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 // reproduce it. The gate used to refuse every MUBUF load on its resource kind alone,
 // which dropped whole shaders whose only sin was fetching one uniform word through the
 // vector path - see the two decoupled-lookback scan passes in SILENT HILL 2.
+// A DWORDX4 load of that shape reads four such words at once, which is how a whole V# stored
+// in a buffer reaches the scalar registers; each component is then taken apart by a
+// CompositeExtract.
 bool IsUniformBufferRead(const ResourcePlan& values, const Inst& inst) {
-	if (inst.GetOpcode() != ValueOpcode::LoadBufferU32 || inst.NumArgs() != 5) {
+	const auto op = inst.GetOpcode();
+	if ((op != ValueOpcode::LoadBufferU32 && op != ValueOpcode::LoadBufferU32x4) ||
+	    inst.NumArgs() != 5) {
 		return false;
 	}
+	const auto dwords = op == ValueOpcode::LoadBufferU32x4 ? 4u : 1u;
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= values.memory_info.size()) {
 		return false;
 	}
 	const auto& mem = values.memory_info[flags.index];
 	if (mem.kind != ResourceKind::Buffer || mem.idxen || mem.offen || mem.typed ||
-	    mem.formatted || mem.data_bits != 32u || mem.data_dwords != 1u) {
+	    mem.formatted || mem.data_bits != 32u || mem.data_dwords != dwords ||
+	    mem.component_index != 0u) {
 		return false;
 	}
 	// The translator plants literal zeroes for the index and offset operands when the
@@ -76,13 +83,16 @@ bool IsUniformBufferRead(const ResourcePlan& values, const Inst& inst) {
 // second; a MUBUF load puts the index and the per-lane offset there and the scalar
 // offset fourth.
 size_t RawReadOffsetArg(ValueOpcode op) {
-	return op == ValueOpcode::LoadBufferU32 ? 3u : 1u;
+	return op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::LoadBufferU32x4 ? 3u : 1u;
 }
 
 // A MUBUF load carries the exec mask as its last operand. That is lane state, not part
 // of the address, and walking it would reject the read for depending on lane identity.
 size_t RawReadAddressArgs(const Inst& inst) {
-	return inst.GetOpcode() == ValueOpcode::LoadBufferU32 ? 4u : inst.NumArgs();
+	const auto op = inst.GetOpcode();
+	return op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::LoadBufferU32x4
+	           ? 4u
+	           : inst.NumArgs();
 }
 
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
@@ -128,6 +138,7 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::CompositeExtractU64:
 		case ValueOpcode::CompositeConstructU32x2:
 		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x4:
 		case ValueOpcode::BitFieldInsert:
 		case ValueOpcode::BitFieldUExtract:
 		case ValueOpcode::BitFieldSExtract:
@@ -355,6 +366,20 @@ private:
 			}
 			return finish(Validate(entry));
 		}
+		if (op == ValueOpcode::Ballot) {
+			// The other way a vector value reaches the scalar registers: a VCMP into an SGPR, or
+			// EXEC read as a scalar, collects one bit per lane. The predicate is re-executed for
+			// every lane, so a lane index inside it is bound, and every lane counts - hence an
+			// all-true mask rather than the enclosing readfirstlane mask.
+			if (inst->NumArgs() != 1 || inst->Arg(0).GetType() != Type::U1) {
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
+			}
+			const auto active_mask = m_active_mask;
+			m_active_mask          = Value(true);
+			const bool valid       = Validate(inst->Arg(0));
+			m_active_mask          = active_mask;
+			return finish(valid);
+		}
 		if (op == ValueOpcode::LaneId) {
 			// A descriptor lives in scalar registers, so the only route a lane index has into one
 			// is the readfirstlane that lifts a vector value back into them - in practice the
@@ -400,6 +425,21 @@ private:
 			    handle->GetOpcode() != expected) {
 				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
+		} else if (op == ValueOpcode::LoadBufferU32x4) {
+			const auto* handle = inst->NumArgs() != 0 ? inst->Arg(0).ResolveInstruction() : nullptr;
+			if (!IsUniformBufferRead(m_program, *inst) || handle == nullptr ||
+			    handle->GetOpcode() != ValueOpcode::GetBufferResource) {
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
+			}
+		} else if (op == ValueOpcode::CompositeExtractU32x4) {
+			const auto* source = inst->NumArgs() == 2 ? inst->Arg(0).ResolveInstruction() : nullptr;
+			const auto  index  = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
+			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
+			    index.U32() >= 4u ||
+			    (source->GetOpcode() != ValueOpcode::Ballot &&
+			     source->GetOpcode() != ValueOpcode::LoadBufferU32x4)) {
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
+			}
 		} else if (op == ValueOpcode::CompositeExtractU64) {
 			const auto index = inst->NumArgs() == 2 ? inst->Arg(1).Resolve() : Value {};
 			if (!index.IsImmediate() || index.GetType() != Type::U32 || index.U32() >= 2u) {
@@ -427,7 +467,7 @@ private:
 			}
 		} else if (op != ValueOpcode::ReadConst && op != ValueOpcode::ReadConstBuffer &&
 		           op != ValueOpcode::LoadAddressU32 &&
-		           !(op == ValueOpcode::LoadBufferU32 &&
+		           !((op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::LoadBufferU32x4) &&
 		             IsUniformBufferRead(m_program, *inst)) &&
 		           !IsRuntimeUniformOp(op)) {
 			return finish(Reject(RuntimeValueReject::UnsupportedOpcode, op));
@@ -586,6 +626,9 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		return false;
 	}
 	const auto component = index.U32();
+	if (inst.GetOpcode() == ValueOpcode::CompositeExtractU32x4) {
+		return EvaluateExtractU32x4(inst, component, result);
+	}
 	if (component >= 2u) {
 		return false;
 	}
@@ -619,7 +662,31 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	return false;
 }
 
-bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
+bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component,
+                                     uint64_t& result) {
+	const auto* source = inst.Arg(0).ResolveInstruction();
+	if (source == nullptr || component >= 4u) {
+		return false;
+	}
+	if (source->GetOpcode() == ValueOpcode::Ballot) {
+		// The ballot packs lanes 0-31 and 32-63 into one word; the upper two dwords are zero.
+		uint64_t mask = 0;
+		if (!Arg(inst, 0, mask)) {
+			return false;
+		}
+		result = component < 2u ? static_cast<uint32_t>(mask >> (component * 32u)) : 0u;
+		return true;
+	}
+	if (source->GetOpcode() == ValueOpcode::LoadBufferU32x4 &&
+	    IsUniformBufferRead(m_program, *source)) {
+		// A U32x4 does not fit the walk 64-bit value, so read the one dword asked for.
+		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
+	}
+	return false;
+}
+
+bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
+                               uint32_t component_bytes) {
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
 		return false;
@@ -646,11 +713,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	    !Arg(inst, RawReadOffsetArg(inst.GetOpcode()), offset)) {
 		return false;
 	}
-	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset));
-	uint64_t   address   = 0;
+	const auto base = (high << 32u) | static_cast<uint32_t>(low);
+	const auto immediate =
+	    static_cast<int64_t>(static_cast<int32_t>(mem.offset)) + component_bytes;
+	uint64_t address = 0;
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
-	    inst.GetOpcode() == ValueOpcode::LoadBufferU32) {
+	    inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
+	    inst.GetOpcode() == ValueOpcode::LoadBufferU32x4) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
@@ -773,7 +842,8 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 		case ValueOpcode::CompositeExtractU64:
-		case ValueOpcode::CompositeExtractU32x2: return EvaluateExtract(inst, result);
+		case ValueOpcode::CompositeExtractU32x2:
+		case ValueOpcode::CompositeExtractU32x4: return EvaluateExtract(inst, result);
 		case ValueOpcode::CompositeConstructU64:
 		// A U32x2 packs into the same 64-bit word the extract cases read back.
 		case ValueOpcode::CompositeConstructU32x2:
@@ -802,6 +872,41 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 			        : EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
 			m_lane = lane;
 			return read;
+		}
+		case ValueOpcode::Ballot: {
+			// One bit per lane of the predicate, each lane re-executed with its own index. A
+			// predicate that never asks for the lane is the same on every lane, so one walk
+			// fills the whole wave. Same model as the readfirstlane sweep: all wave_size lanes.
+			const auto lanes = m_program.wave_size;
+			if (lanes == 0u || lanes > 64u) {
+				return false;
+			}
+			const auto wave = lanes == 64u ? ~uint64_t {0} : (uint64_t {1} << lanes) - 1u;
+			LaneScope  scope;
+			uint64_t   mask = 0;
+			for (scope.lane = 0; scope.lane < lanes; scope.lane++) {
+				scope.dependent = false;
+				SrtWalker lane_walk(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
+				                    Value(true));
+				lane_walk.m_lane   = &scope;
+				lane_walk.m_barred = m_barred;
+				for (const auto& assumed: m_assumed) {
+					lane_walk.m_barred.insert(assumed.first);
+				}
+				uint64_t taken = 0;
+				if (!lane_walk.EvaluateWide(inst.Arg(0), taken)) {
+					return false;
+				}
+				if (scope.lane == 0u && !scope.dependent) {
+					mask = taken != 0u ? wave : 0u;
+					break;
+				}
+				if (taken != 0u) {
+					mask |= uint64_t {1} << scope.lane;
+				}
+			}
+			result = mask;
+			return true;
 		}
 		case ValueOpcode::LaneId:
 			// Only the sweep above binds a lane. Anywhere else the value is per-lane with
