@@ -1470,7 +1470,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	if (desc.info.HasMetadata()) {
 		m_surface_metas.emplace(desc.info.metadata.range.address,
 		                        MetaDataInfo {.type       = MetaDataInfo::Type::HTile,
-		                                      .clear_mask = image.info.htile_clear_mask});
+		                                      .clear_mask = MetaSliceMask::FromBits32(image.info.htile_clear_mask)});
 	}
 	RefreshImage(id);
 	CommitGpuWrite(image);
@@ -2014,7 +2014,7 @@ bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
-	return (found->second.clear_mask & (1u << slice)) != 0;
+	return found->second.clear_mask.Test(slice);
 }
 
 bool TextureCache::ClearMeta(uint64_t address) {
@@ -2023,7 +2023,7 @@ bool TextureCache::ClearMeta(uint64_t address) {
 	if (found == m_surface_metas.end()) {
 		return false;
 	}
-	found->second.clear_mask = UINT32_MAX;
+	found->second.clear_mask = MetaSliceMask::All();
 	return true;
 }
 
@@ -2033,11 +2033,7 @@ bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	if (found == m_surface_metas.end() || slice >= 32) {
 		return false;
 	}
-	if (is_clear) {
-		found->second.clear_mask |= 1u << slice;
-	} else {
-		found->second.clear_mask &= ~(1u << slice);
-	}
+	found->second.clear_mask.Assign(slice, is_clear);
 	return true;
 }
 
