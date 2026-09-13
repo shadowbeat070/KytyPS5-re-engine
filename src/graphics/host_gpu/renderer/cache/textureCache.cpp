@@ -112,6 +112,42 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	return true;
 }
 
+[[nodiscard]] std::vector<vk::BufferImageCopy> BuildDepthCopies(const ImageInfo& info,
+                                                              uint64_t slice_stride,
+                                                              vk::ImageAspectFlags aspect) {
+	std::vector<vk::BufferImageCopy> copies(info.resources.layers);
+	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+		auto& copy             = copies[layer];
+		copy.bufferOffset      = slice_stride * layer;
+		copy.bufferRowLength   = info.pitch;
+		copy.bufferImageHeight = info.extent.height;
+		copy.imageSubresource  = {aspect, 0, layer, 1};
+		copy.imageExtent       = {info.extent.width, info.extent.height, 1};
+	}
+	return copies;
+}
+
+[[nodiscard]] std::vector<GpuTileInfo> BuildDepthTiles(const ImageInfo& info) {
+	TileBlockLayout block {};
+	EXIT_NOT_IMPLEMENTED(
+	    !TileGetBlockLayout(TileBlockFamily::Depth64KB, info.bytes_per_block, block));
+	const auto               full_slice_size = info.data.size / info.resources.layers;
+	std::vector<GpuTileInfo> tiles;
+	tiles.reserve(info.resources.layers);
+	for (uint32_t layer = 0; layer < info.resources.layers; ++layer) {
+		const auto offset = full_slice_size * layer;
+		tiles.push_back({block.family, block.bytes_per_element, offset, full_slice_size, offset,
+		                 full_slice_size, 0, info.extent.width, info.extent.height, 1, info.pitch});
+		tiles.back().surface_z = layer;
+	}
+	return tiles;
+}
+
+// Only an 8-bit colour sample or storage image can alias a stencil plane; a target stays its own.
+[[nodiscard]] bool IsStencilPlaneView(const Image& image) {
+	return !image.info.IsDepth() && image.info.bytes_per_block == 1 && !image.usage.render_target;
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -1190,7 +1226,9 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
 		const auto owner = m_slot_images.try_get(id);
 		if (owner != nullptr && owner->info.data == stencil &&
-		    owner->info.extent == depth.info.extent) {
+		    owner->info.extent == depth.info.extent &&
+		    (owner->depth_id || IsStencilPlaneView(*owner))) {
+
 			association = id;
 		}
 	}
@@ -1295,7 +1333,10 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& resolved = m_slot_images[result];
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
-			} else if (resolved.info.resources < desc.info.resources) {
+			} else if (resolved.info.resources < desc.info.resources ||
+			           (resolved.depth_id && desc.type != BindingType::Texture &&
+			            desc.type != BindingType::Storage)) {
+				// A target binding reclaims the address from a stale stencil proxy.
 				FreeImage(result);
 				result = {};
 			}
