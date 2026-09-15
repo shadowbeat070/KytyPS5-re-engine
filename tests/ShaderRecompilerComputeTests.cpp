@@ -32035,6 +32035,49 @@ TestCase DsMiscVariants() {
   return test;
 }
 
+TestCase DsMskorB32ClearsMaskThenOrsValue() {
+  using O = ShaderOpcode;
+
+  // MEM = (MEM & ~DATA0) | DATA1, with DATA1 not limited to the mask.
+  std::vector<u32> code;
+  AppendVMovU32(&code, 1, 0);
+  AppendVMovU32(&code, 2, 4);
+  AppendVMovLiteral(&code, 3, 0x11223344u);
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 3, 1));
+  AppendVMovLiteral(&code, 4, 0xaabbccddu);
+  code.push_back(EncodeDs0(0x0d, 0));
+  code.push_back(EncodeDs1(0, 4, 2));
+  AppendVMovLiteral(&code, 5, 0x0000ff00u);
+  AppendVMovLiteral(&code, 6, 0x00005500u);
+  code.push_back(EncodeDs0(0x0c, 0));
+  code.push_back(EncodeDs1Ex(0, 6, 5, 1));
+  AppendVMovLiteral(&code, 7, 0xff000000u);
+  AppendVMovLiteral(&code, 8, 0x7f000002u);
+  code.push_back(EncodeDs0(0x0c, 0));
+  code.push_back(EncodeDs1Ex(0, 8, 7, 2));
+  code.push_back(EncodeDs0(0x36, 0));
+  code.push_back(EncodeDs1(9, 0, 1));
+  code.push_back(EncodeDs0(0x36, 4));
+  code.push_back(EncodeDs1(10, 0, 1));
+  AppendStoreVgpr(&code, 9, 0);
+  AppendStoreVgpr(&code, 10, 1);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsMskorB32ClearsMaskThenOrsValue";
+  test.code = code;
+  test.initial = std::vector<u32>(4, 0);
+  test.expected = {0x11225544u, 0x7fbbccdfu, 0, 0};
+  test.opcodes = {O::V_MOV_B32, O::DS_WRITE_B32, O::DS_MSKOR_B32, O::DS_READ_B32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 1;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase DsFloatMinMaxIgnoresSecondDataOperand() {
   using O = ShaderOpcode;
 
@@ -36571,6 +36614,7 @@ std::vector<TestCase> MakeCases() {
   }
   AddCase(DsMiscVariants);
   AddCase(DsFloatMinMaxIgnoresSecondDataOperand);
+  AddCase(DsMskorB32ClearsMaskThenOrsValue);
   AddCase([] { return DsFloatMinMaxClasses(false); });
   AddCase([] { return DsFloatMinMaxClasses(true); });
   AddCase(DsSwizzleInvalidSourceLaneZero);
