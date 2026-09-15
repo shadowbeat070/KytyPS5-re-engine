@@ -32821,7 +32821,7 @@ TestCase DsPermuteCapturedExecOffsetAndWrap() {
   return test;
 }
 
-TestCase DsPermuteWave64UsesIndependentHalves() {
+TestCase DsPermuteWave64XorLaneHalves() {
   using O = ShaderOpcode;
 
   std::vector<u32> code;
@@ -32835,7 +32835,7 @@ TestCase DsPermuteWave64UsesIndependentHalves() {
   AppendEnd(&code);
 
   TestCase test;
-  test.name = "DsPermuteWave64UsesIndependentHalves";
+  test.name = "DsPermuteWave64XorLaneHalves";
   test.code = code;
   test.initial = std::vector<u32>(64, 0);
   for (u32 lane = 0; lane < 64; ++lane) {
@@ -32928,6 +32928,91 @@ TestCase DsBpermuteWave64UsesIndependentHalves() {
                   O::DS_BPERMUTE_B32, O::V_LSHLREV_B32,
                   O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.required_spirv = {"OpGroupNonUniformShuffle"};
+  test.compute_info.threads_num[0] = 64;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 64;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+// The RDNA 2 ISA DS_PERMUTE_B32 examples: SRC0 {A, B, C, D}, ADDR {0, 0, 12, 4}.
+TestCase DsPermuteIsaExamples() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendBufferLoadDword(&code, 17, 30);
+  AppendVMovLiteral(&code, 1, 0xdeadbeefu);
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  // EXEC = 0xA: VDST := {-, D, -, 0}.
+  code.push_back(EncodeSop1(0x04, 4, 126));
+  code.push_back(EncodeVop2(0x1b, 18, InlineU32(1), 0));
+  code.push_back(EncodeVopc(0xc2, InlineU32(1), 18));
+  code.push_back(EncodeSop1(0x04, 126, 106));
+  code.push_back(EncodeDs0(0xb2, 0));
+  code.push_back(EncodeDs1(1, 3, 17));
+  code.push_back(EncodeSop1(0x04, 126, 4));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 4);
+  // lane * 4 + 124 with offset 4 wraps back onto the source lane.
+  AppendVMovU32(&code, 17, 124);
+  code.push_back(EncodeVop2(0x25, 17, Vgpr(30), 17));
+  code.push_back(EncodeDs0(0xb2, 4));
+  code.push_back(EncodeDs1(2, 3, 17));
+  AppendStoreVgprAtLaneDwordOffset(&code, 2, 0, 8);
+  // EXEC = 0xF: VDST := {B, D, 0, C}; B, the higher source, beats A.
+  AppendBufferLoadDword(&code, 17, 30);
+  code.push_back(EncodeDs0(0xb2, 0));
+  code.push_back(EncodeDs1(5, 3, 17));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, 12);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsPermuteIsaExamples";
+  test.code = code;
+  test.initial = {0, 0, 12, 4, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+  test.expected = {0,   0,   12,  4,   0xdeadbeefu, 103, 0xdeadbeefu, 0,
+                   100, 101, 102, 103, 101,         103, 0,           102};
+  test.opcodes = {O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD, O::V_MOV_B32,
+                  O::V_ADD_NC_U32,  O::V_AND_B32,         O::V_CMP_EQ_U32,
+                  O::S_MOV_B64,     O::DS_PERMUTE_B32,    O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.decoded_counts = {{"DS_PERMUTE_B32", 3}};
+  test.ir_counts = {{"PermuteU32", 3}};
+  test.compute_info.threads_num[0] = 4;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.wave_size = 32;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
+  return test;
+}
+
+TestCase DsPermuteWave64UsesIndependentHalves() {
+  using O = ShaderOpcode;
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 3, 100);
+  code.push_back(EncodeVop2(0x25, 3, Vgpr(0), 3));
+  code.push_back(EncodeVop2(0x1a, 30, InlineU32(2), 0));
+  AppendVMovU32(&code, 17, 128);
+  code.push_back(EncodeVop2(0x25, 17, Vgpr(30), 17));
+  code.push_back(EncodeDs0(0xb2, 0));
+  code.push_back(EncodeDs1(1, 3, 17));
+  AppendStoreVgprAtLaneDwordOffset(&code, 1, 0, 0);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DsPermuteWave64UsesIndependentHalves";
+  test.code = code;
+  test.initial = std::vector<u32>(64, 0);
+  for (u32 lane = 0; lane < 64u; lane++) {
+    test.expected.push_back(100u + lane);
+  }
+  test.opcodes = {O::V_MOV_B32,      O::V_ADD_NC_U32,       O::V_LSHLREV_B32,
+                  O::DS_PERMUTE_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
   test.compute_info.threads_num[0] = 64;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
@@ -37269,6 +37354,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(DsPermuteWave64UsesIndependentHalves);
   AddCase(DsBpermuteCapturedExecOffsetAndWrap);
   AddCase(DsBpermuteWave64UsesIndependentHalves);
+  AddCase(DsPermuteIsaExamples);
+  AddCase(DsPermuteWave64XorLaneHalves);
   AddCase(Wave64CrossHalfLaneAndLds);
   AddCase(Wave64RawMasksAndScalarBranch);
   AddCase(Wave64PartialMultidimensionalWorkgroup);
