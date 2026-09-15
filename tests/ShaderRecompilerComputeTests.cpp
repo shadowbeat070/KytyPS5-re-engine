@@ -23207,6 +23207,8 @@ TestCase VectorBfeI32SignExtendsField() {
 TestCase VectorAlignByteUsesTwoBitByteOffset() {
   using O = ShaderOpcode;
 
+  // The offset operand is a byte address whose (address & -4) loaded LO, so only its low
+  // two bits count: offsets 4, 8 and 0x3a5 must read like 0 and 1, never zero or HI bytes.
   std::vector<u32> code;
   AppendVMovLiteral(&code, 0, 0x11223344u);
   AppendVMovLiteral(&code, 1, 0x55667788u);
@@ -23229,6 +23231,60 @@ TestCase VectorAlignByteUsesTwoBitByteOffset() {
       {O::V_MOV_B32, O::BUFFER_LOAD_DWORD, O::V_ALIGNBYTE_B32,
        O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
   test.forbidden_spirv = {"OpTypeInt 64"};
+  return test;
+}
+
+TestCase VectorAlignByteNaniteVertexByteStream() {
+  using O = ShaderOpcode;
+
+  // SILENT HILL f Nanite page transcode d7874b7861593ec2 pc 0x89c..0x8d4, verbatim except that
+  // the load names the test buffer: three bytes per vertex from a stream at an odd address.
+  constexpr u32 guest[] = {
+      0xd7460001u, 0x04010300u, // V_LSHL_ADD_U32 v1, v0, 1, v0
+      0xd76d0003u, 0x0404000du, // V_ADD3_U32 v3, s13, s0, v1
+      0x360206c4u,              // V_AND_B32 v1, -4, v3
+      0xe0341000u, 0x800c0101u, // BUFFER_LOAD_DWORDX2 v1, v1, s48
+      0xbf8c3f70u,              // S_WAITCNT 0x3f70
+      0xd54f0001u, 0x040e0302u, // V_ALIGNBYTE_B32 v1, v2, v1, v3
+      0x340a02f9u, 0x00860690u, // V_LSHLREV_B32 v5, 16, v1.sdwa(sel=0)
+      0x340602f9u, 0x01860690u, // V_LSHLREV_B32 v3, 16, v1.sdwa(sel=1)
+      0x340802f9u, 0x02860690u, // V_LSHLREV_B32 v4, 16, v1.sdwa(sel=2)
+  };
+  constexpr u32 stream_dword = 4;
+  constexpr u32 out = 64;
+  std::vector<u32> code;
+  AppendSMovLiteral(&code, 13, stream_dword * 4u + 1u);
+  AppendSMovLiteral(&code, 0, 0);
+  code.insert(code.end(), std::begin(guest), std::end(guest));
+  AppendStoreVgprAtLaneDwordOffset(&code, 5, 0, out);
+  AppendStoreVgprAtLaneDwordOffset(&code, 3, 0, out + 16);
+  AppendStoreVgprAtLaneDwordOffset(&code, 4, 0, out + 32);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "VectorAlignByteNaniteVertexByteStream";
+  test.code = std::move(code);
+  test.initial.assign(out + 48, 0);
+  for (u32 i = 0; i < 16; i++) {
+    test.initial[stream_dword + i] = 0x03020100u + i * 0x04040404u;
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < 16; lane++) {
+    const u32 address = stream_dword * 4u + 1u + lane * 3u;
+    for (u32 b = 0; b < 3; b++) {
+      const u32 byte = (test.initial[(address + b) / 4u] >> (((address + b) % 4u) * 8u)) & 0xffu;
+      test.expected[out + b * 16u + lane] = byte << 16u;
+    }
+  }
+  test.opcodes = {O::S_MOV_B32, O::V_LSHL_ADD_U32, O::V_ADD3_U32, O::V_AND_B32,
+                  O::BUFFER_LOAD_DWORDX2, O::S_WAITCNT, O::V_ALIGNBYTE_B32,
+                  O::V_LSHLREV_B32, O::V_MOV_B32, O::V_ADD_NC_U32,
+                  O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = 16;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.has_compute_info = true;
   return test;
 }
 
@@ -36325,6 +36381,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorVop3IntegerOps);
   AddCase(VectorBfeI32SignExtendsField);
   AddCase(VectorAlignByteUsesTwoBitByteOffset);
+  AddCase(VectorAlignByteNaniteVertexByteStream);
   AddCase(VectorCarryAndBitCountOps);
   AddCase(VectorMbcntUsesThreadMask);
   AddCase(VectorAddcWritesPerLaneCarryOut);
@@ -42348,6 +42405,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--alignbyte-only") == 0) {
     VulkanHarness vulkan;
     RunCase(&vulkan, VectorAlignByteUsesTwoBitByteOffset());
+    RunCase(&vulkan, VectorAlignByteNaniteVertexByteStream());
     RunCase(&vulkan, VectorVop3IntegerOps());
     return 0;
   }
