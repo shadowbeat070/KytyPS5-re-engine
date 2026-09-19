@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -905,19 +906,57 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return TryReadBacking(vaddr, data, size);
 }
 
+const char* DescribeGpuBackingRefusal(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
+		if (!Graphics::GuestGpu::IsGpuThread()) {
+			return "the read is off the GPU thread";
+		}
+		if (GetGpuResources().GetBufferCache().HasGpuDirtyBytes(vaddr, size)) {
+			return "the buffer cache still holds GPU writes there";
+		}
+	}
+	std::array<uint8_t, 4> probe {};
+	const auto             probe_size = std::min<uint64_t>(size, probe.size());
+	if (!TryReadBacking(vaddr, probe.data(), probe_size)) {
+		return "nothing is mapped there";
+	}
+	return "the range reads back now";
+}
+
+static Common::Mutex           g_buffer_range_report_mutex;
+static BufferRangeReportPolicy g_buffer_range_reports;
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 
 	const auto clamped_size = g_virtual_ranges->ClampRangeSize(vaddr, size);
-	if (clamped_size == 0) {
-		EXIT("Memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64
-		     "\n",
-		     vaddr, size);
+	if (clamped_size == size) {
+		return clamped_size;
 	}
-	if (clamped_size != size) {
+
+	BufferRangeReportPolicy::Decision decision {};
+	{
+		Common::LockGuard lock(g_buffer_range_report_mutex);
+		decision = g_buffer_range_reports.Observe(vaddr, size, clamped_size);
+	}
+	char repeat[32] = "";
+	if (decision.report && decision.occurrences > 1) {
+		std::snprintf(repeat, sizeof(repeat), " (x%" PRIu64 ")", decision.occurrences);
+	}
+
+	// A resource descriptor is guest data and may point at memory the guest never mapped, so an
+	// unmapped base is a bindable state, not an emulator fault. Callers bind nothing instead.
+	if (clamped_size == 0) {
+		if (decision.report) {
+			LOGF("Memory: unmapped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 "%s\n",
+			     vaddr, size, repeat);
+		}
+		return 0;
+	}
+	if (decision.report) {
 		LOGF("Memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64
-		     " to 0x%016" PRIx64 "\n",
-		     vaddr, size, clamped_size);
+		     " to 0x%016" PRIx64 "%s\n",
+		     vaddr, size, clamped_size, repeat);
 	}
 	return clamped_size;
 }
