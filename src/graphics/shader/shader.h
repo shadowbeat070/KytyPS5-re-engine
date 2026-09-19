@@ -169,6 +169,10 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       custom_interpolation_mask    = 0;
 	uint32_t                                       ps_perspective_center_vgpr   = UINT32_MAX;
 	uint32_t                                       ps_perspective_centroid_vgpr = UINT32_MAX;
+	// PERSP_SAMPLE has no builtin of its own, but its pair still has to be seeded: left unseeded
+	// it reads zero, the weights fold to (1, 0, 0) and every interpolated attribute resolves to
+	// vertex 0 of the primitive.
+	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
 	uint32_t                                       scratch_size_dwords          = 0;
