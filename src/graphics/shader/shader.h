@@ -89,6 +89,7 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	uint32_t gs_vgpr_component_count = 0;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
