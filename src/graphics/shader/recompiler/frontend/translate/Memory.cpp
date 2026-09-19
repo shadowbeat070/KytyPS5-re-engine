@@ -253,6 +253,7 @@ Decoder::Operand MemorySourceAt(const Decoder::Instruction& decoded, uint32_t in
 			case Decoder::Opcode::DS_WRITE2ST64_B32:
 			case Decoder::Opcode::DS_WRITE2_B64:
 			case Decoder::Opcode::DS_WRITE2ST64_B64:
+			case Decoder::Opcode::DS_CMPST_RTN_B64:
 			case Decoder::Opcode::DS_MSKOR_B32:
 				return index == 0u ? decoded.src1 : index == 1u ? decoded.src0 : decoded.src2;
 			default: return decoded.src0;
@@ -588,6 +589,31 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
 	if (returns_value) {
 		WriteOperand(inst.dst, result);
 	}
+}
+
+// A 64-bit LDS atomic takes its operand from a VGPR pair and returns the pre-op pair.
+void Translator::DS_ATOMIC64(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
+	const auto memory  = MemoryInfoFromDecoded(inst);
+	const auto address = ReadU32(MemorySourceAt(inst, 1));
+	const auto data    = ReadU64(MemorySourceAt(inst, 0));
+	const auto result =
+	    ir.Emit(opcode, {address, data, ir.GetExec()}, AddMemoryInfo(memory, inst.pc));
+	WriteOperand(inst.dst, result);
+	return;
+}
+
+// DS_CMPST_RTN_B64 takes the swap value from data1 and the comparand from data0, the opposite
+// order from BUFFER_ATOMIC_CMPSWAP_X2, as the RDNA 2 ISA warns in its own opcode description.
+void Translator::DS_CMPST64(const Decoder::Instruction& inst) {
+	const auto memory     = MemoryInfoFromDecoded(inst);
+	const auto address    = ReadU32(MemorySourceAt(inst, 1));
+	const auto comparator = ReadU64(MemorySourceAt(inst, 0));
+	const auto source     = ReadU64(MemorySourceAt(inst, 2));
+	const auto result     = ir.Emit(IR::ValueOpcode::SharedAtomicCmpSwap64,
+	                                {address, source, comparator, ir.GetExec()},
+	                                AddMemoryInfo(memory, inst.pc));
+	WriteOperand(inst.dst, result);
+	return;
 }
 
 void Translator::FLAT_LOAD(const Decoder::Instruction& inst) {
@@ -1053,6 +1079,9 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax32, false);
 		case Decoder::Opcode::DS_MAX_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax32, true);
+		case Decoder::Opcode::DS_MAX_RTN_U64:
+			return DS_ATOMIC64(inst, IR::ValueOpcode::SharedAtomicUMax64);
+		case Decoder::Opcode::DS_CMPST_RTN_B64: return DS_CMPST64(inst);
 		case Decoder::Opcode::DS_AND_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicAnd32, false);
 		case Decoder::Opcode::DS_AND_RTN_B32:

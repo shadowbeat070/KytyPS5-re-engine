@@ -167,6 +167,10 @@ uint32_t TypeU32ElementPointer(EmitterState& state, spv::StorageClass storage_cl
 	return TypePointer(state, storage_class, TypeU32(state));
 }
 
+uint32_t TypeU64ElementPointer(EmitterState& state, spv::StorageClass storage_class) {
+	return TypePointer(state, storage_class, TypeU64(state));
+}
+
 namespace {
 
 uint32_t PushConstantArrayType(EmitterState& state) {

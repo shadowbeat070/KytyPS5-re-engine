@@ -88,6 +88,8 @@ private:
 	void          IMAGE_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode32,
 	                           IR::ValueOpcode opcode64 = IR::ValueOpcode::Count);
 	void DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opcode, bool returns_value);
+	void DS_ATOMIC64(const Decoder::Instruction& inst, IR::ValueOpcode opcode);
+	void DS_CMPST64(const Decoder::Instruction& inst);
 	void FLAT_LOAD(const Decoder::Instruction& inst);
 	void FLAT_STORE(const Decoder::Instruction& inst);
 	void IMAGE_GET_RESINFO(const Decoder::Instruction& inst);
