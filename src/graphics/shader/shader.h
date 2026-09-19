@@ -89,7 +89,10 @@ struct ShaderMeshInputInfo: ShaderWorkgroupInputInfo {
 	uint32_t max_primitives       = 0;
 	uint32_t provoking_vertex     = 0;
 	bool     fast_launch          = false;
+	// SPI_SHADER_PGM_RSRC1_GS.GS_VGPR_COMP_CNT / SPI_SHADER_PGM_RSRC2_GS.ES_VGPR_COMP_CNT: the
+	// index of the last VGPR the SPI pre-loads for each half of the merged ES/GS wave.
 	uint32_t gs_vgpr_component_count = 0;
+	uint32_t es_vgpr_component_count = 0;
 
 	[[nodiscard]] constexpr uint32_t InputPrimitiveSize() const {
 		switch (static_cast<Prospero::PrimitiveType>(input_primitive)) {
@@ -196,6 +199,12 @@ struct ShaderPixelInputInfo {
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
+
+// SPI_PS_IN_CONTROL.PS_W32_EN runs the pixel stage as 32-lane waves, which leaves the upper
+// halves of EXEC and VCC free for the shader to use as ordinary scalar registers.
+constexpr uint32_t ShaderPixelWaveSize(uint32_t ps_in_control) {
+	return (ps_in_control & 0x8000u) != 0 ? 32u : 64u;
+}
 
 union ShaderStageInputInfo {
 	const ShaderVertexInputInfo*  vertex;
