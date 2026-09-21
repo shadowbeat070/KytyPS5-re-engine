@@ -121,6 +121,12 @@ bool                   TryReadBacking(uint64_t vaddr, void* data, uint64_t size)
 bool                   TryReadGpuCleanBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
+// Zero-fills the destination, copies back whatever the guest has committed over the span, and
+// returns how many bytes were real. For a caller that cannot refuse, such as an image upload.
+uint64_t                  ReadBackingPartial(uint64_t vaddr, void* data, uint64_t size);
+// The committed prefix, whether a PRT aperture covers it, and the covering plus neighbouring
+// virtual ranges. For failure reports only.
+[[nodiscard]] std::string DescribeGuestRange(uint64_t vaddr, uint64_t size);
 // Which of TryReadGpuCleanBacking's conditions refuses this range, for a caller that has to
 // report why a descriptor read failed. Never null; says so when the range reads back now.
 [[nodiscard]] const char* DescribeGpuBackingRefusal(uint64_t vaddr, uint64_t size);
