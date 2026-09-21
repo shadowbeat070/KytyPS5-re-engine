@@ -4350,6 +4350,88 @@ void TestBufferRangeReportsSummariseRepeats() {
 	            kRepeats);
 }
 
+// Both guest readers are all-or-nothing: the dense one refuses a span if a single byte is
+// uncommitted, the sparse one only answers inside a registered PRT aperture. An image upload
+// cannot refuse, so it needs a reader that serves what the guest has and zeroes the rest.
+void TestPartialBackingReadServesCommittedGranules() {
+	const char*        test      = "PartialBackingReadServesCommittedGranules";
+	constexpr uint64_t kPages    = 3;
+	const auto         size      = SceKernelPageSize * kPages;
+	int64_t            phys_addr = 0;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+	            0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), size, SceKernelPageSize,
+	            SceKernelMtypeC, &phys_addr),
+	        "KernelAllocateDirectMemory");
+
+	void* address = nullptr;
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMapNamedDirectMemory(&address, size, SceKernelProtCpuRw,
+	                                                            0, phys_addr, SceKernelPageSize,
+	                                                            "partial_backing_read"),
+	        "KernelMapNamedDirectMemory");
+	const auto base = reinterpret_cast<uint64_t>(address);
+	std::memset(reinterpret_cast<void*>(base), 0xaa, SceKernelPageSize);
+	std::memset(reinterpret_cast<void*>(base + SceKernelPageSize * 2), 0xbb, SceKernelPageSize);
+
+	// The hole a streaming arena leaves behind when the game releases one granule of a surface
+	// whose descriptor still names the whole allocation.
+	CheckOk(test,
+	        Libs::LibKernel::Memory::KernelMunmap(base + SceKernelPageSize, SceKernelPageSize),
+	        "KernelMunmap(middle)");
+
+	std::vector<uint8_t> bytes(size, 0x5a);
+	Check(test, !Libs::LibKernel::Memory::TryReadBacking(base, bytes.data(), bytes.size()),
+	      "the dense reader accepted a partly committed span");
+	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t v) { return v == 0x5a; }),
+	      "a refused dense read modified its destination");
+
+	const auto copied = Libs::LibKernel::Memory::ReadBackingPartial(base, bytes.data(), size);
+	Check(test, copied == SceKernelPageSize * 2,
+	      "the partial reader reported " + std::to_string(copied) + " backed bytes, expected " +
+	          std::to_string(SceKernelPageSize * 2));
+	Check(test,
+	      std::all_of(bytes.begin(), bytes.begin() + SceKernelPageSize,
+	                  [](uint8_t v) { return v == 0xaa; }) &&
+	          std::all_of(bytes.begin() + SceKernelPageSize, bytes.begin() + SceKernelPageSize * 2,
+	                      [](uint8_t v) { return v == 0; }) &&
+	          std::all_of(bytes.begin() + SceKernelPageSize * 2, bytes.end(),
+	                      [](uint8_t v) { return v == 0xbb; }),
+	      "the partial reader did not serve the committed granules and zero the hole");
+
+	// The report has to say how far the commit reaches and what the guest owns around it, or the
+	// address in the log is unactionable.
+	const auto description = Libs::LibKernel::Memory::DescribeGuestRange(base, size);
+	Check(test, description.find("prt=no") != std::string::npos,
+	      "the range description did not report PRT aperture coverage: " + description);
+	Check(test, description.find("here=[") != std::string::npos,
+	      "the range description did not name the covering guest range: " + description);
+	char expected_commit[64] = "";
+	std::snprintf(expected_commit, sizeof(expected_commit), "committed=0x%016" PRIx64,
+	              SceKernelPageSize);
+	Check(test, description.find(expected_commit) != std::string::npos,
+	      "the range description did not clamp to the committed prefix: " + description);
+
+	// Nothing mapped at all is the other shape the abort covered, and it must still be defined.
+	constexpr uint64_t kNeverMapped = 0x0000007ffff00000ull;
+	std::fill(bytes.begin(), bytes.end(), 0x5a);
+	Check(test,
+	      Libs::LibKernel::Memory::ReadBackingPartial(kNeverMapped, bytes.data(), size) == 0,
+	      "the partial reader claimed backing for an address the guest never mapped");
+	Check(test, std::all_of(bytes.begin(), bytes.end(), [](uint8_t v) { return v == 0; }),
+	      "the partial reader left an unmapped span undefined instead of zeroing it");
+	const auto unmapped_description =
+	    Libs::LibKernel::Memory::DescribeGuestRange(kNeverMapped, size);
+	Check(test, unmapped_description.find("here=none") != std::string::npos,
+	      "an unmapped address was not reported as uncovered: " + unmapped_description);
+
+	CheckOk(test, Libs::LibKernel::Memory::KernelReleaseDirectMemory(phys_addr, size),
+	        "KernelReleaseDirectMemory");
+
+	std::printf("[host]    %-48s ok (%" PRIu64 " of 0x%" PRIx64 " bytes backed)\n", test, copied,
+	            size);
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -4403,6 +4485,7 @@ int main(int argc, char** argv) {
 	RunTest(TestGuestAddressSpaceOwnsReservationsBeforeBacking);
 	RunTest(TestSparseBackingReadPreservesResidency);
 	RunTest(TestSparseReadDuringDirectCommit);
+	RunTest(TestPartialBackingReadServesCommittedGranules);
 	RunTest(TestGuestAddressSpaceHasNoFixedFallback);
 	RunTest(TestGuestFreeRangeSearchDoesNotUnderflow);
 	RunTest(TestFlexibleMemoryCapacityIsBootFixed);

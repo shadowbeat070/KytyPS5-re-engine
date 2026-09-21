@@ -197,6 +197,20 @@ static bool IsCommittedRangeType(VirtualRangeType type) {
 	return !IsReservedRangeType(type);
 }
 
+static const char* VirtualRangeTypeName(VirtualRangeType type) {
+	switch (type) {
+		case VirtualRangeType::Reserved: return "reserved";
+		case VirtualRangeType::PoolReserved: return "pool-reserved";
+		case VirtualRangeType::Direct: return "direct";
+		case VirtualRangeType::Flexible: return "flexible";
+		case VirtualRangeType::Pooled: return "pooled";
+		case VirtualRangeType::Stack: return "stack";
+		case VirtualRangeType::Code: return "code";
+		case VirtualRangeType::Runtime: return "runtime";
+		default: return "unknown";
+	}
+}
+
 static bool IsPrivateCommittedRangeType(VirtualRangeType type) {
 	return type == VirtualRangeType::Stack || type == VirtualRangeType::Code ||
 	       type == VirtualRangeType::Runtime;
@@ -461,6 +475,45 @@ public:
 		}
 
 		return clamped_size;
+	}
+
+	// The range covering an address plus its two neighbours. "here=none" with a populated
+	// "prev"/"next" is an address the game never mapped; one it mapped and released leaves a
+	// reservation behind.
+	std::string DescribeAround(uint64_t addr) {
+		Common::LockGuard lock(m_mutex);
+
+		const Range* previous  = nullptr;
+		const Range* covering  = nullptr;
+		const Range* following = nullptr;
+		for (const auto& r: m_ranges) {
+			if (End(r.start, r.size) <= addr) {
+				previous = &r;
+			} else if (r.start <= addr) {
+				covering = &r;
+			} else {
+				following = &r;
+				break;
+			}
+		}
+
+		std::string out;
+		const auto  append = [&out](const char* label, const Range* r) {
+            char line[288];
+            if (r == nullptr) {
+                std::snprintf(line, sizeof(line), "%s=none ", label);
+            } else {
+                std::snprintf(line, sizeof(line),
+                              "%s=[0x%016" PRIx64 "+0x%" PRIx64 " %s prot=0x%x \"%s\"] ", label,
+                              r->start, r->size, VirtualRangeTypeName(r->type), r->protection,
+                              r->name);
+            }
+            out += line;
+		};
+		append("here", covering);
+		append("prev", previous);
+		append("next", following);
+		return out;
 	}
 
 	uint64_t CountPageTableEntries(bool gpu) {
@@ -1018,6 +1071,27 @@ static bool IsInPrtAperture(uint64_t address, uint64_t size = 1) {
 
 bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return g_guest_address_space->TryReadSparseBacking(vaddr, data, size);
+}
+
+uint64_t ReadBackingPartial(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		if (data != nullptr && size != 0) {
+			std::memset(data, 0, size);
+		}
+		return 0;
+	}
+	return g_guest_address_space->ReadBackingPartial(vaddr, data, size);
+}
+
+std::string DescribeGuestRange(uint64_t vaddr, uint64_t size) {
+	if (g_virtual_ranges == nullptr) {
+		return "ranges=unavailable";
+	}
+	char line[128];
+	std::snprintf(line, sizeof(line), "committed=0x%016" PRIx64 " prt=%s ",
+	              g_virtual_ranges->ClampRangeSize(vaddr, size),
+	              IsInPrtAperture(vaddr, size) ? "yes" : "no");
+	return std::string(line) + g_virtual_ranges->DescribeAround(vaddr);
 }
 
 static bool SelfTestSub64SharedPlaceholderAlias() {

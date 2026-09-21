@@ -231,6 +231,44 @@ public:
 		return true;
 	}
 
+	// Copies whatever backing exists across the span, zeroes the rest, and reports how many bytes
+	// were real. The dense reader is all-or-nothing, which is wrong for a caller that must hand
+	// the GPU something for a range the game has only partly committed.
+	uint64_t ReadBackingPartial(uint64_t vaddr, void* data, uint64_t size) {
+		if (data == nullptr || size == 0) {
+			return 0;
+		}
+		auto* destination = static_cast<uint8_t*>(data);
+		std::memset(destination, 0, size);
+		if (!IsAvailable() || UINT64_MAX - vaddr < size) {
+			return 0;
+		}
+
+		std::lock_guard lock(m_mutex);
+		const auto      end   = vaddr + size;
+		auto            first = m_maps.lower_bound(vaddr);
+		if (first != m_maps.begin()) {
+			auto previous = std::prev(first);
+			if (previous->second.vaddr + previous->second.size > vaddr) {
+				first = previous;
+			}
+		}
+		uint64_t copied = 0;
+		for (auto mapping = first; mapping != m_maps.end() && mapping->second.vaddr < end;
+		     ++mapping) {
+			const auto& entry  = mapping->second;
+			const auto  start  = std::max(vaddr, entry.vaddr);
+			const auto  bytes  = std::min(end, entry.vaddr + entry.size) - start;
+			const auto  offset = entry.backing_offset + start - entry.vaddr;
+			if (!RangeOk(offset, bytes)) {
+				continue;
+			}
+			std::memcpy(destination + start - vaddr, m_backing_base + offset, bytes);
+			copied += bytes;
+		}
+		return copied;
+	}
+
 	bool MapFixed(uint64_t vaddr, uint64_t size, uint64_t backing_offset,
 	              VirtualMemory::Mode mode, FailureReason* failure_reason = nullptr) {
 		if (!IsAvailable() || !RangeOk(backing_offset, size)) {
@@ -767,6 +805,10 @@ public:
 			}
 		}
 		return m_backing->TryReadSparseBacking(vaddr, data, size);
+	}
+
+	uint64_t ReadBackingPartial(uint64_t vaddr, void* data, uint64_t size) {
+		return m_backing->ReadBackingPartial(vaddr, data, size);
 	}
 
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
