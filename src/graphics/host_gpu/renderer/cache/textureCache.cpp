@@ -42,19 +42,25 @@ constexpr uint64_t NumFramesBeforeRemoval = 32;
 	       NumFramesBeforeRemoval;
 }
 
-// Only an untiled image is ever enrolled for download, and the collector declines tiled ones, so a
-// tiled image's pixels never reach guest memory. It cannot hold the newest bytes there, and no
+// Only an untiled image is ever enrolled for download, and the one place that writes a tiled
+// image back - the collector's eviction step - destroys it in the same pass. So no *live* tiled
+// image has ever put its pixels into guest memory. It cannot hold the newest bytes there, and no
 // drain can change that, so it must not withhold a read of what the guest wrote itself.
 [[nodiscard]] bool ImageOwnsGuestBytes(const Image& image) {
 	return !image.info.IsTiled();
 }
 
+// One emergency reclaim runs with a draw half-built, so it is capped rather than allowed to sweep
+// the whole cache.
+constexpr size_t MaxEmergencyReclaimImages = 256;
+
 // Retiring an overlap victim asks a different question from SafeToDownload's, and the difference
 // only shows on a tiled image. SafeToDownload answers "may these pixels be written back to guest
 // memory", so a dirty page under the image makes it say no: the guest may have put newer bytes
 // there. Retiring asks "can anything reproduce these pixels once they are gone", and for a tiled
-// image the answer is no whatever the page says - nothing ever downloads one, TrackImageDownload
-// and the collector both decline it, so guest memory has never held its pixels.
+// image the answer is no whatever the page says - TrackImageDownload declines one, and the only
+// thing that downloads one is the collector's eviction step, which frees it in the same pass, so
+// guest memory has never held a surviving tiled image's pixels.
 //
 // Maybe-dirty is only a suspicion: a guest write landed somewhere in the same tracker page, not
 // necessarily in the image, and RefreshImage settles it with HashGuestEdges the next time the
@@ -218,15 +224,21 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_buffer_cache(buffer_cache),
       m_readback_linear_images(Config::ReadbackLinearImagesEnabled()) {
 	if (m_graphics.CanReportMemoryUsage()) {
-		constexpr int64_t GiB = 1024ll * 1024 * 1024;
-		const auto        budget =
-		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
-		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
-		m_pressure_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
-		m_critical_gc_memory = static_cast<uint64_t>(
-		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
-		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+		// Fractions of what this device reports, not fixed subtractions from it; see
+		// Headroom::ResolveCollectorThresholds.
+		const auto budget     = m_graphics.GetTotalMemoryBudget();
+		const auto thresholds = Headroom::ResolveCollectorThresholds(budget);
+		if (budget != 0) {
+			m_trigger_gc_memory  = thresholds.trigger;
+			m_pressure_gc_memory = thresholds.pressure;
+			m_critical_gc_memory = thresholds.critical;
+		}
+		LOGF("TextureCache thresholds: trigger=%" PRIu64 " MiB (%" PRIu64 "%%) pressure=%" PRIu64
+		     " MiB (%" PRIu64 "%%) critical=%" PRIu64 " MiB (%" PRIu64
+		     "%%) of a %" PRIu64 " MiB working ceiling\n",
+		     m_trigger_gc_memory >> 20u, Headroom::CollectorTriggerPercent,
+		     m_pressure_gc_memory >> 20u, Headroom::CollectorPressurePercent,
+		     m_critical_gc_memory >> 20u, Headroom::CollectorCriticalPercent, budget >> 20u);
 	}
 }
 
@@ -302,11 +314,77 @@ TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
 }
 
 ImageId TextureCache::InsertImage(const ImageInfo& info) {
-	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	GraphicContext::ImageAllocationReport allocation {};
+	auto                                  id = m_slot_images.insert(m_graphics, m_scheduler, info,
+	                                                                &allocation);
+	if (m_slot_images[id].BackingFailed()) {
+		// The image that just failed owns nothing: drop its slot, let the collector hand memory
+		// back, and ask the driver once more before giving up.
+		m_slot_images.erase(id);
+		const auto requested = allocation.size;
+		const auto reclaimed = ReclaimForAllocation(requested);
+		GraphicContext::ImageAllocationReport retry {};
+		id = m_slot_images.insert(m_graphics, m_scheduler, info, &retry);
+		if (m_slot_images[id].BackingFailed()) {
+			EXIT("out of device memory for an image: extent=%ux%ux%u format=%u levels=%u layers=%u "
+			     "requested=%" PRIu64 " bytes, result=%s; reclaimed=%" PRIu64
+			     " bytes from %zu live images (%" PRIu64 " bytes accounted); device usage=%" PRIu64
+			     " budget=%" PRIu64 " heap=%" PRIu64 " (budget %s, host fallback %s)\n",
+			     info.extent.width, info.extent.height, info.extent.depth,
+			     static_cast<uint32_t>(info.pixel_format), info.resources.levels,
+			     info.resources.layers, requested != 0 ? requested : retry.size,
+			     vk::to_string(retry.result).c_str(), reclaimed, m_slot_images.size(),
+			     m_total_used_memory, retry.budget.usage, retry.budget.budget,
+			     retry.budget.heap_size, retry.budget.reported ? "reported" : "unknown",
+			     retry.host_fallback_allowed ? "tried" : "not permitted for this usage");
+		}
+	}
 	if (!info.data.Empty()) {
 		RegisterImage(id);
 	}
 	return id;
+}
+
+uint64_t TextureCache::ReclaimForAllocation(uint64_t needed) {
+	// Runs part-way through preparing a draw with m_lock already held, so it may only release
+	// images that need no GPU work to preserve and that the frame in flight has stopped touching.
+	const auto           frame = m_frame_index.load(std::memory_order_relaxed);
+	std::vector<ImageId> candidates;
+	m_lru_cache.ForEachItemBelow(m_gc_tick, [&](ImageId id) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr ||
+		    !Headroom::ReclaimableWithoutGpuWork(CollectorFacts(*owner, false),
+		                                         ImageAbandoned(*owner, frame))) {
+			return false;
+		}
+		candidates.push_back(id);
+		return candidates.size() >= MaxEmergencyReclaimImages;
+	});
+
+	uint64_t freed = 0;
+	for (const auto id: candidates) {
+		const auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr) {
+			continue;
+		}
+		freed += owner->AccountedSize();
+		FreeImage(id);
+		if (needed != 0 && freed >= needed) {
+			break;
+		}
+	}
+	if (freed == 0) {
+		return 0;
+	}
+
+	// FreeImage only queues the VkImage destruction behind the submit that may still reference it,
+	// so push the current command buffer through and run the deferred destructions: that is what
+	// turns the accounting above into real device memory before the caller retries.
+	if (m_scheduler.Active()) {
+		m_scheduler.Wait(m_scheduler.CurrentTick());
+		m_scheduler.PopPendingOperations();
+	}
+	return freed;
 }
 
 void TextureCache::RegisterImage(ImageId id) {
@@ -352,6 +430,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 }
 
 void TextureCache::DeleteImage(ImageId id) {
+	m_evict_pending.erase(id);
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
 		return;
@@ -1179,6 +1258,25 @@ TextureCache::ImageDownload TextureCache::BuildDownload(const Image& image) cons
 	transfer.texture = BuildTextureTransfer(image, binding, TransferDirection::Download);
 	transfer.valid   = transfer.texture.valid;
 	return transfer;
+}
+
+Headroom::CollectorImageFacts TextureCache::CollectorFacts(const Image& image,
+                                                           bool with_download_plan) {
+	Headroom::CollectorImageFacts facts {};
+	facts.registered       = image.registered;
+	facts.depth_associated = static_cast<bool>(image.depth_id);
+	facts.video_out        = image.usage.video_out;
+	facts.gpu_modified     = image.IsGpuModified();
+	facts.tiled            = image.info.IsTiled();
+	facts.stencil_plane = image.info.HasStencil() && image.GpuWriteSerial() != 0;
+	if (!facts.gpu_modified) {
+		return facts;
+	}
+	facts.safe_to_download = image.SafeToDownload();
+	// Planning a download costs a layout walk, so only the collector asks for it.
+	facts.downloadable =
+	    with_download_plan && facts.safe_to_download && !image.depth_id && BuildDownload(image).valid;
+	return facts;
 }
 
 void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
@@ -2156,9 +2254,14 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		                    : transfer.texture.color_transform == ColorTransform::Reverse10_11_11 ? 4
 		                                                                                         : 1;
 	}
+	if (regions.empty()) {
+		// A tiled colour transfer plans no regions: TileImage re-tiles the whole image, so there is no
+		// partial form. Both callers treat a refusal as a range no image can serve.
+		return false;
+	}
 	std::vector<TextureDownloadChunk> chunks;
-	if (regions.empty() || !TexturePlanDownloadChunks(regions, info.data.size, block, capacity,
-	                                                  chunk_alignment, chunks)) {
+	if (!TexturePlanDownloadChunks(regions, info.data.size, block, capacity, chunk_alignment,
+	                               chunks)) {
 		EXIT("TextureCache: cannot split an image download past the download buffer: "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 " format=%u extent=%ux%u\n",
 		     info.data.address, info.data.size, static_cast<uint32_t>(info.pixel_format),
@@ -2367,6 +2470,7 @@ void TextureCache::RunGarbageCollector() {
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 	}
+	FreePublishedEvictions();
 	if (m_total_used_memory < m_trigger_gc_memory) {
 		return;
 	}
@@ -2389,21 +2493,39 @@ void TextureCache::RunGarbageCollector() {
 			}
 			--deletions;
 			auto owner = m_slot_images.try_get(id);
-			if (owner == nullptr || !owner->registered || owner->depth_id) {
+			if (owner == nullptr) {
 				continue;
 			}
-			if (owner->IsGpuModified()) {
-				const bool safe = owner->SafeToDownload();
-				if (safe && owner->info.IsTiled()) {
-					continue;
-				}
-				if (safe && !pressured) {
-					continue;
-				}
-				if (safe && !DownloadImageMemory(id)) {
-					continue;
-				}
+			if (m_evict_pending.contains(id)) {
+				continue;
 			}
+			// Keep means nothing could restore these pixels; Evict means they can be restored but
+			// have not been written back yet, which is what a tiled GPU-modified surface is -
+			// BuildDownload plans a re-tile for one.
+			const auto verdict = Headroom::ClassifyForCollection(CollectorFacts(*owner, true),
+			                                                     pressured);
+			if (verdict == Headroom::CollectorVerdict::Skip ||
+			    verdict == Headroom::CollectorVerdict::Keep) {
+				continue;
+			}
+			if (verdict == Headroom::CollectorVerdict::Evict) {
+				if (!DownloadImageMemory(id)) {
+					continue;
+				}
+				// A submit runs deferred destructions, so the slot pointer is re-read rather than reused.
+				owner = m_slot_images.try_get(id);
+				if (owner == nullptr) {
+					continue;
+				}
+				m_evict_pending.insert_or_assign(id, owner->GpuWriteSerial());
+				m_scheduler.DeferPriorityOperation([this, id] {
+					const std::scoped_lock published_lock {m_evict_published_lock};
+					m_evict_published.push_back(id);
+				});
+				continue;
+			}
+			// Safe because DeleteImage hands the VkImage to CommandScheduler::DeferOperation, so
+			// it outlives the submit that reads it. Nothing here may submit or wait.
 			FreeImage(id);
 			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
 				deletions >>= 2;
@@ -2418,6 +2540,30 @@ void TextureCache::RunGarbageCollector() {
 	collect(false);
 	if (m_total_used_memory >= m_critical_gc_memory) {
 		collect(true);
+	}
+}
+
+void TextureCache::FreePublishedEvictions() {
+	std::vector<ImageId> ready;
+	{
+		const std::scoped_lock published_lock {m_evict_published_lock};
+		ready.swap(m_evict_published);
+	}
+	for (const auto id: ready) {
+		const auto pending = m_evict_pending.find(id);
+		if (pending == m_evict_pending.end()) {
+			continue;
+		}
+		const auto serial_at_eviction = pending->second;
+		m_evict_pending.erase(pending);
+		auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr || !owner->registered) {
+			continue;
+		}
+		if (owner->GpuWriteSerial() != serial_at_eviction) {
+			continue;
+		}
+		FreeImage(id);
 	}
 }
 

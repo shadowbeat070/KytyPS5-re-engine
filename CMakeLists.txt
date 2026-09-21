@@ -598,6 +598,12 @@ add_executable(unfoldable_rebuild_tests EXCLUDE_FROM_ALL
 target_link_libraries(unfoldable_rebuild_tests common fmt::fmt)
 target_include_directories(unfoldable_rebuild_tests PRIVATE ${inc_headers})
 
+add_executable(vram_headroom_tests EXCLUDE_FROM_ALL
+	"${KYTY_TESTS_DIR}/VramHeadroomTests.cpp"
+)
+target_link_libraries(vram_headroom_tests common fmt::fmt)
+target_include_directories(vram_headroom_tests PRIVATE ${inc_headers})
+
 # These tests use exceptions.
 foreach(kyty_exception_test scalar_provenance_tests resource_tracking_tests
 		virtual_memory_allocation_tests)
@@ -704,6 +710,8 @@ if(BUILD_TESTING)
 
 	add_test(NAME unfoldable_rebuild COMMAND $<TARGET_FILE:unfoldable_rebuild_tests>)
 
+	add_test(NAME vram_headroom COMMAND $<TARGET_FILE:vram_headroom_tests>)
+
 	add_custom_target(kyty_tests DEPENDS
 		ime_dialog_tests
 		shader_cfg_tests
@@ -735,6 +743,7 @@ if(BUILD_TESTING)
 		http_uri_parse_tests
 		unresolved_import_registration_tests
 		unfoldable_rebuild_tests
+		vram_headroom_tests
 	)
 endif()
 
