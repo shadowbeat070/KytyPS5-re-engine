@@ -127,6 +127,10 @@ void BufferCache::ChangeRegister(BufferId id) {
 		    });
 		WriteDataBuffer(m_bda_pagetable_buffer, table_offset,
 		                addresses.data(), addresses.size() * sizeof(vk::DeviceAddress));
+		// A buffer that did not exist has nothing current in it: the first walk over its pages
+		// is what creates their tracker regions, which are born CPU-dirty, and uploads them.
+		// Queue after the registration, so a drain racing this sees the buffer it must fill.
+		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	} else {
 		const auto found = m_buffers.find(buffer.CpuAddress());
 		EXIT_IF(found == m_buffers.end() || found->second != id);
@@ -137,6 +141,8 @@ void BufferCache::ChangeRegister(BufferId id) {
 		m_bda_pagetable_buffer.Fill(table_offset,
 		                            size_pages * sizeof(vk::DeviceAddress), 0);
 		buffer.is_deleted = true;
+		// Whatever covers these pages next inherits them, and they may still be CPU-dirty.
+		m_memory_tracker.QueueBdaSync(buffer.CpuAddress(), buffer.Size());
 	}
 }
 
@@ -752,10 +758,10 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 	});
 }
 
-void BufferCache::MarkBdaStoresInRange(uint64_t vaddr, uint64_t size, bool all_tracked) {
+void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {
 	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;
-	ranges.ForEachInRange(
-	    vaddr, size, [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });
+	ForEachBdaMarkRange(ranges, mapped,
+	                    [this](uint64_t begin, uint64_t end) { MarkBdaStores(begin, end - begin); });
 }
 
 void BufferCache::MarkBdaStores(uint64_t vaddr, uint64_t size) {
