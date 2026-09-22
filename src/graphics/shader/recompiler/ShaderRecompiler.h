@@ -8,6 +8,7 @@
 #include "graphics/shader/shader.h"
 
 #include <span>
+#include <string>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler {
@@ -58,6 +59,36 @@ struct CompileResult {
 	// same way a rejected translation is, rather than ending the session.
 	RecompileStatus        status;
 };
+
+// What the structurized-CFG cache has done this session. The cache is meant to be invisible -
+// a hit and a build produce the same graph - so this is the only way a run or a test can tell the
+// two apart, and it is the number that says what the cache is worth.
+struct CfgCacheStats {
+	uint64_t hits    = 0;
+	uint64_t misses  = 0;
+	uint64_t evicted = 0;
+	uint64_t refused = 0;
+	uint64_t entries = 0;
+	uint64_t bytes   = 0;
+	uint64_t loaded   = 0;
+	uint64_t stored   = 0;
+	uint64_t rejected = 0;
+	uint64_t hits_from_file    = 0;
+	uint64_t avoided_file_us   = 0;
+	uint64_t avoided_memory_us = 0;
+};
+
+[[nodiscard]] CfgCacheStats CfgCacheStatistics();
+
+// Backs the structurized-CFG cache with a file. `stamp` must change whenever CFG::BuildGraph or
+// CFG::Structurize changes behaviour, or CFG::Graph's layout changes; 0 disables the file.
+void OpenCfgCacheFile(const std::string& path, uint64_t stamp);
+
+// Write the file out. Safe to call repeatedly; does nothing when no file is configured.
+void FlushCfgCacheFile();
+
+// Empties the in-memory cache and forgets any file. Tests only.
+void ResetCfgCacheForTest();
 
 [[nodiscard]] TranslateResult TranslateProgram(std::span<const uint32_t> code,
                                                const CompileOptions& options);

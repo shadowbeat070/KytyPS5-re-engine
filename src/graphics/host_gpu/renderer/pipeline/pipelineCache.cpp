@@ -195,6 +195,15 @@ std::string PipelineCacheTitleId() {
 	return title_id;
 }
 
+// KYTY_CFG_CACHE_LOG=1 reports every write of the structurized-CFG file.
+bool CfgCacheLogEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_CFG_CACHE_LOG");
+		return text != nullptr && std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+
 template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
@@ -1025,6 +1034,7 @@ void PipelineCache::InitializeDriverCache() {
 	}
 
 	const std::filesystem::path folder("_PipelineCache");
+	InitializeCfgCache(folder, title_id);
 	const auto                  name = fmt::format("{}-{:016x}.bin", title_id, m_build_hash);
 	PruneDriverCaches(folder, title_id, name);
 	m_driver_cache_path     = folder / name;
@@ -1095,6 +1105,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::Save() {
+	FlushCfgCacheIfDirtyLocked();
 	if (!WriteDriverCacheLocked()) {
 		return;
 	}
@@ -1114,6 +1125,55 @@ void PipelineCache::MaybeSaveDriverCacheLocked() {
 	}
 	m_last_save = now;
 	(void)WriteDriverCacheLocked();
+}
+
+// m_build_hash stamps the file: any change to CFG::BuildGraph, CFG::Structurize or CFG::Graph's
+// layout implies a different executable. 0 refuses the file outright.
+void PipelineCache::InitializeCfgCache(const std::filesystem::path& folder,
+                                       const std::string&           title_id) {
+	if (m_build_hash == 0) {
+		PipelineCacheLog("Shader CFG cache: disabled (binary could not be fingerprinted)");
+		return;
+	}
+	const auto path = folder / "cfg" / fmt::format("{}.cfgcache", title_id);
+	ShaderRecompiler::OpenCfgCacheFile(Common::PathToString(path), m_build_hash);
+	m_cfg_cache_enabled = true;
+	const auto stats    = ShaderRecompiler::CfgCacheStatistics();
+	PipelineCacheLog("Shader CFG cache: {} stamp={:016x} loaded={} rejected={}",
+	                 Common::PathToString(path), m_build_hash, stats.loaded, stats.rejected);
+}
+
+void PipelineCache::FlushCfgCacheIfDirtyLocked() {
+	if (!m_cfg_cache_enabled) {
+		return;
+	}
+	const auto stats = ShaderRecompiler::CfgCacheStatistics();
+	if (stats.misses == m_cfg_flushed_misses) {
+		return;
+	}
+	m_cfg_flushed_misses = stats.misses;
+	ShaderRecompiler::FlushCfgCacheFile();
+	if (CfgCacheLogEnabled()) {
+		const auto written = ShaderRecompiler::CfgCacheStatistics();
+		PipelineCacheLog(
+		    "Shader CFG cache: wrote {} entries, {} bytes held, avoided {} ms this run ({} ms of "
+		    "it from the file)",
+		    written.stored, written.bytes,
+		    (written.avoided_file_us + written.avoided_memory_us) / 1000u,
+		    written.avoided_file_us / 1000u);
+	}
+}
+
+void PipelineCache::MaybeFlushCfgCacheLocked() {
+	if (!m_cfg_cache_enabled) {
+		return;
+	}
+	const auto now = std::chrono::steady_clock::now();
+	if (now - m_last_cfg_flush < CfgCacheFlushPeriod) {
+		return;
+	}
+	m_last_cfg_flush = now;
+	FlushCfgCacheIfDirtyLocked();
 }
 
 bool PipelineCache::WriteDriverCacheLocked() {
@@ -1487,6 +1547,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
 	MaybeSaveDriverCacheLocked();
+	MaybeFlushCfgCacheLocked();
 
 	return *iter->second;
 }
@@ -1520,6 +1581,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
 	MaybeSaveDriverCacheLocked();
+	MaybeFlushCfgCacheLocked();
 
 	return *iter->second;
 }
