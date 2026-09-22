@@ -12908,7 +12908,7 @@ public:
         image.numeric_class = Prospero::TextureNumericClass::Float;
         image.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
       }
-      ShaderRecompiler::IR::ApplyResourceSpecialization(
+      (void)ShaderRecompiler::IR::ApplyResourceSpecialization(
           null_program, null_specialization);
       allocate_bindings(null_program);
       ShaderRecompiler::IR::CompiledShaderInfo null_info{};
@@ -15315,7 +15315,7 @@ public:
                  return true;
                }}, stencil_snapshot, stencil_specialization),
           "captured stencil shader could not resolve its clear byte");
-      ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
+      (void)ShaderRecompiler::IR::ApplyResourceSpecialization(stencil_translated.program,
                                                        stencil_specialization);
       ShaderRecompiler::IR::CompiledShaderInfo stencil_program{};
       stencil_program.stage = ShaderType::Compute;
@@ -35623,6 +35623,9 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
 void CheckIndirectImageKeySwitch() {
   constexpr const char *name = "IndirectImageKeySwitch";
   constexpr uint32_t mapping_capacity = 1793u;
+  // A non-zero slot: with slot 0 the directory hop and the mapping hop read the same word,
+  // and a one-hop search looks correct.
+  constexpr uint32_t kMappingSlot = 7u;
   using namespace ShaderRecompiler::IR;
 
   Program program{};
@@ -35685,7 +35688,7 @@ void CheckIndirectImageKeySwitch() {
   root.dimension = ShaderRecompiler::Decoder::ImageDimension::Dim2D;
   root.read = true;
   root.indirect_root = 0;
-  root.indirect_mapping_offset = 0;
+  root.indirect_mapping_offset = kMappingSlot;
 	root.indirect_search_iterations = std::bit_width(mapping_capacity);
   root.indirect_resources = {0u, 1u};
   auto candidate = root;
@@ -35742,6 +35745,38 @@ void CheckIndirectImageKeySwitch() {
           text.find("OpSwitch") == std::string::npos &&
               CountText(text, "OpImageSampleExplicitLod") == 1,
           "materialized images expanded into per-candidate samples");
+
+  // Two hops: load the slot, then index the key table from what it held. One hop short reads the
+  // directory region instead, which no count of instructions can see - hence a shape assertion.
+  {
+    const auto id_after = [&](const std::string &needle) {
+      const auto at = text.find(needle);
+      if (at == std::string::npos) {
+        return std::string();
+      }
+      const auto line_start = text.rfind('\n', at) + 1;
+      const auto percent = text.find('%', line_start);
+      if (percent == std::string::npos || percent > at) {
+        return std::string();
+      }
+      const auto end = text.find_first_of(" \t", percent);
+      return text.substr(percent, end - percent);
+    };
+    const auto slot_id = id_after("OpConstant %uint " + std::to_string(kMappingSlot) + "\n");
+    Require(name, "directory slot constant", !slot_id.empty(),
+            "the mapping slot never reached the module as a constant");
+    const auto first_chain = id_after("OpAccessChain %_ptr_StorageBuffer_uint %flattened_srt "
+                                      "%uint_0 " + slot_id + "\n");
+    Require(name, "directory hop", !first_chain.empty(),
+            "the runtime search did not address the directory slot");
+    const auto mapping_id = id_after("OpLoad %uint " + first_chain + "\n");
+    Require(name, "directory load", !mapping_id.empty(),
+            "the directory slot was addressed but never loaded");
+    Require(name, "mapping hop",
+            text.find("OpAccessChain %_ptr_StorageBuffer_uint %flattened_srt %uint_0 " +
+                      mapping_id) != std::string::npos,
+            "the key table was indexed from the slot itself instead of from the offset it holds");
+  }
 
   program.memory_info[0].image_dimension =
       ShaderRecompiler::Decoder::ImageDimension::Dim2DArray;
@@ -40189,7 +40224,7 @@ void CheckImageSamplerSpecialization() {
               mixed_sampler_plan, {}, mixed_sampler_snapshot,
               mixed_sampler_specialization),
           "mixed sampler descriptors could not be materialized");
-  ShaderRecompiler::IR::ApplyResourceSpecialization(
+  (void)ShaderRecompiler::IR::ApplyResourceSpecialization(
       mixed_sampler_program, mixed_sampler_specialization);
   Require("ImageSamplerSpecialization", "mixed sampler variant",
           mixed_sampler_program.info.samplers.size() == 3u &&

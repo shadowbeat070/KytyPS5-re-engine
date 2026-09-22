@@ -491,7 +491,12 @@ uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResour
 // candidate slot the key names, or zero when the mapping does not hold it. Branchless: the search
 // always runs its full iteration count, so it stays one basic block whatever the key is. Images and
 // buffers lay their mappings out identically and share this.
-uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_offset,
+// One word of the flattened SRT by constant index.
+uint32_t LoadFlattenedSrtWord(EmitterState& state, uint32_t index);
+
+// `mapping_slot` indexes the flattened SRT's directory, which holds the table's real mapping
+// offset. The offset itself never reaches the module - see ResourceMaterialization.cpp.
+uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
                                      uint32_t iterations, uint32_t key);
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);

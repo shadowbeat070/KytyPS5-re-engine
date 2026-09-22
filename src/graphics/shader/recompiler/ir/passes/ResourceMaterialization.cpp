@@ -337,6 +337,34 @@ bool ReadScalarBufferWord(const ShaderBufferResource& descriptor, uint32_t dynam
 	                       static_cast<uint32_t>(offset), runtime, {&word, 1});
 }
 
+// The flattened SRT ends with a directory followed by the key mappings the directory points at.
+// Two words per image resource - its mapping offset and its feedback bitmap offset - at a base
+// fixed by the program own SRT width. Both halves of a slot number are behind the program key
+// already, so a slot never moves when a sibling table gains a key; the mapping offsets it holds
+// are allocation results and stay out of the specialization. See ResourceMaterialization.h.
+constexpr size_t IndirectDirectoryStride = 2u;
+
+size_t IndirectDirectoryBase(const ResourcePlan& program) {
+	return program.srt_reads.size();
+}
+
+size_t IndirectDirectoryWords(const ResourcePlan& program) {
+	// A shader with no indirect table reads no directory, so its flattened SRT stays exactly the
+	// words it reads.
+	const bool has_table =
+	    std::ranges::any_of(program.info.images, [&](const ImageResource& image) {
+		    const auto* source = Source(program, image.source);
+		    return source != nullptr && source->indirect_descriptor.has_value();
+	    });
+	if (!has_table) {
+		return 0;
+	}
+	return program.info.images.size() * IndirectDirectoryStride;
+}
+
+size_t IndirectMappingSlot(const ResourcePlan& program, uint32_t image_index) {
+	return IndirectDirectoryBase(program) + static_cast<size_t>(image_index) * IndirectDirectoryStride;
+}
 bool MaterializeIndirectImage(const ResourcePlan& program,
                               const DescriptorSource::IndirectDescriptor& indirect,
                               uint32_t image_index,
@@ -480,9 +508,14 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	if (snapshot.images.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+		const auto slot = IndirectMappingSlot(program, image_index);
+		if (slot >= mapping_offset) {
+			return false;
+		}
+		snapshot.flattened_srt[slot] = static_cast<uint32_t>(mapping_offset);
 		auto& root = specialization.images[image_index];
 		root.indirect_root = image_index;
-		root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
+		root.indirect_mapping_offset = static_cast<uint32_t>(slot);
 		root.indirect_search_iterations = std::bit_width(key_count);
 	}
 	return true;
@@ -742,12 +775,19 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (root.indirect_root != root_index) {
 			continue;
 		}
-		const auto key_count = root.indirect_mapping_offset < snapshot.flattened_srt.size()
-		                           ? snapshot.flattened_srt[root.indirect_mapping_offset]
+		// The specialization names a directory slot; the mapping it points at is what has to be
+		// in bounds and hold at least two candidates.
+		const auto directory_end = IndirectDirectoryBase(program) + IndirectDirectoryWords(program);
+		const auto mapping_offset =
+		    static_cast<size_t>(root.indirect_mapping_offset) < directory_end
+		        ? static_cast<size_t>(snapshot.flattened_srt[root.indirect_mapping_offset])
+		        : 0u;
+		const auto key_count = mapping_offset >= directory_end &&
+		                               mapping_offset < snapshot.flattened_srt.size()
+		                           ? snapshot.flattened_srt[mapping_offset]
 		                           : 0u;
 		if (root.indirect_search_iterations == 0u || key_count < 2u ||
-		    static_cast<size_t>(root.indirect_mapping_offset) + 1u +
-		            static_cast<size_t>(key_count) * 2u >
+		    mapping_offset + 1u + static_cast<size_t>(key_count) * 2u >
 		        snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
 		}
@@ -1260,6 +1300,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		return false;
 	}
 	const auto active = std::span<const uint8_t>(program.active_sources);
+	// Reserve the indirect directory before any mapping is appended, so a slot is a function of
+	// the resource index and the SRT width alone.
+	snapshot.flattened_srt.resize(IndirectDirectoryBase(program) + IndirectDirectoryWords(program),
+	                              0u);
 	snapshot.uniform_fill = {};
 	const auto& fill = program.uniform_fill;
 	const auto words = fill.fill.words;
@@ -1394,42 +1438,99 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	return BuildResourceSpecialization(program, snapshot, specialization);
 }
 
+const char* FirstSpecializationDifference(const ResourceSpecialization& before,
+                                          const ResourceSpecialization& after) {
+	if (before.buffers.size() != after.buffers.size()) {
+		return "buffer count";
+	}
+	if (before.images.size() != after.images.size()) {
+		return "image count";
+	}
+	for (size_t index = 0; index < before.buffers.size(); index++) {
+		const auto& a = before.buffers[index];
+		const auto& b = after.buffers[index];
+		if (a == b) {
+			continue;
+		}
+		if (a.packed_stride != b.packed_stride) {
+			return "buffer stride";
+		}
+		if (a.descriptor_format != b.descriptor_format) {
+			return "buffer format";
+		}
+		if (a.descriptor_swizzle != b.descriptor_swizzle) {
+			return "buffer swizzle";
+		}
+		if (a.indirect_root != b.indirect_root) {
+			return "buffer table root";
+		}
+		if (a.indirect_search_iterations != b.indirect_search_iterations) {
+			return "buffer search depth";
+		}
+		if (a.indirect_feedback_keys != b.indirect_feedback_keys) {
+			return "buffer feedback width";
+		}
+		return "buffer table offset";
+	}
+	for (size_t index = 0; index < before.images.size(); index++) {
+		const auto& a = before.images[index];
+		const auto& b = after.images[index];
+		if (a == b) {
+			continue;
+		}
+		if (a.numeric_class != b.numeric_class) {
+			return "image numeric class";
+		}
+		if (a.dimension != b.dimension) {
+			return "image dimension";
+		}
+		if (a.mip_count != b.mip_count) {
+			return "image mip count";
+		}
+		if (a.conversion_format != b.conversion_format) {
+			return "image format";
+		}
+		if (a.shader_swizzle != b.shader_swizzle) {
+			return "image swizzle";
+		}
+		if (a.cube != b.cube || a.fmask != b.fmask) {
+			return "image kind";
+		}
+		if (a.indirect_root != b.indirect_root) {
+			return "image table root";
+		}
+		if (a.indirect_search_iterations != b.indirect_search_iterations) {
+			return "image search depth";
+		}
+		if (a.indirect_feedback_keys != b.indirect_feedback_keys) {
+			return "image feedback width";
+		}
+		return "image table offset";
+	}
+	return nullptr;
+}
+
 void AddObservedIndirectKeys(uint64_t signature, std::span<const uint32_t> keys) {
 	if (!keys.empty()) {
 		ObservedKeys().Add(signature, keys);
 	}
 }
 
-void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
+bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
 	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
 	        program.binding_layout_complete);
-	EXIT_IF(program.info.buffers.size() > specialization.buffers.size() ||
-	        program.info.images.size() > specialization.images.size());
+	// Not a fault: a permutation can be keyed on a specialization that came from a different
+	// tracking of the same shader, and the caller refuses it rather than dying on it.
+	if (program.info.buffers.size() != specialization.buffers.size() ||
+	    program.info.images.size() > specialization.images.size()) {
+		return false;
+	}
 
 	auto& buffers = program.info.buffers;
-	const auto original_buffer_count = buffers.size();
-	buffers.reserve(specialization.buffers.size());
-	for (uint32_t index = 0; index < specialization.buffers.size(); ++index) {
-		const auto& source = specialization.buffers[index];
-		if (index >= buffers.size()) {
-			EXIT_IF(source.indirect_root >= original_buffer_count);
-			buffers.push_back(buffers[source.indirect_root]);
-		}
-		auto& buffer                      = buffers[index];
-		buffer.packed_stride              = source.packed_stride;
-		buffer.descriptor_format          = source.descriptor_format;
-		buffer.descriptor_swizzle         = source.descriptor_swizzle;
-		buffer.indirect_root              = source.indirect_root;
-		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
-		buffer.indirect_search_iterations = source.indirect_search_iterations;
-		buffer.indirect_resources.clear();
-	}
-	for (uint32_t index = 0; index < buffers.size(); ++index) {
-		const auto root = buffers[index].indirect_root;
-		if (root != BufferResource::NoIndirectBuffer) {
-			EXIT_IF(root >= buffers.size());
-			buffers[root].indirect_resources.push_back(index);
-		}
+	for (size_t index = 0; index < buffers.size(); index++) {
+		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
+		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
+		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
 	}
 	auto& images = program.info.images;
 	const auto original_image_count = images.size();
@@ -1437,7 +1538,9 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	for (uint32_t index = 0; index < specialization.images.size(); index++) {
 		const auto& source = specialization.images[index];
 		if (index >= images.size()) {
-			EXIT_IF(source.indirect_root >= original_image_count);
+			if (source.indirect_root >= original_image_count) {
+				return false;
+			}
 			images.push_back(images[source.indirect_root]);
 		}
 		auto& image                      = images[index];
@@ -1592,6 +1695,7 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 	}
 	image_remap.Apply(images);
+	return true;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

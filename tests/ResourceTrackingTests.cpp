@@ -32,6 +32,15 @@ void Check(bool condition, const char *message) {
   }
 }
 
+// A table's specialization names a directory slot in the flattened SRT, and the slot holds the
+// table's real mapping offset - the offset is an allocation result and would respecialize every
+// table after it if it reached the module. Tests that read a mapping take the same hop the module
+// does.
+uint32_t MappingOf(const ResourceSnapshot &snapshot, uint32_t slot) {
+  return slot < snapshot.flattened_srt.size() ? snapshot.flattened_srt[slot]
+                                              : std::numeric_limits<uint32_t>::max();
+}
+
 bool SameResourceSnapshot(const ResourceSnapshot &lhs,
                           const ResourceSnapshot &rhs) {
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
@@ -616,9 +625,11 @@ void TestInvariantIndirectImageMaterialization() {
             dynamic_snapshot.images.size() == 2,
         "dynamic indirect image table was not specialized transactionally");
   const auto &mapping = dynamic_specialization.images[0];
-  const auto key_count = dynamic_snapshot.flattened_srt[mapping.indirect_mapping_offset];
+  const auto mapping_offset =
+      MappingOf(dynamic_snapshot, mapping.indirect_mapping_offset);
+  const auto key_count = dynamic_snapshot.flattened_srt[mapping_offset];
   Check(mapping.indirect_search_iterations == std::bit_width(key_count) &&
-            mapping.indirect_mapping_offset + 1u + key_count * 2u ==
+            mapping_offset + 1u + key_count * 2u ==
                 dynamic_snapshot.flattened_srt.size(),
         "indirect image mapping retained worst-case padding");
 
@@ -913,7 +924,7 @@ void TestGuardedDirectImageTable() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 32u && specialization.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            snapshot.flattened_srt[MappingOf(snapshot, specialization.images[0].indirect_mapping_offset)] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
   const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
@@ -925,7 +936,7 @@ void TestGuardedDirectImageTable() {
              memory.words.begin() + captured_word);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            snapshot.flattened_srt[MappingOf(snapshot, specialization.images[0].indirect_mapping_offset)] == 32u &&
             std::ranges::all_of(snapshot.images[16].dwords,
                                 [](uint32_t word) { return word == 0u; }),
         "captured non-descriptor record became a host image or lost its key mapping");
@@ -1243,8 +1254,8 @@ void TestBoundedComputeImageLoop() {
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               snapshot.images.size() == count &&
               specialization.images.size() == count &&
-              snapshot.flattened_srt[
-                  specialization.images[0].indirect_mapping_offset] == count &&
+              snapshot.flattened_srt[MappingOf(
+                  snapshot, specialization.images[0].indirect_mapping_offset)] == count &&
               snapshot.images.back().dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
   }
@@ -1591,12 +1602,12 @@ void TestUniformizedMaterialImageKeys() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 2u &&
             memory.reads == 4u && memory.descriptor_reads == 2u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset] == 2u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 1u] == 7u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 3u] == 4096u,
+            snapshot.flattened_srt[MappingOf(
+                snapshot, specialization.images[0].indirect_mapping_offset)] == 2u &&
+            snapshot.flattened_srt[MappingOf(
+                snapshot, specialization.images[0].indirect_mapping_offset) + 1u] == 7u &&
+            snapshot.flattened_srt[MappingOf(
+                snapshot, specialization.images[0].indirect_mapping_offset) + 3u] == 4096u,
         "material mask did not limit sparse descriptor reads");
   user_data[8] = first_material;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&

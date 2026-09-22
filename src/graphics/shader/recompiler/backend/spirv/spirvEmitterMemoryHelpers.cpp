@@ -791,7 +791,19 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 	return target;
 }
 
-uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_offset,
+// One word of the flattened SRT, by constant index. Used for the directory, whose words hold the
+// runtime offsets that must not be baked into the module.
+uint32_t LoadFlattenedSrtWord(EmitterState& state, uint32_t index) {
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+	                          state.flattened_srt_variable, ConstantU32(state, 0),
+	                          ConstantU32(state, index));
+	const auto value = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+	return value;
+}
+
+uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
                                      uint32_t iterations, uint32_t key) {
 	const auto LoadMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
@@ -802,7 +814,11 @@ uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_offse
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
 		return value;
 	};
-	const auto mapping  = ConstantU32(state, mapping_offset);
+	// Where the mapping sits is an allocation result: it moves when any earlier table's key count
+	// moves, and a constant here would put that in the module and in the permutation key, so one
+	// table gaining a key would rebuild every table after it. The directory slot is a function of
+	// the resource index alone, so it is the constant, and the offset is loaded through it.
+	const auto mapping  = LoadMapping(ConstantU32(state, mapping_slot));
 	auto       low      = ConstantU32(state, 0u);
 	auto       high     = LoadMapping(mapping);
 	auto       selected = ConstantU32(state, 0u);
