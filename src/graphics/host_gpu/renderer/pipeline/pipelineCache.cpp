@@ -756,7 +756,8 @@ struct PipelineCache::ProgramCache {
 			// so count which one did it and - when it was the specialization - what actually
 			// differed. This is measurement: a run's own answer to how much of its recompilation
 			// is the resource shape changing and how much is not.
-			ReportPermutationMiss(entry->second.permutations, specialization, push_data_cursor);
+			ReportPermutationMiss(entry->second.permutations, entry->second.specialization,
+			                      push_data_cursor);
 		}
 
 		ShaderStageInputInfo stage_input {};
@@ -987,12 +988,103 @@ struct PipelineCache::ProgramCache {
 	uint64_t                                                    next_shader_id = 0;
 };
 
+FragmentLibraryCache::~FragmentLibraryCache() {
+	Common::LockGuard lock(m_mutex);
+	LogHitRate();
+	for (const auto& [key, entry]: m_entries) {
+		(void)key;
+		m_graphics.device.destroyPipeline(entry->library, nullptr);
+		m_graphics.device.destroyPipelineLayout(entry->layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(entry->set_layout, nullptr);
+	}
+	m_entries.clear();
+}
+
+const FragmentLibraryCache::Entry* FragmentLibraryCache::Find(const FragmentLibraryKey& key) {
+	Common::LockGuard lock(m_mutex);
+	const auto        iter = m_entries.find(key);
+	if (iter == m_entries.end()) {
+		m_misses++;
+		MaybeLogHitRateLocked();
+		return nullptr;
+	}
+	m_hits++;
+	MaybeLogHitRateLocked();
+	return iter->second.get();
+}
+
+const FragmentLibraryCache::Entry* FragmentLibraryCache::Insert(const FragmentLibraryKey& key,
+                                                                const Entry&              entry) {
+	Common::LockGuard lock(m_mutex);
+	const auto        iter = m_entries.find(key);
+	if (iter != m_entries.end()) {
+		// Another thread built the same fragment subset while this one was inside the driver. Its
+		// entry is already published and may already be linked into a pipeline, so this one is the
+		// loser and is destroyed here rather than leaked.
+		m_graphics.device.destroyPipeline(entry.library, nullptr);
+		m_graphics.device.destroyPipelineLayout(entry.layout, nullptr);
+		m_graphics.device.destroyDescriptorSetLayout(entry.set_layout, nullptr);
+		return iter->second.get();
+	}
+	auto [inserted_iter, inserted] = m_entries.emplace(key, std::make_unique<Entry>(entry));
+	EXIT_IF(!inserted);
+	return inserted_iter->second.get();
+}
+
+void FragmentLibraryCache::MaybeLogHitRateLocked() const {
+	const auto total = m_hits + m_misses;
+	if (total == 0 || (total & (total - 1u)) != 0u || total == m_reported) {
+		return;
+	}
+	m_reported = total;
+	LogHitRate();
+}
+
+void FragmentLibraryCache::LogHitRate() const {
+	const auto total = m_hits + m_misses;
+	if (total == 0) {
+		return;
+	}
+	const auto since_built  = m_misses - m_reported_misses;
+	const auto since_reused = m_hits - m_reported_hits;
+	const auto since_total  = since_built + since_reused;
+	m_reported_hits         = m_hits;
+	m_reported_misses       = m_misses;
+	// Note 156 estimated 34-47 % of a run's fragment libraries would be repeats, from a static
+	// sweep of the dumped shader corpus. This is that estimate measured on the run that just ran.
+	std::printf("FragmentLibraries: built %" PRIu64 " | reused %" PRIu64 " | lookups %" PRIu64
+	            " | hit rate %.1f%% | since last: built %" PRIu64 " reused %" PRIu64 " (%.1f%%)\n",
+	            m_misses, m_hits, total,
+	            100.0 * static_cast<double>(m_hits) / static_cast<double>(total), since_built,
+	            since_reused,
+	            since_total == 0
+	                ? 0.0
+	                : 100.0 * static_cast<double>(since_reused) / static_cast<double>(since_total));
+	std::fflush(stdout);
+}
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
       m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.subgroup_size)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EnsurePipelineStallWatchdog();
 	InitializeDriverCache();
+	if (graphics.pipeline_library_enabled) {
+		m_fragment_libraries = std::make_unique<FragmentLibraryCache>(graphics);
+	}
+}
+
+void PipelineCache::DestroyPipelineObjects(const Pipeline& pipeline) {
+	// The fragment library is owned by FragmentLibraryCache and shared, so it is not destroyed
+	// here; these three belong to this pipeline alone. Destroying a null handle is a no-op, which
+	// is what every monolithic pipeline hits.
+	m_graphics.device.destroyPipeline(pipeline.library_vertex_input, nullptr);
+	m_graphics.device.destroyPipeline(pipeline.library_pre_raster, nullptr);
+	m_graphics.device.destroyPipeline(pipeline.library_fragment_output, nullptr);
+	m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.pixel_descriptor_set_layout, nullptr);
 }
 
 PipelineCache::~PipelineCache() {
@@ -1007,6 +1099,8 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
+	// After the pipelines, because a linked pipeline references its fragment library.
+	m_fragment_libraries.reset();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -1346,6 +1440,42 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 	return std::memcmp(this, &other, sizeof(*this)) == 0;
 }
 
+// Field by field rather than memcmp: the struct has padding, and a library served on a padding
+// byte would be served on nothing at all.
+bool FragmentLibraryKey::operator==(const FragmentLibraryKey& other) const noexcept {
+	return ps_shader_id == other.ps_shader_id && samples == other.samples &&
+	       sample_shading_enable == other.sample_shading_enable &&
+	       stencil_test_enable == other.stencil_test_enable &&
+	       std::memcmp(&stencil_front, &other.stencil_front, sizeof(stencil_front)) == 0 &&
+	       std::memcmp(&stencil_back, &other.stencil_back, sizeof(stencil_back)) == 0 &&
+	       depth_format == other.depth_format && stencil_format == other.stencil_format;
+}
+
+// The same mix PipelineCache uses for its own keys, repeated here because that one is a private
+// nested type and this hash is not a member of anything.
+static void MixFragmentKey(std::size_t& hash, std::size_t value) {
+	hash ^= value + static_cast<std::size_t>(0x9e3779b97f4a7c15ull) + (hash << 6u) + (hash >> 2u);
+}
+
+std::size_t FragmentLibraryKeyHash::operator()(const FragmentLibraryKey& key) const noexcept {
+	std::size_t hash = 0;
+	MixFragmentKey(hash, static_cast<std::size_t>(key.ps_shader_id));
+	MixFragmentKey(hash, key.samples);
+	MixFragmentKey(hash, static_cast<std::size_t>(key.sample_shading_enable) |
+	                         (static_cast<std::size_t>(key.stencil_test_enable) << 1u));
+	const auto* front = reinterpret_cast<const uint8_t*>(&key.stencil_front);
+	for (std::size_t i = 0; i < sizeof(key.stencil_front); i++) {
+		MixFragmentKey(hash, front[i]);
+	}
+	const auto* back = reinterpret_cast<const uint8_t*>(&key.stencil_back);
+	for (std::size_t i = 0; i < sizeof(key.stencil_back); i++) {
+		MixFragmentKey(hash, back[i]);
+	}
+	MixFragmentKey(hash, static_cast<std::size_t>(key.depth_format));
+	MixFragmentKey(hash, static_cast<std::size_t>(key.stencil_format));
+	return hash;
+}
+
 PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
     std::span<const RenderColorInfo> colors, const RenderDepthInfo& depth,
     std::span<const ShaderVertexInputInfo> vertex_info, CommandBuffer& command,
@@ -1536,7 +1666,9 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                            ps_active ? pixel_program.hash : 0,
 		                            ps_active ? pixel_program.spirv_words : 0);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
-		                       ps_input_info, programs, static_params, m_driver_cache);
+		                       ps_input_info, programs, static_params, m_driver_cache,
+		                       m_fragment_libraries.get());
+
 	}
 
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);
