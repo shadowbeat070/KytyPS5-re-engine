@@ -31,6 +31,15 @@ void Check(bool condition, const char *message) {
   }
 }
 
+// A table's specialization names a directory slot in the flattened SRT, and the slot holds the
+// table's real mapping offset - the offset is an allocation result and would respecialize every
+// table after it if it reached the module. Tests that read a mapping take the same hop the module
+// does.
+uint32_t MappingOf(const ResourceSnapshot &snapshot, uint32_t slot) {
+  return slot < snapshot.flattened_srt.size() ? snapshot.flattened_srt[slot]
+                                              : std::numeric_limits<uint32_t>::max();
+}
+
 bool SameResourceSnapshot(const ResourceSnapshot &lhs,
                           const ResourceSnapshot &rhs) {
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
@@ -541,6 +550,172 @@ void TestInvariantIndirectImageMaterialization() {
     Check(walker.Evaluate(handle->Arg(0), offset) && offset == expected,
           "GPU descriptor offset projection lost U32 wrap or scalar immediate carry");
   }
+  memory.words[(0x2000u - memory.base) / 4u + 1u] = image_descriptor[1];
+  memory.words[(0x2000u - memory.base) / 4u + 3u] = image_descriptor[3];
+  memory.words[(0x2020u - memory.base) / 4u + 1u] = image_descriptor[1];
+  memory.words[(0x2020u - memory.base) / 4u + 3u] =
+      image_descriptor[3] ^ (1u << 28u);
+  ResourceSnapshot null_snapshot;
+  ResourceSpecialization null_specialization;
+  Check(MaterializeResources(resource_plan, runtime, null_snapshot,
+                             null_specialization) &&
+            std::ranges::all_of(null_snapshot.images[0].dwords,
+                                [](uint32_t dword) { return dword == 0u; }),
+        "stale typed null image descriptors were not canonicalized");
+
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  memory.words[(0x2020u - memory.base) / 4u] ^= 1u;
+  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+  ResourceSnapshot dynamic_snapshot;
+  ResourceSpecialization dynamic_specialization;
+  Check(MaterializeResources(resource_plan, runtime, dynamic_snapshot,
+                             dynamic_specialization) &&
+            dynamic_snapshot.images.size() == 2 &&
+            dynamic_specialization.images.size() == 2,
+        "dynamic indirect image table did not materialize");
+  const auto second_image = (0x2020u - memory.base) / 4u;
+  memory.words[second_image + 1u] |= 3u << 30u;
+  memory.words[second_image + 2u] = 3u << 14u;
+  memory.words[second_image + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
+  memory.words[second_image + 4u] = 11u;
+  ResourceSnapshot mixed_snapshot;
+  ResourceSpecialization mixed_specialization;
+  Check(MaterializeResources(resource_plan, runtime, mixed_snapshot,
+                             mixed_specialization) &&
+            mixed_snapshot.images.size() == 2 &&
+            mixed_specialization.images.size() == 2 &&
+            mixed_specialization.images[0].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            !mixed_specialization.images[0].cube &&
+            mixed_specialization.images[1].dimension ==
+                Decoder::ImageDimension::Dim2DArray &&
+            mixed_specialization.images[1].cube &&
+            std::equal(mixed_snapshot.images[1].dwords.begin(),
+                       mixed_snapshot.images[1].dwords.end(),
+                       memory.words.begin() + second_image),
+        "mixed 2D and cube candidates were rejected or discarded");
+  memory.words[second_image + 1u] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32UInt)
+          << 20u |
+      (3u << 30u);
+  Check(!MaterializeResources(resource_plan, runtime, mixed_snapshot,
+                              mixed_specialization),
+        "indirect images with different numeric classes were accepted");
+  for (const auto dword : {1u, 2u, 3u, 4u}) {
+    memory.words[second_image + dword] = image_descriptor[dword];
+  }
+  ApplyResourceSpecialization(fixture->program, dynamic_specialization);
+  Check(fixture->program.info.images.size() == 2 &&
+            fixture->program.info.images[0].indirect_root == 0 &&
+            fixture->program.info.images[0].indirect_search_iterations != 0 &&
+            fixture->program.info.images[0].indirect_resources.size() == 2 &&
+            dynamic_snapshot.images.size() == 2,
+        "dynamic indirect image table was not specialized transactionally");
+  const auto &mapping = dynamic_specialization.images[0];
+  const auto mapping_offset =
+      MappingOf(dynamic_snapshot, mapping.indirect_mapping_offset);
+  const auto key_count = dynamic_snapshot.flattened_srt[mapping_offset];
+  Check(mapping.indirect_search_iterations == std::bit_width(key_count) &&
+            mapping_offset + 1u + key_count * 2u ==
+                dynamic_snapshot.flattened_srt.size(),
+        "indirect image mapping retained worst-case padding");
+
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2000u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+    memory.words[(0x2020u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  memory.words[(0x2000u - memory.base) / 4u] += 0x100u;
+  memory.words[(0x2020u - memory.base) / 4u] += 0x101u;
+  ResourceSnapshot rebound_snapshot;
+  ResourceSpecialization rebound_specialization;
+  Check(MaterializeResources(resource_plan, runtime, rebound_snapshot,
+                             rebound_specialization) &&
+            rebound_specialization == dynamic_specialization,
+        "stable indirect key mapping did not accept changed image addresses");
+  memory.words[(0x2020u - memory.base) / 4u] =
+      memory.words[(0x2000u - memory.base) / 4u];
+  Check(MaterializeResources(resource_plan, runtime, rebound_snapshot,
+                             rebound_specialization) &&
+            rebound_specialization != dynamic_specialization,
+        "collapsed indirect candidates did not select a new specialization");
+  const auto collapsed_specialization = rebound_specialization;
+  ResourceSnapshot capacity_snapshot;
+  ResourceSpecialization capacity_specialization;
+  for (const uint32_t records : {1u, 3u}) {
+    user_data[2] = records;
+    Check(MaterializeResources(resource_plan, runtime, capacity_snapshot,
+                               capacity_specialization),
+          "runtime indirect key mapping rejected a valid material-table size");
+  }
+  user_data[2] = 2u;
+  memory.words[(0x2020u - memory.base) / 4u] =
+      memory.words[(0x2000u - memory.base) / 4u] + 1u;
+  memory.words[(0x2040u - memory.base) / 4u] =
+      memory.words[(0x2000u - memory.base) / 4u] + 2u;
+  for (uint32_t dword = 1; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2040u - memory.base) / 4u + dword] =
+        image_descriptor[dword];
+  }
+  memory.words[(0x1000u - memory.base + 68u) / 4u] = 2u;
+  Check(MaterializeResources(resource_plan, runtime, rebound_snapshot,
+                             rebound_specialization) &&
+            rebound_specialization != collapsed_specialization,
+        "larger indirect candidate topology reused the old specialization");
+
+  auto memory_backed = MakeIndirectImageFixture(false, 4u, true);
+  memory_backed->PlanAndTrack();
+  auto memory_backed_plan = ExtractResourcePlan(memory_backed->program);
+  EliminateDeadCode(memory_backed->program.blocks);
+  std::array<uint32_t, 11> memory_backed_user_data{0x1000u, 224u << 16u, 2u, 0u,
+                                                   0x2000u, 16u << 16u,  4u, 0u,
+                                                   7u,      0x3100u,     0u};
+  memory.words[(0x3100u - memory.base) / 4u] = 0x3000u;
+  memory.words[(0x3000u - memory.base) / 4u] = 0x1000u;
+  memory.fail_address = 0x3100u;
+  SrtRuntime memory_backed_runtime{.user_data = memory_backed_user_data,
+                                   .userdata = &memory,
+                                   .read_specialization_memory =
+                                       ReadLinearTestMemory};
+  Check(!MaterializeResources(memory_backed_plan, memory_backed_runtime,
+                              snapshot, specialization),
+        "unreadable indirect table descriptor was accepted");
+  memory.fail_address = UINT64_MAX;
+
+  memory.watched_address = 0x3100u;
+  memory.watched_reads = 0;
+  Check(MaterializeResources(memory_backed_plan, memory_backed_runtime,
+                             snapshot, specialization) && memory.watched_reads == 1u,
+        "descriptor, flattened SRT and indirect-table roots repeated a clean pointer read");
+  const auto* buffer_storage = snapshot.buffers.data();
+  const auto* image_storage = snapshot.images.data();
+  const auto* flat_storage = snapshot.flattened_srt.data();
+  const auto* user_data_storage = snapshot.user_data.data();
+  const auto* buffer_specialization_storage = specialization.buffers.data();
+  const auto* image_specialization_storage = specialization.images.data();
+  const auto old_address = snapshot.images[0].dwords[0];
+  memory.words[(0x2000u - memory.base) / 4u] += 0x100u;
+  memory.watched_reads = 0;
+  Check(MaterializeResources(memory_backed_plan, memory_backed_runtime,
+                             snapshot, specialization) && memory.watched_reads == 1u &&
+            snapshot.images[0].dwords[0] == old_address + 0x100u,
+        "cache refresh reused stale table contents or repeated its clean pointer read");
+  Check(snapshot.buffers.data() == buffer_storage && snapshot.images.data() == image_storage &&
+            snapshot.flattened_srt.data() == flat_storage &&
+            snapshot.user_data.data() == user_data_storage &&
+            specialization.buffers.data() == buffer_specialization_storage &&
+            specialization.images.data() == image_specialization_storage,
+        "a same-shape refresh discarded the runtime output storage");
+
   auto malformed = MakeIndirectImageFixture(true);
   CheckFatal([&] { malformed->PlanAndTrack(); }, "not a valid runtime value",
              "noncontiguous descriptor DWORDs entered the table plan");
@@ -750,7 +925,7 @@ void TestGuardedDirectImageTable() {
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 32u && specialization.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            snapshot.flattened_srt[MappingOf(snapshot, specialization.images[0].indirect_mapping_offset)] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
   const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
@@ -762,7 +937,7 @@ void TestGuardedDirectImageTable() {
              memory.words.begin() + captured_word);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 32u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 32u &&
+            snapshot.flattened_srt[MappingOf(snapshot, specialization.images[0].indirect_mapping_offset)] == 32u &&
             std::ranges::all_of(snapshot.images[16].dwords,
                                 [](uint32_t word) { return word == 0u; }),
         "captured non-descriptor record became a host image or lost its key mapping");
@@ -1130,8 +1305,8 @@ void TestBoundedComputeImageLoop() {
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
               snapshot.images.size() == count &&
               specialization.images.size() == count &&
-              snapshot.flattened_srt[
-                  specialization.images[0].indirect_mapping_offset] == count &&
+              snapshot.flattened_srt[MappingOf(
+                  snapshot, specialization.images[0].indirect_mapping_offset)] == count &&
               snapshot.images.back().dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
   }
@@ -1495,12 +1670,12 @@ void TestUniformizedMaterialImageKeys() {
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 2u &&
             memory.reads == 4u && memory.descriptor_reads == 2u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset] == 2u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 1u] == 7u &&
-            snapshot.flattened_srt[
-                specialization.images[0].indirect_mapping_offset + 3u] == 4096u,
+            snapshot.flattened_srt[MappingOf(
+                snapshot, specialization.images[0].indirect_mapping_offset)] == 2u &&
+            snapshot.flattened_srt[MappingOf(
+                snapshot, specialization.images[0].indirect_mapping_offset) + 1u] == 7u &&
+            snapshot.flattened_srt[MappingOf(
+                snapshot, specialization.images[0].indirect_mapping_offset) + 3u] == 4096u,
         "material mask did not limit sparse descriptor reads");
   user_data[8] = first_material;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&

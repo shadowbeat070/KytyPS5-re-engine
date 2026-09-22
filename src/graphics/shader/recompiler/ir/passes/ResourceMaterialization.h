@@ -48,17 +48,17 @@ struct ResourceSpecialization {
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
-//
-// `unfoldable_pcs`, when given, receives the `first_use_pc` of every resource whose descriptor
-// source this call had to leave null because no host value stands for it. That is a measurement,
-// not a diagnostic: it is the one thing tracking cannot work out for itself, and handing it back
-// to a later translate is what lets such a resource be served from a table instead of from null.
-// See ResourcePlan::unfoldable_pcs.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
 // Applies an already-derived specialization to native IR before layout and emission.
-void ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization);
+// Names the first field two specializations differ in, or nullptr when they match. Reporting
+// only, but it is what tells a redundant permutation apart from a genuinely new one.
+[[nodiscard]] const char* FirstSpecializationDifference(const ResourceSpecialization& before,
+                                                       const ResourceSpecialization& after);
+// False when the specialization does not describe this translation of the program.
+[[nodiscard]] bool ApplyResourceSpecialization(Program&                      program,
+                                               const ResourceSpecialization& specialization);
 
 // How many times an indirect image table has been enumerated rather than reused. A reused table
 // reads the same words as a re-derived one, so this is what separates the two.
