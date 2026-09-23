@@ -343,6 +343,11 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 				    input_info.pixel->ps_sample_mask_export_enable) {
 					AddOutput(info, StageOutputKind::SampleMask, 0, 0, "gl_SampleMask");
 				}
+				if (program.stage == ShaderType::Pixel && (export_info.en & 0x2u) != 0 &&
+				    (input_info.pixel->ps_stencil_test_val_export_enable ||
+				     input_info.pixel->ps_stencil_op_val_export_enable)) {
+					AddOutput(info, StageOutputKind::Stencil, 0, 0, "gl_FragStencilRefARB");
+				}
 				continue;
 			}
 			if (export_info.en == 0) {

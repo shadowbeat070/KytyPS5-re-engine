@@ -164,6 +164,7 @@ struct EmitterState {
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
 	uint32_t                   pixel_valid_mask_variable             = 0;
+	uint32_t                   stencil_bit_pass_variable             = 0;
 	// Loop budget guard: when armed, every loop header this emitter can reach charges one unit
 	// against a per-invocation budget and leaves the loop when it runs out, so a runaway trip
 	// count becomes a wrong picture rather than a device lost to the watchdog.
@@ -183,6 +184,7 @@ struct EmitterState {
 	uint32_t                   layer_variable                        = 0;
 	uint32_t                   viewport_index_variable               = 0;
 	uint32_t                   depth_variable                        = 0;
+	uint32_t                   stencil_ref_variable                  = 0;
 	uint32_t                   sample_mask_variable                  = 0;
 	std::vector<InputBinding>  inputs;
 	std::vector<OutputBinding> outputs;

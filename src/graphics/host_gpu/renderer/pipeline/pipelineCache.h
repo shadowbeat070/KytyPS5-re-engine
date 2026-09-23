@@ -22,6 +22,7 @@ namespace Libs::Graphics {
 struct GraphicContext;
 struct RenderColorInfo;
 struct RenderDepthInfo;
+struct ShaderParams;
 class CommandBuffer;
 
 namespace HW {
@@ -250,6 +251,9 @@ public:
 	struct GraphicsPrograms {
 		std::array<ShaderProgram, 3> vertex;
 		ShaderProgram pixel;
+		std::array<ShaderProgram, 8>      stencil_bit_pixel;
+		std::array<ShaderStageRuntime, 8> stencil_bit_stage;
+		uint8_t                           stencil_bit_mask = 0;
 
 		[[nodiscard]] uint32_t VertexStageCount() const { return vertex[1] ? 3u : 1u; }
 	};
@@ -276,6 +280,10 @@ public:
 
 private:
 	struct ProgramCache;
+
+	void GetStencilBitPrograms(const ShaderParams&         pixel_params,
+	                           const ShaderPixelInputInfo& pixel_info, uint32_t pixel_cursor,
+	                           uint32_t next_cursor, uint8_t bits, GraphicsPrograms& result);
 
 	struct GraphicsPipelineKey {
 		PipelineRenderingState   rendering;
