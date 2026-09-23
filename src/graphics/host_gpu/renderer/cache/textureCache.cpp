@@ -783,9 +783,18 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
 	}
 	PrepareImageCopy(destination);
+	const bool stencil_involved = Image::FormatHasStencil(source.backing.format) ||
+	                              Image::FormatHasStencil(destination.backing.format);
 	if (source.IsBufferModified()) {
 		if (source.info.data == destination.info.data) {
 			destination.MarkBufferModified();
+		}
+		if (stencil_involved) {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: stencil_copy_dropped path=buffer_modified addr=0x%016" PRIx64
+			           " %s -> %s\n",
+			           source.info.data.address, vk::to_string(source.backing.format).c_str(),
+			           vk::to_string(destination.backing.format).c_str());
 		}
 		return;
 	}
@@ -799,6 +808,17 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 	    (source.backing.format == destination.backing.format ||
 	     (!source_depth && !dest_depth &&
 	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
+	if (stencil_involved) {
+		const bool carried =
+		    direct_copy && Image::CopyCarriesStencil(source.backing.format,
+		                                             destination.backing.format);
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "TextureCache: %s path=%s addr=0x%016" PRIx64 " %s -> %s\n",
+		           carried ? "stencil_copy_carried" : "stencil_copy_dropped",
+		           direct_copy ? "direct" : "cross_format", source.info.data.address,
+		           vk::to_string(source.backing.format).c_str(),
+		           vk::to_string(destination.backing.format).c_str());
+	}
 	if (direct_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
@@ -1517,6 +1537,7 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	if (!depth.info.IsDepth() || !depth.info.HasStencil()) {
 		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
 	}
+	depth.info.stencil = stencil;
 
 	ImageId association {};
 	for (const auto id: FindImagesInRegion(stencil.address, stencil.size, false)) {
@@ -1876,6 +1897,21 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			candidate_subresources = owner->stencil_subresources;
 			owner        = m_slot_images.try_get(candidate_id);
 			if (owner == nullptr || owner->backing.image == nullptr || !owner->info.HasStencil()) {
+				continue;
+			}
+			// A stale proxy fill erases the current plane; a partial view's own slice is current.
+			const auto& plane         = owner->info.stencil;
+			const auto& bound         = owner->stencil_subresources;
+			bool        current_plane = plane == GuestRange {address, size};
+			if (!current_plane && bound.layer_count != 0 && plane.size % bound.layer_count == 0) {
+				const auto slice = plane.size / bound.layer_count;
+				const auto shift = uint64_t {bound.base_layer} * slice;
+				current_plane    = slice != 0 && plane.address >= shift &&
+				                address == plane.address - shift +
+				                               uint64_t {candidate_subresources.base_layer} * slice &&
+				                size == uint64_t {candidate_subresources.layer_count} * slice;
+			}
+			if (!current_plane) {
 				continue;
 			}
 		} else if (!owner->depth_id && owner->info.data.address == address &&

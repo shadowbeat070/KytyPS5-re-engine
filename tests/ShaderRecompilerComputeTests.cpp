@@ -7015,6 +7015,25 @@ public:
       }
       DestroyBuffer(&stencil_readback);
 
+      constexpr uint64_t stale_stencil_offset = 0x27e4000;
+      TextureCacheTestAccess::AssociateStencil(texture_cache, stencil_clear_id,
+                                               stencil_clear_desc.info.stencil);
+      TextureCacheTestAccess::AssociateStencil(
+          texture_cache, stencil_clear_id,
+          GuestRange{base + stale_stencil_offset, 0x1000});
+      Require(name, "current stencil plane fill clears",
+              texture_cache.ClearImageFromBuffer(command,
+                                                 base + stale_stencil_offset,
+                                                 0x1000, 0x01010101u),
+              "a fill covering the depth image's own stencil plane was not "
+              "consumed as a stencil clear");
+      Require(name, "stale stencil proxy fill declined",
+              !texture_cache.ClearImageFromBuffer(
+                  command, stencil_clear_desc.info.stencil.address,
+                  stencil_clear_desc.info.stencil.size, 0x00000000u),
+              "a fill over a superseded stencil proxy was converted into a "
+              "total clear of the live stencil plane");
+
       constexpr uint64_t partial_image_offset = 0xa000;
       constexpr uint64_t partial_buffer_offset = 0xa010;
       constexpr uint64_t partial_clean_offset = 0xa020;

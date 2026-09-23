@@ -150,6 +150,12 @@ public:
 	}
 	[[nodiscard]] uint64_t HashGuestEdges() const;
 
+	[[nodiscard]] static bool FormatHasStencil(vk::Format format) noexcept;
+	// vkCmdCopyImage requires the source and destination aspect masks to agree once either image
+	// is depth/stencil, so stencil can only ride along when the two backing formats are identical.
+	[[nodiscard]] static bool CopyCarriesStencil(vk::Format source,
+	                                             vk::Format destination) noexcept;
+
 	ImageInfo        info;
 	VulkanImage      backing;
 	std::vector<CachedImageView> views;
