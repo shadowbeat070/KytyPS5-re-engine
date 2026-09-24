@@ -226,6 +226,9 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 
+	// Null before InitializeDriverCache and after Save(), which Vulkan accepts as "no cache".
+	[[nodiscard]] vk::PipelineCache DriverCache() const { return m_driver_cache; }
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;

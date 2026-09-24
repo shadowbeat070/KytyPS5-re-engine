@@ -19,7 +19,6 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
-#include "kytyGitVersion.h"
 #include "loader/systemContent.h"
 
 #include <algorithm>
@@ -92,8 +91,11 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 uint64_t EmulatorBinaryHash() {
 	std::filesystem::path exe;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
-	char* program = nullptr;
-	if (_get_pgmptr(&program) == 0 && program != nullptr) {
+	// The Windows entry point is wmain, so the CRT never initializes the narrow program path and
+	// _get_pgmptr does not report that as an error: it fails validation, and the invalid-parameter
+	// handler is noreturn, so asking for the narrow copy kills the process.
+	wchar_t* program = nullptr;
+	if (_get_wpgmptr(&program) == 0 && program != nullptr) {
 		exe = std::filesystem::path(program);
 	}
 #else
@@ -134,21 +136,49 @@ uint64_t EmulatorBinaryHash() {
 	return hash == 0 ? 1 : hash;
 }
 
-std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties,
-                                 uint64_t                            build_hash) {
+// Vulkan defines cache compatibility on the device and pipelineCacheUUID, not on our build.
+uint64_t DriverCacheKey(const vk::PhysicalDeviceProperties& properties) {
+	struct Identity {
+		uint32_t vendor_id      = 0;
+		uint32_t device_id      = 0;
+		uint32_t driver_version = 0;
+		uint8_t  uuid[VK_UUID_SIZE] {};
+	} identity {};
+	static_assert(sizeof(Identity) == 3 * sizeof(uint32_t) + VK_UUID_SIZE);
+	identity.vendor_id      = properties.vendorID;
+	identity.device_id      = properties.deviceID;
+	identity.driver_version = properties.driverVersion;
+	std::memcpy(identity.uuid, properties.pipelineCacheUUID.data(), VK_UUID_SIZE);
+	const auto hash = XXH3_64bits(&identity, sizeof(identity));
+	return hash == 0 ? 1 : hash;
+}
+
+constexpr std::string_view DriverCacheMagic = "KytyPC3:";
+
+std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
 	for (size_t i = 0; i < VK_UUID_SIZE; i++) {
 		uuid[i * 2]     = hex[properties.pipelineCacheUUID[i] >> 4u];
 		uuid[i * 2 + 1] = hex[properties.pipelineCacheUUID[i] & 0xfu];
 	}
-	return fmt::format("KytyPC2:{}:{:016x}:{:08x}:{:08x}:{:08x}:{}\n", KYTY_GIT_REVISION,
-	                   build_hash, properties.vendorID, properties.deviceID,
-	                   properties.driverVersion, uuid);
+	return fmt::format("{}{:08x}:{:08x}:{:08x}:{}\n", DriverCacheMagic, properties.vendorID,
+	                   properties.deviceID, properties.driverVersion, uuid);
 }
 
-// Each build keys its own file; keep one older file so alternating builds still hit. These blobs
-// run to hundreds of megabytes, so the rest go.
+bool DriverCacheFileIsCurrentFormat(const std::filesystem::path& path) {
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return false;
+	}
+	std::string magic(DriverCacheMagic.size(), '\0');
+	uint32_t    read = 0;
+	file.Read(magic.data(), static_cast<uint32_t>(magic.size()), &read);
+	file.Close();
+	return read == magic.size() && magic == DriverCacheMagic;
+}
+
+// Keep the previous driver's file in case of a rollback; an older format can never load again.
 void PruneDriverCaches(const std::filesystem::path& folder, const std::string& title_id,
                        const std::string& keep) {
 	constexpr size_t KeepMax = 2;
@@ -171,6 +201,10 @@ void PruneDriverCaches(const std::filesystem::path& folder, const std::string& t
 			continue;
 		}
 		auto path = folder / entry.name;
+		if (!DriverCacheFileIsCurrentFormat(path)) {
+			Common::File::DeleteFile(path);
+			continue;
+		}
 		others.emplace_back(Common::File::GetLastWriteTimeUTC(path), std::move(path));
 	}
 	if (others.size() < KeepMax) {
@@ -344,10 +378,15 @@ bool ValidateShaderSpirv(const char* label, uint64_t shader_hash,
 // here, the largest of which is 3955 words.
 constexpr size_t MaxDispatcherSpirvWords = 131072;
 
+// A VkPipelineCache cannot evict, so past this size the blob on disk stops growing.
+constexpr uint64_t MaxDriverCacheBytes = uint64_t {1} << 30u;
+
 // A pipeline creation still inside the driver after this long is pathological: a healthy one
 // returns at once, while the SILENT HILL 2 loading-screen stall runs past a minute.
 constexpr std::chrono::nanoseconds PipelineStallThreshold = std::chrono::seconds {5};
 constexpr std::chrono::nanoseconds PipelineStallRepeat    = std::chrono::seconds {15};
+// A finished creation is still named from here, long enough to show as a hitch.
+constexpr std::chrono::nanoseconds PipelineSlowThreshold = std::chrono::milliseconds {250};
 
 struct PipelineCreationSlot {
 	std::atomic<bool> claimed {false};
@@ -377,11 +416,11 @@ void PrintPipelineStallLine(bool compute, const uint64_t hash[2], const uint32_t
                             const char* phase, int64_t elapsed_ns) {
 	const double seconds = static_cast<double>(elapsed_ns) / 1e9;
 	if (compute) {
-		std::printf("PipelineStall: compute pipeline %s after %.1fs cs=0x%016" PRIx64
+		std::printf("PipelineStall: compute pipeline %s after %.2fs cs=0x%016" PRIx64
 		            " spirv_words=%" PRIu32 "\n",
 		            phase, seconds, hash[0], words[0]);
 	} else {
-		std::printf("PipelineStall: graphics pipeline %s after %.1fs vs=0x%016" PRIx64
+		std::printf("PipelineStall: graphics pipeline %s after %.2fs vs=0x%016" PRIx64
 		            " spirv_words=%" PRIu32 " ps=0x%016" PRIx64 " spirv_words=%" PRIu32 "\n",
 		            phase, seconds, hash[0], words[0], hash[1], words[1]);
 	}
@@ -485,7 +524,7 @@ public:
 		}
 		g_pipelines_in_flight.fetch_sub(1, std::memory_order_relaxed);
 		g_pipelines_completed.fetch_add(1, std::memory_order_relaxed);
-		if (elapsed >= PipelineStallThreshold.count()) {
+		if (elapsed >= PipelineSlowThreshold.count()) {
 			PrintPipelineStallSummary();
 			PrintPipelineStallLine(m_compute, m_hash, m_words, "finished", elapsed);
 		}
@@ -1140,21 +1179,13 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
+	// Still the CFG cache's stamp: a stored graph depends on the structurizer that built it.
 	m_build_hash = EmulatorBinaryHash();
-	if (m_build_hash == 0) {
-		// Without a fingerprint the only key left is the git revision, which identifies a clean
-		// build and nothing else.
-		const std::string_view git_hash     = KYTY_GIT_HASH;
-		const std::string_view git_revision = KYTY_GIT_REVISION;
-		if (git_hash == "unknown" || git_revision == "unknown" || git_hash.ends_with("-dirty")) {
-			PipelineCacheLog("Vulkan pipeline cache: disabled (build cannot be identified)");
-			return;
-		}
-	}
 
 	const std::filesystem::path folder("_PipelineCache");
 	InitializeCfgCache(folder, title_id);
-	const auto                  name = fmt::format("{}-{:016x}.bin", title_id, m_build_hash);
+	const auto driver_key = DriverCacheKey(m_graphics.GetPhysicalDeviceProperties());
+	const auto name       = fmt::format("{}-{:016x}.bin", title_id, driver_key);
 	PruneDriverCaches(folder, title_id, name);
 	m_driver_cache_path     = folder / name;
 	const auto path         = Common::PathToString(m_driver_cache_path);
@@ -1168,8 +1199,7 @@ void PipelineCache::InitializeDriverCache() {
 	if (cache_exists) {
 		Common::File file(m_driver_cache_path, Common::File::Mode::Read);
 		const auto   file_size = file.IsInvalid() ? 0 : file.Size();
-		const auto   signature =
-		    DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_build_hash);
+		const auto   signature = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 		if (file_size >= signature.size() + sizeof(uint64_t) &&
 		    file_size <= std::numeric_limits<uint32_t>::max()) {
 			std::string cached_signature(signature.size(), '\0');
@@ -1306,6 +1336,15 @@ bool PipelineCache::WriteDriverCacheLocked() {
 	for (uint32_t attempt = 0; attempt < 3; attempt++) {
 		size   = 0;
 		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
+		if (result == vk::Result::eSuccess && size > MaxDriverCacheBytes) {
+			static bool reported = false;
+			if (!std::exchange(reported, true)) {
+				PipelineCacheLog("Vulkan pipeline cache: not saving, {} bytes is over the {} byte "
+				                 "budget (the file already on disk is kept)",
+				                 size, MaxDriverCacheBytes);
+			}
+			return false;
+		}
 		if (result != vk::Result::eSuccess || size == 0 ||
 		    size > std::numeric_limits<uint32_t>::max()) {
 			break;
@@ -1323,7 +1362,7 @@ bool PipelineCache::WriteDriverCacheLocked() {
 		return false;
 	}
 	payload.resize(size);
-	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties(), m_build_hash);
+	auto prefix = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
 	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
 	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
 	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
