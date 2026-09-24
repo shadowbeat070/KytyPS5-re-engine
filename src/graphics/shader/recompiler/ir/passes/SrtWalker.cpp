@@ -465,6 +465,13 @@ private:
 			    index.U32() >= 4u ||
 			    (source->GetOpcode() != ValueOpcode::Ballot &&
 			     source->GetOpcode() != ValueOpcode::LoadBufferU32x4)) {
+				// Four conditions share this reason; the one that fires is an unhandled producer,
+				// and naming it is the fact triage needs.
+				if (m_failure != nullptr && source != nullptr) {
+					m_failure->entry_opcode      = source->GetOpcode();
+					m_failure->other_opcode      = op;
+					m_failure->has_entry_opcodes = true;
+				}
 				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 		} else if (op == ValueOpcode::CompositeExtractU64) {
@@ -608,16 +615,25 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	if (!value.IsEmpty()) {
 		return EvaluateWide(value, result);
 	}
-	if (m_barred.contains(&inst)) {
+	const auto refuse_phi = [&](PhiReject reason) {
+		if (m_phi_reject == PhiReject::None) {
+			m_phi_reject = reason;
+		}
 		return false;
+	};
+	if (m_barred.contains(&inst)) {
+		return refuse_phi(PhiReject::Barred);
 	}
 	// Loop-carried: assume the entry value and require every operand to reproduce it, which
 	// makes it the value the phi holds on every iteration.
 	std::vector<const Inst*> web;
 	const auto entry = ResolveCyclicPhiEntry(m_program, Value(const_cast<Inst*>(&inst)), &web);
 	uint64_t   candidate = 0;
-	if (entry.IsEmpty() || !EvaluateWide(entry, candidate)) {
-		return false;
+	if (entry.IsEmpty()) {
+		return refuse_phi(PhiReject::NoEntry);
+	}
+	if (!EvaluateWide(entry, candidate)) {
+		return refuse_phi(PhiReject::EntryUnevaluable);
 	}
 	// A separate walk, because this one's memo already holds the operands the phi was reached
 	// through and re-entering them would read as a cycle.
@@ -632,14 +648,14 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 		// The whole web holds the candidate on one iteration, so assume all of it at once.
 		const auto assumed = trial.m_assumed.emplace(member, candidate);
 		if (!assumed.second && assumed.first->second != candidate) {
-			return false;
+			return refuse_phi(PhiReject::WebAssumptionConflict);
 		}
 	}
 	for (const auto* member: web) {
 		for (size_t index = 0; index < member->NumArgs(); index++) {
 			uint64_t carried = 0;
 			if (!trial.EvaluateWide(member->Arg(index), carried) || carried != candidate) {
-				return false;
+				return refuse_phi(PhiReject::OperandVariesPerIteration);
 			}
 		}
 	}
@@ -714,9 +730,15 @@ bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component,
 
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
                                uint32_t component_bytes) {
+	const auto RefuseRawRead = [&](RawReadReject reason) {
+		if (m_raw_read_reject == RawReadReject::None) {
+			m_raw_read_reject = reason;
+		}
+		return false;
+	};
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= m_program.memory_info.size()) {
-		return false;
+		return RefuseRawRead(RawReadReject::MemoryIndexOutOfRange);
 	}
 	const auto& mem    = m_program.memory_info[flags.index];
 	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
@@ -731,14 +753,28 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 	}
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr) {
-		return false;
+		return RefuseRawRead(RawReadReject::NoHandle);
 	}
-	uint64_t low    = 0;
-	uint64_t high   = 0;
-	uint64_t offset = 0;
-	if (!Arg(*handle, 0, low) || !Arg(*handle, 1, high) ||
-	    !Arg(inst, RawReadOffsetArg(inst.GetOpcode()), offset)) {
-		return false;
+	uint64_t   low        = 0;
+	uint64_t   high       = 0;
+	uint64_t   offset     = 0;
+	const auto offset_arg = RawReadOffsetArg(inst.GetOpcode());
+	const auto refuse_operand = [&](const char* name, Value value) {
+		if (m_raw_read_reject == RawReadReject::None) {
+			m_raw_read_operand = name;
+			ValidateRuntimeValue(m_program, value, RuntimeValueType::Any,
+			                     &m_raw_read_operand_failure);
+		}
+		return RefuseRawRead(RawReadReject::HandleOperandUnavailable);
+	};
+	if (!Arg(*handle, 0, low)) {
+		return refuse_operand("base low", handle->Arg(0));
+	}
+	if (!Arg(*handle, 1, high)) {
+		return refuse_operand("base high", handle->Arg(1));
+	}
+	if (!Arg(inst, offset_arg, offset)) {
+		return refuse_operand("offset", inst.Arg(offset_arg));
 	}
 	const auto base = (high << 32u) | static_cast<uint32_t>(low);
 	const auto immediate =
@@ -750,21 +786,21 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
-			return false;
+			return RefuseRawRead(RawReadReject::DescriptorOperandUnavailable);
 		}
 		if (immediate < 0) {
-			return false;
+			return RefuseRawRead(RawReadReject::NegativeImmediate);
 		}
 		const bool vector_load = inst.GetOpcode() != ValueOpcode::ReadConstBuffer;
 		const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 		// A vector load adds the thread ID to its index when V# asks, so no one value holds.
 		if (vector_load && ((static_cast<uint32_t>(word3) >> 23u) & 1u) != 0u) {
-			return false;
+			return RefuseRawRead(RawReadReject::AddTidIndexing);
 		}
 		if (vector_load && stride != 0u && (static_cast<uint32_t>(high) >> 31u) != 0u) {
 			const auto element = static_cast<uint64_t>(immediate);
 			if (static_cast<uint32_t>(records) == 0u || element + sizeof(uint32_t) > stride) {
-				return false;
+				return RefuseRawRead(RawReadReject::SwizzledElementOutOfStride);
 			}
 			const auto index_stride = uint64_t {8}
 			                          << ((static_cast<uint32_t>(word3) >> 21u) & 3u);
@@ -781,7 +817,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 			// walk refuses rather than substituting hardware's zero. shader_cfg_tests asserts
 			// this: "real S_BUFFER_LOAD walk ignored descriptor bounds".
 			if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
-				return false;
+				return RefuseRawRead(RawReadReject::OutsideDescriptorBounds);
 			}
 			address = (base & ~uint64_t {3}) + byte_offset;
 		}
@@ -789,13 +825,15 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 		const auto relative = (immediate & ~int64_t {3}) +
 		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
-			return false;
+			return RefuseRawRead(RawReadReject::AddressOverflow);
 		}
 	}
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
-			return false;
+			m_refused_read     = address;
+			m_has_refused_read = true;
+			return RefuseRawRead(RawReadReject::ReadRefused);
 		}
 	} else {
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
@@ -805,6 +843,17 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 }
 
 bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
+	if (EvaluateInstRule(inst, result)) {
+		return true;
+	}
+	if (!m_has_first_refusal) {
+		m_first_refusal     = inst.GetOpcode();
+		m_has_first_refusal = true;
+	}
+	return false;
+}
+
+bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 	uint64_t   a       = 0;
 	uint64_t   b       = 0;
 	uint64_t   c       = 0;
@@ -1398,17 +1447,69 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	return true;
 }
 
-bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
-	if (!m_program.srt_plan_complete) return false;
+bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailure* failure,
+                                  bool prune) {
+	const auto refuse = [&](FlatRefreshFailure::Stage stage, uint32_t flat_offset) {
+		if (failure != nullptr) {
+			failure->stage       = stage;
+			failure->flat_offset = flat_offset;
+		}
+		return false;
+	};
+	if (failure != nullptr) {
+		*failure = {};
+	}
+	m_has_refused_read = false;
+	m_raw_read_reject  = RawReadReject::None;
+	m_raw_read_operand  = nullptr;
+	m_has_first_refusal = false;
+	m_phi_reject        = PhiReject::None;
+	if (m_clean_evaluator != nullptr) {
+		m_clean_evaluator->m_has_refused_read = false;
+		m_clean_evaluator->m_raw_read_reject  = RawReadReject::None;
+		m_clean_evaluator->m_raw_read_operand  = nullptr;
+		m_clean_evaluator->m_has_first_refusal = false;
+		m_clean_evaluator->m_phi_reject        = PhiReject::None;
+	}
+	if (!m_program.srt_plan_complete) {
+		return refuse(FlatRefreshFailure::Stage::PlanIncomplete, 0);
+	}
 	const auto refresh = [&](uint32_t slot) {
-		if (slot >= m_program.srt_reads.size()) return false;
-		const auto& read = m_program.srt_reads[slot];
-		const bool clean = read.flat_offset < m_clean_flat_slots.size() &&
+		if (slot >= m_program.srt_reads.size()) {
+			return refuse(FlatRefreshFailure::Stage::OffsetOutOfRange, slot);
+		}
+		const auto& read  = m_program.srt_reads[slot];
+		const bool  clean = read.flat_offset < m_clean_flat_slots.size() &&
 		                   m_clean_flat_slots[read.flat_offset] != 0u;
-		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
-			return false;
+		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+			return refuse(FlatRefreshFailure::Stage::CleanSlotUnreadable, read.flat_offset);
+		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (read.flat_offset >= flat.size()) {
+			return refuse(FlatRefreshFailure::Stage::OffsetOutOfRange, read.flat_offset);
+		}
+		if (!evaluator.Evaluate(read.value, flat[read.flat_offset])) {
+			if (failure != nullptr) {
+				failure->value_is_expressible = ValidateRuntimeValue(
+				    m_program, read.value, RuntimeValueType::Any, &failure->value);
+				failure->raw_read         = evaluator.m_raw_read_reject;
+				failure->raw_read_operand = evaluator.m_raw_read_operand;
+				failure->raw_read_operand_failure = evaluator.m_raw_read_operand_failure;
+				failure->first_refusal            = evaluator.m_first_refusal;
+				failure->has_first_refusal        = evaluator.m_has_first_refusal;
+				failure->phi                      = evaluator.m_phi_reject;
+				if (evaluator.m_has_refused_read) {
+					failure->read_address     = evaluator.m_refused_read;
+					failure->has_read_address = true;
+					if (m_runtime.describe_read_refusal != nullptr) {
+						failure->read_refusal = m_runtime.describe_read_refusal(
+						    m_runtime.userdata, evaluator.m_refused_read);
+					}
+				}
+			}
+			return refuse(FlatRefreshFailure::Stage::ValueUnevaluable, read.flat_offset);
+		}
+		return true;
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
@@ -1441,7 +1542,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 		uint32_t condition = 0;
 		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
-		if (!block.condition.IsEmpty() && m_runtime.read_specialization_memory != nullptr &&
+		if (prune && !block.condition.IsEmpty() &&
+		    m_runtime.read_specialization_memory != nullptr &&
 		    predicate.Evaluate(block.condition, condition)) {
 			pending.push_back(block.successors[condition != 0u ? 0u : 1u]);
 		} else {
@@ -1449,6 +1551,100 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		}
 	}
 	return true;
+}
+
+std::string_view PhiRejectName(PhiReject reason) {
+	switch (reason) {
+		case PhiReject::None: return "no recorded reason";
+		case PhiReject::Barred: return "the phi is barred by an enclosing trial";
+		case PhiReject::NoEntry: return "no operand enters the web from outside the loop";
+		case PhiReject::EntryUnevaluable: return "the entry value could not be evaluated";
+		case PhiReject::WebAssumptionConflict: return "the web already assumed a different value";
+		case PhiReject::OperandVariesPerIteration:
+			return "an operand does not reproduce the entry value, so it varies per iteration";
+	}
+	return "unknown reason";
+}
+
+std::string_view RawReadRejectName(RawReadReject reason) {
+	switch (reason) {
+		case RawReadReject::None: return "no recorded reason";
+		case RawReadReject::MemoryIndexOutOfRange: return "the memory index is out of range";
+		case RawReadReject::NoHandle: return "the read has no descriptor handle";
+		case RawReadReject::HandleOperandUnavailable:
+			return "a handle address operand could not be evaluated";
+		case RawReadReject::DescriptorOperandUnavailable:
+			return "the descriptor num_records or word3 could not be evaluated";
+		case RawReadReject::NegativeImmediate: return "the immediate offset is negative";
+		case RawReadReject::AddTidIndexing: return "the descriptor adds the thread id to its index";
+		case RawReadReject::SwizzledElementOutOfStride:
+			return "the swizzled element lies outside the descriptor stride";
+		case RawReadReject::OutsideDescriptorBounds:
+			return "the read lies outside the descriptor bounds";
+		case RawReadReject::AddressOverflow: return "the address computation overflowed";
+		case RawReadReject::ReadRefused: return "the guest read refused";
+	}
+	return "unknown reason";
+}
+
+std::string DescribeRuntimeFailure(const RuntimeValueFailure& failure) {
+	if (failure.has_entry_opcodes) {
+		const auto operand = [](ValueOpcode opcode) {
+			return opcode == ValueOpcode::Void ? std::string_view("immediate")
+			                                   : ValueOpcodeName(opcode);
+		};
+		return fmt::format("{} {}, entries {} and {}", RuntimeValueRejectName(failure.reason),
+		                   ValueOpcodeName(failure.opcode), operand(failure.entry_opcode),
+		                   operand(failure.other_opcode));
+	}
+	if (failure.has_opcode) {
+		return fmt::format("{} {}", RuntimeValueRejectName(failure.reason),
+		                   ValueOpcodeName(failure.opcode));
+	}
+	return std::string(RuntimeValueRejectName(failure.reason));
+}
+
+std::string DescribeFlatRefreshFailure(const FlatRefreshFailure& failure) {
+	switch (failure.stage) {
+		case FlatRefreshFailure::Stage::None: return "no recorded reason";
+		case FlatRefreshFailure::Stage::PlanIncomplete: return "the SRT plan is incomplete";
+		case FlatRefreshFailure::Stage::CleanSlotUnreadable:
+			return fmt::format("slot {} is clean but has no strict reader", failure.flat_offset);
+		case FlatRefreshFailure::Stage::OffsetOutOfRange:
+			return fmt::format("slot {} is past the flat buffer", failure.flat_offset);
+		case FlatRefreshFailure::Stage::ValueUnevaluable:
+			// An expressible value that still refuses did not stop on an opcode: the guest read
+			// behind it is what failed, which is a memory problem and not a recompiler gap.
+			if (failure.has_read_address) {
+				return fmt::format("slot {} could not read 0x{:012x}: {}", failure.flat_offset,
+				                   failure.read_address,
+				                   failure.read_refusal != nullptr ? failure.read_refusal
+				                                                   : "no describer");
+			}
+			if (failure.raw_read != RawReadReject::None) {
+				if (failure.raw_read_operand != nullptr) {
+					return fmt::format(
+					    "slot {} raw read refused: {} ({}: {}, deepest refusal {})",
+					    failure.flat_offset, RawReadRejectName(failure.raw_read),
+					    failure.raw_read_operand,
+					    DescribeRuntimeFailure(failure.raw_read_operand_failure),
+					    failure.has_first_refusal
+					        ? (failure.phi != PhiReject::None
+					               ? fmt::format("{} ({})", ValueOpcodeName(failure.first_refusal),
+					                             PhiRejectName(failure.phi))
+					               : std::string(ValueOpcodeName(failure.first_refusal)))
+					        : std::string("none"));
+				}
+				return fmt::format("slot {} raw read refused: {}", failure.flat_offset,
+				                   RawReadRejectName(failure.raw_read));
+			}
+			return failure.value_is_expressible
+			           ? fmt::format("slot {} refused at evaluation with no recorded raw read",
+			                         failure.flat_offset)
+			           : fmt::format("slot {} {}", failure.flat_offset,
+			                         DescribeRuntimeFailure(failure.value));
+	}
+	return "unknown reason";
 }
 
 std::string_view RuntimeValueRejectName(RuntimeValueReject reason) {

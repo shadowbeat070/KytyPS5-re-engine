@@ -1,6 +1,7 @@
 #ifndef EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_
 #define EMULATOR_INCLUDE_EMULATOR_GRAPHICS_SHADER_RECOMPILER_RESOURCEMATERIALIZATION_H_
 
+#include <string_view>
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -48,6 +49,9 @@ struct ResourceSpecialization {
 ResourcePlan ExtractResourcePlan(const Program& program);
 
 // Refreshes cached resources and specialization in place. A failed refresh must not be used.
+// Why the last MaterializeResources on this thread refused, for the report that follows it.
+std::string_view LastMaterializeFailure();
+
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
 
