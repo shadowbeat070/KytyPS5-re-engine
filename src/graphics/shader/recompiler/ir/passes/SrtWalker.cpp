@@ -42,6 +42,15 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	return true;
 }
 
+uint32_t DescriptorLoadDwords(ValueOpcode op) {
+	switch (op) {
+		case ValueOpcode::LoadBufferU32x2: return 2u;
+		case ValueOpcode::LoadBufferU32x3: return 3u;
+		case ValueOpcode::LoadBufferU32x4: return 4u;
+		default: return 0u;
+	}
+}
+
 // A vector-path buffer load whose address carries no lane identity: no index, no
 // per-lane offset, one plain dword. Hardware reaches it as base + soffset + imm, which
 // is the same shape the scalar reads below already re-execute, so the host can
@@ -53,11 +62,11 @@ bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 // CompositeExtract.
 bool IsUniformBufferRead(const ResourcePlan& values, const Inst& inst) {
 	const auto op = inst.GetOpcode();
-	if ((op != ValueOpcode::LoadBufferU32 && op != ValueOpcode::LoadBufferU32x4) ||
-	    inst.NumArgs() != 5) {
+	const auto multi = DescriptorLoadDwords(op);
+	if ((op != ValueOpcode::LoadBufferU32 && multi == 0u) || inst.NumArgs() != 5) {
 		return false;
 	}
-	const auto dwords = op == ValueOpcode::LoadBufferU32x4 ? 4u : 1u;
+	const auto dwords = multi == 0u ? 1u : multi;
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= values.memory_info.size()) {
 		return false;
@@ -101,22 +110,21 @@ bool IsUniformBufferRead(const ResourcePlan& values, const Inst& inst) {
 // DWORDX4 read is never flattened ("A uniform DWORDX4 load is deliberately not one"), so widening
 // it cannot reach the planner.
 bool IsDescriptorDwordX4Load(const ResourcePlan& values, const Inst& inst) {
-	return inst.GetOpcode() == ValueOpcode::LoadBufferU32x4 &&
-	       IsUniformBufferRead(values, inst);
+	return DescriptorLoadDwords(inst.GetOpcode()) != 0u && IsUniformBufferRead(values, inst);
 }
 
 // Which argument carries the read's dynamic byte offset. The scalar reads put it
 // second; a MUBUF load puts the index and the per-lane offset there and the scalar
 // offset fourth.
 size_t RawReadOffsetArg(ValueOpcode op) {
-	return op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::LoadBufferU32x4 ? 3u : 1u;
+	return op == ValueOpcode::LoadBufferU32 || DescriptorLoadDwords(op) != 0u ? 3u : 1u;
 }
 
 // A MUBUF load carries the exec mask as its last operand. That is lane state, not part
 // of the address, and walking it would reject the read for depending on lane identity.
 size_t RawReadAddressArgs(const Inst& inst) {
 	const auto op = inst.GetOpcode();
-	return op == ValueOpcode::LoadBufferU32 || op == ValueOpcode::LoadBufferU32x4
+	return op == ValueOpcode::LoadBufferU32 || DescriptorLoadDwords(op) != 0u
 	           ? 4u
 	           : inst.NumArgs();
 }
@@ -215,8 +223,47 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 		case ValueOpcode::LogicalAnd:
 		case ValueOpcode::LogicalXor:
 		case ValueOpcode::LogicalNot:
+		case ValueOpcode::ReadLane:
+		case ValueOpcode::BitReverse32:
+		case ValueOpcode::BitCount32:
+		case ValueOpcode::BitCount64:
+		case ValueOpcode::FindUMsb32:
+		case ValueOpcode::FindUMsb64:
+		case ValueOpcode::FindILsb32:
+		case ValueOpcode::FPFma32:
+		case ValueOpcode::FPMad32:
+		case ValueOpcode::FPMinTri32:
+		case ValueOpcode::FPMaxTri32:
+		case ValueOpcode::FPMedTri32:
+		case ValueOpcode::FPLdexp:
+		case ValueOpcode::FPAbs32:
+		case ValueOpcode::FPNeg32:
+		case ValueOpcode::FPSaturate32:
+		case ValueOpcode::FPRoundEven32:
+		case ValueOpcode::FPFloor32:
+		case ValueOpcode::FPCeil32:
+		case ValueOpcode::FPFract32:
+		case ValueOpcode::FPSqrt:
+		case ValueOpcode::FPRecip32:
+		case ValueOpcode::FPRecipSqrt32:
+		case ValueOpcode::FPExp2:
+		case ValueOpcode::FPLog2:
+		case ValueOpcode::FPAdd32:
+		case ValueOpcode::FPSub32:
+		case ValueOpcode::FPMin32:
+		case ValueOpcode::FPMax32:
+		case ValueOpcode::FPOrdEqual32:
+		case ValueOpcode::FPUnordEqual32:
+		case ValueOpcode::FPOrdNotEqual32:
+		case ValueOpcode::FPUnordNotEqual32:
+		case ValueOpcode::FPOrdLessThan32:
+		case ValueOpcode::FPUnordLessThan32:
+		case ValueOpcode::FPOrdGreaterThan32:
+		case ValueOpcode::FPUnordGreaterThan32:
 		case ValueOpcode::FPOrdLessThanEqual32:
+		case ValueOpcode::FPUnordLessThanEqual32:
 		case ValueOpcode::FPOrdGreaterThanEqual32:
+		case ValueOpcode::FPUnordGreaterThanEqual32:
 		case ValueOpcode::FPIsNan32:
 		case ValueOpcode::FPMul32:
 		case ValueOpcode::FPRecipIFlag32:
@@ -436,6 +483,23 @@ private:
 			m_active_mask          = active_mask;
 			return finish(valid);
 		}
+		if (op == ValueOpcode::ReadLane) {
+			// V_READLANE_B32 names the lane outright, so unlike readfirstlane there is nothing to
+			// guess and no agreement to prove: bind that one lane and re-execute the operand. The
+			// instruction ignores EXEC, hence the all-true mask rather than the enclosing one.
+			if (inst->NumArgs() != 2 || inst->Arg(0).GetType() != Type::U32 ||
+			    inst->Arg(1).GetType() != Type::U32) {
+				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
+			}
+			if (!Validate(inst->Arg(1))) {
+				return finish(false);
+			}
+			const auto active_mask = m_active_mask;
+			m_active_mask          = Value(true);
+			const bool valid       = Validate(inst->Arg(0));
+			m_active_mask          = active_mask;
+			return finish(valid);
+		}
 		if (op == ValueOpcode::GetSrtResource) {
 			if (inst->NumArgs() != 0) {
 				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
@@ -452,7 +516,7 @@ private:
 			    handle->GetOpcode() != expected) {
 				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
-		} else if (op == ValueOpcode::LoadBufferU32x4) {
+		} else if (DescriptorLoadDwords(op) != 0u) {
 			const auto* handle = inst->NumArgs() != 0 ? inst->Arg(0).ResolveInstruction() : nullptr;
 			if (!IsDescriptorDwordX4Load(m_program, *inst) || handle == nullptr ||
 			    handle->GetOpcode() != ValueOpcode::GetBufferResource) {
@@ -485,7 +549,8 @@ private:
 			if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
 			    index.U32() >= 2u ||
 			    (source->GetOpcode() != ValueOpcode::CompositeConstructU32x2 &&
-			     source->GetOpcode() != ValueOpcode::IAddCarry32)) {
+			     source->GetOpcode() != ValueOpcode::IAddCarry32 &&
+			     source->GetOpcode() != ValueOpcode::LoadBufferU32x2)) {
 				return finish(Reject(RuntimeValueReject::MalformedInstruction, op));
 			}
 		}
@@ -690,6 +755,10 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 	if (source->GetOpcode() == ValueOpcode::CompositeConstructU32x2) {
 		return EvaluateWide(source->Arg(component), result);
 	}
+	if (source->GetOpcode() == ValueOpcode::LoadBufferU32x2 &&
+	    IsDescriptorDwordX4Load(m_program, *source)) {
+		return EvaluateRawRead(*source, result, component * sizeof(uint32_t));
+	}
 	if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
 		uint64_t lhs = 0;
 		uint64_t rhs = 0;
@@ -741,15 +810,13 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 		return RefuseRawRead(RawReadReject::MemoryIndexOutOfRange);
 	}
 	const auto& mem    = m_program.memory_info[flags.index];
-	const bool vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32;
-	const auto guard = vector ? inst.Arg(4).Resolve() : Value {};
-	if (vector && (guard.IsImmediate() || guard != m_active_mask)) {
-		uint64_t enabled = 0;
-		if (!Arg(inst, 4, enabled)) return false;
-		if (enabled == 0u) {
-			result = 0u;
-			return true;
-		}
+	const bool  vector = inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
+	                    DescriptorLoadDwords(inst.GetOpcode()) != 0u;
+	// A vector load under a literal false EXEC touches no memory and leaves zero.
+	if (const auto guard = inst.Arg(inst.NumArgs() - 1u).Resolve();
+	    vector && guard.IsImmediate() && guard.GetType() == Type::U1 && !guard.U1()) {
+		result = 0u;
+		return true;
 	}
 	const auto* handle = inst.Arg(0).ResolveInstruction();
 	if (handle == nullptr) {
@@ -782,7 +849,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 	uint64_t address = 0;
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
 	    inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
-	    inst.GetOpcode() == ValueOpcode::LoadBufferU32x4) {
+	    DescriptorLoadDwords(inst.GetOpcode()) != 0u) {
 		uint64_t records = 0;
 		uint64_t word3   = 0;
 		if (handle->NumArgs() != 4u || !Arg(*handle, 2, records) || !Arg(*handle, 3, word3)) {
@@ -918,6 +985,205 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			result = common;
 			return true;
 		}
+		case ValueOpcode::ReadLane: {
+			// The lane is an operand, so one walk with that lane bound settles it. No sweep and no
+			// agreement test: readfirstlane has to guess which lane is first active, this does not.
+			uint64_t lane = 0;
+			if (!EvaluateWide(inst.Arg(1), lane) || lane >= m_program.wave_size) {
+				return false;
+			}
+			LaneScope scope;
+			scope.lane      = static_cast<uint32_t>(lane);
+			scope.dependent = false;
+			SrtWalker lane_walk(m_program, m_runtime, m_clean_flat_slots, m_clean_evaluator,
+			                    Value(true));
+			lane_walk.m_lane   = &scope;
+			lane_walk.m_barred = m_barred;
+			for (const auto& assumed: m_assumed) {
+				lane_walk.m_barred.insert(assumed.first);
+			}
+			return lane_walk.EvaluateWide(inst.Arg(0), result);
+		}
+		case ValueOpcode::BitReverse32:
+			if (Arg(inst, 0, a)) {
+				auto value = static_cast<uint32_t>(a);
+				value      = ((value & 0x55555555u) << 1u) | ((value >> 1u) & 0x55555555u);
+				value      = ((value & 0x33333333u) << 2u) | ((value >> 2u) & 0x33333333u);
+				value      = ((value & 0x0f0f0f0fu) << 4u) | ((value >> 4u) & 0x0f0f0f0fu);
+				value      = ((value & 0x00ff00ffu) << 8u) | ((value >> 8u) & 0x00ff00ffu);
+				result     = (value << 16u) | (value >> 16u);
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitCount32:
+			if (Arg(inst, 0, a)) {
+				result = static_cast<uint32_t>(std::popcount(static_cast<uint32_t>(a)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::BitCount64:
+			if (Arg(inst, 0, a)) {
+				result = static_cast<uint32_t>(std::popcount(a));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FindUMsb32:
+			if (Arg(inst, 0, a)) {
+				const auto value = static_cast<uint32_t>(a);
+				result = value == 0u ? UINT32_MAX : static_cast<uint32_t>(31 - std::countl_zero(value));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FindUMsb64:
+			if (Arg(inst, 0, a)) {
+				result = a == 0u ? UINT32_MAX : static_cast<uint32_t>(63 - std::countl_zero(a));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FindILsb32:
+			if (Arg(inst, 0, a)) {
+				const auto value = static_cast<uint32_t>(a);
+				result = value == 0u ? UINT32_MAX : static_cast<uint32_t>(std::countr_zero(value));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPAbs32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::fabs(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPNeg32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(-Float32(a)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPSaturate32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::clamp(Float32(a), 0.0F, 1.0F)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPRoundEven32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::nearbyint(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPFloor32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::floor(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPCeil32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::ceil(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPFract32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(Float32(a) - std::floor(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPSqrt:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::sqrt(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPRecip32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(1.0F / Float32(a)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPRecipSqrt32:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(1.0F / std::sqrt(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPExp2:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::exp2(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPLog2:
+			if (Arg(inst, 0, a)) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::log2(Float32(a))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPFma32:
+			if (ternary()) {
+				result = std::bit_cast<uint32_t>(Float32(a) * Float32(b) + Float32(c));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPMad32:
+			if (ternary()) {
+				result = std::bit_cast<uint32_t>(Float32(a) * Float32(b) + Float32(c));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPMinTri32:
+			if (ternary()) {
+				result = std::bit_cast<uint32_t>(
+				    std::fmin(std::fmin(Float32(a), Float32(b)), Float32(c)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPMaxTri32:
+			if (ternary()) {
+				result = std::bit_cast<uint32_t>(
+				    std::fmax(std::fmax(Float32(a), Float32(b)), Float32(c)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPMedTri32:
+			if (ternary()) {
+				const auto lo = std::fmin(std::fmin(Float32(a), Float32(b)), Float32(c));
+				const auto hi = std::fmax(std::fmax(Float32(a), Float32(b)), Float32(c));
+				result = std::bit_cast<uint32_t>(Float32(a) + Float32(b) + Float32(c) - lo - hi);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPLdexp:
+			if (binary()) {
+				result = std::bit_cast<uint32_t>(
+				    std::ldexp(Float32(a), static_cast<int32_t>(static_cast<uint32_t>(b))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPAdd32:
+			if (binary()) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(Float32(a) + Float32(b)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPSub32:
+			if (binary()) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(Float32(a) - Float32(b)));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPMin32:
+			if (binary()) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::fmin(Float32(a), Float32(b))));
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPMax32:
+			if (binary()) {
+				result = std::bit_cast<uint32_t>(static_cast<float>(std::fmax(Float32(a), Float32(b))));
+				return true;
+			}
+			return false;
 		case ValueOpcode::BitCastU32F32:
 		case ValueOpcode::BitCastF32U32: return Arg(inst, 0, result);
 		case ValueOpcode::CompositeExtractU64:
@@ -1080,6 +1346,31 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 				return true;
 			}
 			return false;
+		case ValueOpcode::FPOrdEqual32:
+			if (binary()) {
+				result = Float32(a) == Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPOrdNotEqual32:
+			if (binary()) {
+				result = !std::isnan(Float32(a)) && !std::isnan(Float32(b)) &&
+				         Float32(a) != Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPOrdLessThan32:
+			if (binary()) {
+				result = Float32(a) < Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPOrdGreaterThan32:
+			if (binary()) {
+				result = Float32(a) > Float32(b);
+				return true;
+			}
+			return false;
 		case ValueOpcode::FPOrdLessThanEqual32:
 		case ValueOpcode::FPOrdGreaterThanEqual32:
 			if (binary()) {
@@ -1093,6 +1384,47 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 				result = inst.GetOpcode() == ValueOpcode::FPOrdLessThanEqual32
 				             ? operand(a) <= operand(b)
 				             : operand(a) >= operand(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPUnordEqual32:
+			if (binary()) {
+				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
+				         Float32(a) == Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPUnordNotEqual32:
+			if (binary()) {
+				result = Float32(a) != Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPUnordLessThan32:
+			if (binary()) {
+				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
+				         Float32(a) < Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPUnordGreaterThan32:
+			if (binary()) {
+				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
+				         Float32(a) > Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPUnordLessThanEqual32:
+			if (binary()) {
+				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
+				         Float32(a) <= Float32(b);
+				return true;
+			}
+			return false;
+		case ValueOpcode::FPUnordGreaterThanEqual32:
+			if (binary()) {
+				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
+				         Float32(a) >= Float32(b);
 				return true;
 			}
 			return false;
