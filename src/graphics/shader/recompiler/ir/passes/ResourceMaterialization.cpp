@@ -14,6 +14,7 @@
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <numeric>
 #include <string>
@@ -862,6 +863,60 @@ bool ValidBufferDescriptor(const DescriptorValue& value) {
 // Enumerates every record of a descriptor table the shader indexes with a wave-uniform selector
 // the host cannot re-execute. Records are probed only at their own stride: a window that straddles
 // two records decodes as a plausible descriptor often enough to exhaust the candidate budget.
+uint64_t IndirectBufferSignature(const DescriptorSource::IndirectBuffer& indirect,
+                                 const DescriptorValue& heap_value) {
+	struct Key {
+		uint32_t heap_count;
+		uint32_t selector_stride;
+		uint32_t selector_offset;
+		uint32_t record_offset;
+		uint32_t heap_dwords[8];
+	} key {};
+	key.heap_count      = heap_value.dword_count;
+	key.selector_stride = indirect.selector_stride;
+	key.selector_offset = indirect.selector_offset;
+	key.record_offset   = indirect.record_offset;
+	std::copy(heap_value.dwords.begin(), heap_value.dwords.end(), key.heap_dwords);
+	return HashBytes(reinterpret_cast<const uint8_t*>(&key), sizeof(key));
+}
+
+// Remembered between dispatches, and returned only while the table's bytes still hash the same.
+class EnumeratedIndirectBuffers {
+public:
+	static EnumeratedIndirectBuffers& Instance() {
+		static EnumeratedIndirectBuffers store;
+		return store;
+	}
+
+	[[nodiscard]] const IndirectBuffer* Find(uint64_t signature, uint64_t content) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		const auto found = m_tables.find(signature);
+		if (found == m_tables.end() || found->second.content != content) {
+			return nullptr;
+		}
+		return &found->second.result;
+	}
+
+	void Remember(uint64_t signature, uint64_t content, const IndirectBuffer& result) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		// Bounded the same way the image memo is.
+		if (m_tables.size() >= MaxRememberedTables) {
+			m_tables.clear();
+		}
+		m_tables[signature] = {content, result};
+	}
+
+private:
+	struct Entry {
+		uint64_t       content = 0;
+		IndirectBuffer result;
+	};
+	static constexpr size_t MaxRememberedTables = 256;
+
+	std::mutex                          m_mutex;
+	std::unordered_map<uint64_t, Entry> m_tables;
+};
+
 bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
                                const DescriptorValue& heap_value, const SrtRuntime& runtime,
                                uint64_t shader_hash, IndirectBuffer& result) {
@@ -891,9 +946,37 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		return false;
 	}
 
+	// One read of the whole table, not four per record.
+	static thread_local std::vector<uint32_t> table_words;
+	const auto word_count = static_cast<size_t>(size / sizeof(uint32_t));
+	table_words.assign(word_count, 0u);
+	if (word_count != 0 &&
+	    !ReadScalarTable(heap.Base48(), size, 0u, runtime, table_words)) {
+		return false;
+	}
+	// Validated against the bytes the walk would have read, so a rewritten table is never stale.
+	const auto content = HashBytes(reinterpret_cast<const uint8_t*>(table_words.data()),
+	                               table_words.size() * sizeof(uint32_t));
+	const auto signature = IndirectBufferSignature(indirect, heap_value);
+	if (const auto* cached = EnumeratedIndirectBuffers::Instance().Find(signature, content)) {
+		result = *cached;
+		return true;
+	}
+	const auto word_at = [&](uint64_t byte_offset, uint32_t& word) {
+		const auto index = byte_offset / sizeof(uint32_t);
+		if ((byte_offset & 3u) != 0u || index >= table_words.size()) {
+			word = 0u;
+			return byte_offset <= size;
+		}
+		word = table_words[static_cast<size_t>(index)];
+		return true;
+	};
+
 	IndirectBuffer next;
 	next.keys.reserve(static_cast<size_t>(probe_count));
 	next.candidates.reserve(static_cast<size_t>(probe_count));
+	// The linear find this replaces was quadratic in a table whose records mostly repeat.
+	std::map<std::array<uint32_t, 4>, uint32_t> seen;
 	for (uint64_t record = 0; record < probe_count; record++) {
 		const auto dynamic =
 		    record * indirect.selector_stride + static_cast<uint64_t>(indirect.selector_offset);
@@ -903,9 +986,8 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		DescriptorValue candidate;
 		candidate.dword_count = 4u;
 		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
-			if (!ReadScalarBufferWord(heap, static_cast<uint32_t>(dynamic),
-			                          indirect.record_offset + dword * sizeof(uint32_t), runtime,
-			                          candidate.dwords[dword])) {
+			if (!word_at(dynamic + indirect.record_offset + dword * sizeof(uint32_t),
+			             candidate.dwords[dword])) {
 				return false;
 			}
 		}
@@ -913,23 +995,26 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 			candidate.dwords.fill(0);
 		}
 		next.keys.push_back(static_cast<uint32_t>(record));
-		const auto found = std::ranges::find(next.descriptors, candidate);
-		if (found == next.descriptors.end()) {
-			if (next.descriptors.size() >= ShaderInfo::MaxBuffers) {
+		const std::array<uint32_t, 4> words {candidate.dwords[0], candidate.dwords[1],
+		                                     candidate.dwords[2], candidate.dwords[3]};
+		const auto [entry, inserted] =
+		    seen.try_emplace(words, static_cast<uint32_t>(next.descriptors.size()));
+		if (inserted) {
+			// MaxBuffers is how many buffers a shader may track; the candidates a table expands
+			// into are budgeted by MaxDenseBuffers, as the image twin of this loop uses MaxImages.
+			if (next.descriptors.size() >= ShaderInfo::MaxDenseBuffers) {
 				ReportIndirectBuffer(
 				    shader_hash,
 				    fmt::format("refused: distinct descriptors exceed the {} buffer limit over "
 				                "{} probes (table stride {}, selector stride {}, records {}, "
 				                "record offset {})",
-				                ShaderInfo::MaxBuffers, probe_count, declared,
+				                ShaderInfo::MaxDenseBuffers, probe_count, declared,
 				                indirect.selector_stride, records, indirect.record_offset));
 				return false;
 			}
 			next.descriptors.push_back(candidate);
-			next.candidates.push_back(static_cast<uint32_t>(next.descriptors.size() - 1u));
-		} else {
-			next.candidates.push_back(static_cast<uint32_t>(found - next.descriptors.begin()));
 		}
+		next.candidates.push_back(entry->second);
 	}
 	if (next.descriptors.empty()) {
 		// An empty table still has to name one descriptor for the binding the shader declares.
@@ -945,6 +1030,7 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 	                "records {}, record offset {}",
 	                probe_count, next.descriptors.size(), declared, indirect.selector_stride,
 	                records, indirect.record_offset));
+	EnumeratedIndirectBuffers::Instance().Remember(signature, content, next);
 	result = std::move(next);
 	return true;
 }
