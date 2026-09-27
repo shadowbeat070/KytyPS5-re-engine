@@ -1200,8 +1200,13 @@ private:
 		return false;
 	}
 
-	bool MatchTableOffset(Value value, Value& key, uint32_t& offset) const {
+	// The byte offset an image heap read computes: a record index scaled by the heap's record
+	// stride, plus whatever constants the shader folded in. The stride travels back out because a
+	// heap of plain T# strides by 32 but an engine that keeps a T# inside a larger per-record
+	// struct does not, and the record step is what the host enumeration has to walk.
+	bool MatchTableOffset(Value value, Value& key, uint32_t& offset, uint32_t& stride) const {
 		offset = 0;
+		stride = 0;
 		for (;;) {
 			const auto* inst = value.Resolve().TryInstruction();
 			if (inst == nullptr || inst->NumArgs() != 2u) {
@@ -1209,9 +1214,24 @@ private:
 			}
 			uint32_t immediate;
 			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
-			    ImmediateU32(inst->Arg(1), immediate) && immediate == 5u) {
+			    ImmediateU32(inst->Arg(1), immediate) && immediate < 32u) {
+				stride = uint32_t {1} << immediate;
 				key = inst->Arg(0).Resolve();
 				return key.GetType() == Type::U32;
+			}
+			// A power-of-two stride is a shift and any other is a multiply; both name the same
+			// record step.
+			if (inst->GetOpcode() == ValueOpcode::IMul32) {
+				Value factor;
+				if (ImmediateU32(inst->Arg(0), stride)) {
+					factor = inst->Arg(1).Resolve();
+				} else if (ImmediateU32(inst->Arg(1), stride)) {
+					factor = inst->Arg(0).Resolve();
+				} else {
+					return false;
+				}
+				key = factor;
+				return stride != 0u && key.GetType() == Type::U32;
 			}
 			if (inst->GetOpcode() != ValueOpcode::IAdd32) {
 				return false;
@@ -1745,6 +1765,9 @@ private:
 		}
 	}
 
+	// One image descriptor: eight dwords of T#.
+	static constexpr uint32_t DescriptorBytes = 8u * sizeof(uint32_t);
+
 	bool TryMakeIndirectImage(Inst& handle, IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
@@ -1752,6 +1775,7 @@ private:
 		Inst* table_handle = nullptr;
 		Value key;
 		uint32_t table_offset = 0;
+		uint32_t heap_stride  = 0;
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
 			auto* read = handle.Arg(dword).Resolve().TryInstruction();
 			if (read == nullptr) {
@@ -1766,6 +1790,7 @@ private:
 			auto* current_handle = read->Arg(0).Resolve().TryInstruction();
 			Value current_key;
 			uint32_t offset = 0;
+			uint32_t current_stride = 0;
 			if (current_handle == nullptr ||
 			    current_handle->GetOpcode() != (memory->kind == ResourceKind::ScalarAddress
 			                                      ? ValueOpcode::GetAddressResource
@@ -1773,7 +1798,7 @@ private:
 			    (memory->kind == ResourceKind::ScalarAddress && read->Parent() != handle.Parent()) ||
 			    (table_handle != nullptr &&
 			     !EquivalentValue(m_program, Value(table_handle), Value(current_handle))) ||
-			    !MatchTableOffset(read->Arg(1), current_key, offset) ||
+			    !MatchTableOffset(read->Arg(1), current_key, offset, current_stride) ||
 			    memory->offset > UINT32_MAX - offset) {
 				return false;
 			}
@@ -1781,7 +1806,9 @@ private:
 			if (dword == 0u) {
 				key = current_key;
 				table_offset = offset;
+				heap_stride  = current_stride;
 			} else if (!EquivalentValue(m_program, key, current_key) ||
+			           current_stride != heap_stride ||
 			           static_cast<uint64_t>(table_offset) + dword * sizeof(uint32_t) != offset) {
 				return false;
 			}
@@ -1801,6 +1828,7 @@ private:
 		DescriptorSource material_source;
 		DescriptorSource::IndirectDescriptor indirect;
 		indirect.table_offset = table_offset;
+		indirect.heap_stride  = heap_stride;
 		if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool bitscan = selector != nullptr && selector->GetOpcode() == ValueOpcode::FindILsb32 &&
@@ -1819,13 +1847,24 @@ private:
 			    !MatchUniformizedMaterialKey(key, handle, indirect, material_source)) {
 				return false;
 			}
-			if ((table_offset & 3u) != 0u ||
+			// A raw-address heap reaches its records through the shader's own byte arithmetic
+			// and its bounds are whatever the enumeration's own limit says, so this branch stays
+			// at the 32-byte record step it was proven on.
+			if (heap_stride != DescriptorBytes || (table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else {
 			auto* material_read = key.Resolve().TryInstruction();
 			uint32_t material_memory_index = 0;
 			const auto* memory = material_read != nullptr
 			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
+			// The descriptor has to sit inside the record the stride steps over: a heap of plain
+			// T# strides by 32 at offset 0, and an engine that keeps a T# inside a larger record
+			// strides by the record and offsets into it. Anything looser would let consecutive
+			// keys name overlapping bytes, and the host enumeration would walk a table it has
+			// misread.
+			if (heap_stride < DescriptorBytes || table_offset > heap_stride - DescriptorBytes) {
+				return false;
+			}
 			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
 			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
 				return false;

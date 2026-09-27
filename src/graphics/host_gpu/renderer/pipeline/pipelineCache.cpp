@@ -212,6 +212,12 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// A descriptor may declare an arena far larger than the pages behind it, and enumerating the
+// declared size probes memory that cannot answer. Report what is actually mapped instead.
+uint64_t ReadableShaderExtent(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::ClampRangeSize(address, size);
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -740,6 +746,7 @@ struct PipelineCache::ProgramCache {
 		    .shader_base                = params.Base(),
 		    .read_memory                = ReadShaderGuestMemoryPermissive,
 		    .read_specialization_memory = ReadShaderGuestMemory,
+		    .readable_extent            = ReadableShaderExtent,
 		    .describe_read_refusal      = DescribeShaderReadRefusal,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {

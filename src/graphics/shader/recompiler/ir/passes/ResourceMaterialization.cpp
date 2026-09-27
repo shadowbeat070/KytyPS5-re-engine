@@ -17,6 +17,7 @@
 #include <mutex>
 #include <numeric>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -366,25 +367,234 @@ size_t IndirectDirectoryWords(const ResourcePlan& program) {
 size_t IndirectMappingSlot(const ResourcePlan& program, uint32_t image_index) {
 	return IndirectDirectoryBase(program) + static_cast<size_t>(image_index) * IndirectDirectoryStride;
 }
-bool MaterializeIndirectImage(const ResourcePlan& program,
-                              const DescriptorSource::IndirectDescriptor& indirect,
-                              uint32_t image_index,
-                              const SrtRuntime& runtime, SrtWalker& clean,
-                              ResourceSnapshot& snapshot,
-                              ResourceSpecialization& specialization) {
+// Why an indirect image table could not be enumerated. Every clause below refuses for a different
+// reason with a different fix - a handle the host cannot decode, a probe budget the table outgrows,
+// an image budget its materials outgrow - and the caller reported all of them as the same line. The
+// numbers travel with the reason because the answer to "which one is it" is usually a comparison of
+// two of them.
+struct IndirectImageFailure {
+	enum class Stage : uint8_t {
+		None,
+		TableDescriptorUndecodable,
+		KeyCountUnevaluable,
+		KeyCountOverBudget,
+		SelectorMaskUnevaluable,
+		MaskProbeOffsetOverflow,
+		MaskProbeUnreadable,
+		MaterialDescriptorUndecodable,
+		MaterialStrideMismatch,
+		ProbeCountOverBudget,
+		MaterialRecordUnreadable,
+		HeapRecordUnreadable,
+		ImageBudgetExhausted,
+		MappingSlotOutOfRange,
+		FiniteCandidateUnevaluable,
+	};
+
+	Stage    stage           = Stage::None;
+	uint32_t selector_stride = 0;
+	uint32_t material_stride = 0;
+	uint64_t material_size   = 0;
+	uint64_t probe_count     = 0;
+	uint64_t probe_budget    = 0;
+	// What the enumeration actually steps by, which is not the selector stride: an offset that
+	// wraps 32 bits reaches every multiple of its gcd with 2^32, so a 224-byte selector walks the
+	// table 32 bytes at a time.
+	uint64_t probe_step      = 0;
+	uint32_t key_count       = 0;
+	uint32_t keys            = 0;
+	uint32_t distinct_images = 0;
+	uint32_t image_budget    = 0;
+	uint32_t key             = 0;
+	uint64_t offset          = 0;
+	// The single guest word whose refusal decided this failure, when one did. Re-probing just that
+	// word costs one read and answers whether the enumeration could now get further, which is what
+	// lets the memo below hold a read failure without ever making it permanent.
+	uint64_t recheck_base   = 0;
+	uint64_t recheck_size   = 0;
+	uint32_t recheck_offset = 0;
+	bool     has_recheck    = false;
+};
+
+// Records the word a read refused on so the memo can re-probe exactly it. Called at the refusal,
+// where the arguments that produced it are still in hand.
+void RecheckAt(IndirectImageFailure& failure, uint64_t base, uint64_t size, uint64_t offset) {
+	if (offset > UINT32_MAX) {
+		return;
+	}
+	failure.recheck_base   = base;
+	failure.recheck_size   = size;
+	failure.recheck_offset = static_cast<uint32_t>(offset);
+	failure.has_recheck    = true;
+}
+
+std::string DescribeIndirectImageFailure(const IndirectImageFailure& failure) {
+	switch (failure.stage) {
+		case IndirectImageFailure::Stage::None: return "no recorded reason";
+		case IndirectImageFailure::Stage::TableDescriptorUndecodable:
+			return "the heap handle is neither a raw address nor a decodable V#";
+		case IndirectImageFailure::Stage::KeyCountUnevaluable:
+			return "the key count is not a host-evaluable value";
+		case IndirectImageFailure::Stage::KeyCountOverBudget:
+			return fmt::format(
+			    "key count {} is past the {} probe budget or runs the heap past 4 GiB",
+			    failure.key_count, failure.probe_budget);
+		case IndirectImageFailure::Stage::SelectorMaskUnevaluable:
+			return "the selector mask or its key count is not a host-evaluable value";
+		case IndirectImageFailure::Stage::MaskProbeOffsetOverflow:
+			return fmt::format("selector offset {} runs past 4 GiB", failure.offset);
+		case IndirectImageFailure::Stage::MaskProbeUnreadable:
+			return fmt::format("the material word at offset {} would not read back",
+			                   failure.offset);
+		case IndirectImageFailure::Stage::MaterialDescriptorUndecodable:
+			return "the material handle is not a decodable V# beside a V# heap";
+		case IndirectImageFailure::Stage::MaterialStrideMismatch:
+			// The shader scales its selector by one step and the V# strides by another, so the
+			// records the enumeration would walk are not the records the draw selects.
+			return fmt::format("material V# strides by {} but the shader scales its selector by {}",
+			                   failure.material_stride, failure.selector_stride);
+		case IndirectImageFailure::Stage::ProbeCountOverBudget:
+			return fmt::format(
+			    "{} records ({} bytes of material walked at a {}-byte step, selector stride {}) is "
+			    "past the {} probe budget",
+			    failure.probe_count, failure.material_size, failure.probe_step,
+			    failure.selector_stride, failure.probe_budget);
+		case IndirectImageFailure::Stage::MaterialRecordUnreadable:
+			return fmt::format("the material record at offset {} would not read back",
+			                   failure.offset);
+		case IndirectImageFailure::Stage::HeapRecordUnreadable:
+			return fmt::format("key {} names heap offset {} which would not read back", failure.key,
+			                   failure.offset);
+		case IndirectImageFailure::Stage::ImageBudgetExhausted:
+			return fmt::format(
+			    "{} keys resolve to more than the {} images a shader may bind ({} distinct so far)",
+			    failure.keys, failure.image_budget, failure.distinct_images);
+		case IndirectImageFailure::Stage::MappingSlotOutOfRange:
+			return "the indirect directory slot is past the mapping it points at";
+		case IndirectImageFailure::Stage::FiniteCandidateUnevaluable:
+			return fmt::format("finite candidate {} is not host-evaluable", failure.key);
+	}
+	return "unknown reason";
+}
+
+// A table that refused once refuses again for as long as its two descriptors stay put: every clause
+// above is a function of those descriptors and the words they address, and re-deriving the answer
+// costs the whole probe budget - one guest read per material record - on every dispatch. That cost
+// is what the earlier bindless attempt died of, so the answer is remembered instead. A draw that
+// rebinds either descriptor hashes differently and misses the memo, and a refusal only the guest
+// memory decides is re-attempted periodically so a table that is merely not filled in yet still
+// converges.
+class RefusedIndirectTables {
+public:
+	// Non-null when this table has already refused and the answer still stands. A refusal a budget
+	// or a shape decided stands until the descriptors move, because nothing else feeds it. A
+	// refusal a guest read decided stands only while that read still refuses, so it is re-probed
+	// here - one word, against the same bounds the enumeration used. The remembered failure comes
+	// back with the answer so the caller's reason string stays honest on a memo hit.
+	[[nodiscard]] const IndirectImageFailure* Find(uint64_t signature, const SrtRuntime& runtime) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		const auto found = m_failures.find(signature);
+		if (found == m_failures.end()) {
+			return nullptr;
+		}
+		const auto& failure = found->second;
+		if (failure.has_recheck) {
+			uint32_t word = 0;
+			if (ReadScalarTable(failure.recheck_base, failure.recheck_size, failure.recheck_offset,
+			                    runtime, {&word, 1})) {
+				m_failures.erase(found);
+				return nullptr;
+			}
+		}
+		return &found->second;
+	}
+
+	void Remember(uint64_t signature, const IndirectImageFailure& failure) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		// A guest that rebinds its heap every frame would otherwise grow this without bound. The
+		// memo only has to outlive a few dispatches to pay for itself, so dropping all of it is
+		// cheaper than tracking which entry to evict.
+		if (m_failures.size() >= MaxRememberedTables) {
+			m_failures.clear();
+		}
+		m_failures[signature] = failure;
+	}
+
+	void Forget(uint64_t signature) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		m_failures.erase(signature);
+	}
+
+private:
+	static constexpr size_t MaxRememberedTables = 1024;
+
+	std::mutex                                         m_mutex;
+	std::unordered_map<uint64_t, IndirectImageFailure> m_failures;
+};
+
+RefusedIndirectTables& RefusedTables() {
+	static RefusedIndirectTables tables;
+	return tables;
+}
+
+// Identifies a table by everything the enumeration reads that is not the guest memory behind it:
+// the two descriptors as bound for this dispatch, and the plan's own view of how the shader indexes
+// them.
+uint64_t IndirectTableSignature(const DescriptorSource::IndirectDescriptor& indirect,
+                                const DescriptorValue&                 material_value,
+                                const DescriptorValue& table_value, uint32_t image_index,
+                                uint64_t readable_extent) {
+	struct Key {
+		uint32_t image_index;
+		uint32_t material_count;
+		uint32_t table_count;
+		uint32_t selector_stride;
+		uint32_t selector_offset;
+		uint32_t table_offset;
+		uint32_t material_offset;
+		uint32_t heap_stride;
+		uint32_t record_offset;
+		uint32_t key_mask;
+		uint32_t indexed_heap;
+		uint64_t readable_extent;
+		uint32_t material_dwords[8];
+		uint32_t table_dwords[8];
+	} key {};
+	key.image_index     = image_index;
+	key.material_count  = material_value.dword_count;
+	key.table_count     = table_value.dword_count;
+	key.selector_stride = indirect.selector_stride;
+	key.selector_offset = indirect.selector_offset;
+	key.table_offset    = indirect.table_offset;
+	key.material_offset = indirect.material_offset;
+	key.heap_stride     = indirect.heap_stride;
+	key.record_offset   = indirect.record_offset;
+	key.key_mask        = indirect.key_mask;
+	key.indexed_heap    = indirect.indexed_heap ? 1u : 0u;
+	// A refusal only holds for the backing the arena had when it was refused.
+	key.readable_extent = readable_extent;
+	std::copy(material_value.dwords.begin(), material_value.dwords.end(), key.material_dwords);
+	std::copy(table_value.dwords.begin(), table_value.dwords.end(), key.table_dwords);
+	return HashBytes(reinterpret_cast<const uint8_t*>(&key), sizeof(key));
+}
+
+bool EnumerateIndirectImage(const ResourcePlan& program,
+                            const DescriptorSource::IndirectDescriptor& indirect,
+                            const DescriptorValue& material_value,
+                            const DescriptorValue& table_value, uint32_t image_index,
+                            const SrtRuntime& runtime, SrtWalker& clean,
+                            ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                            IndirectImageFailure& failure) {
+	const auto Refuse = [&failure](IndirectImageFailure::Stage stage) {
+		failure.stage = stage;
+		return false;
+	};
 	const auto& sources = indirect.sources;
-	auto& keys = program.material_keys;
 	uint64_t table_base = 0;
 	uint64_t table_size = UINT64_MAX; // Scalar addresses have no buffer descriptor bounds.
+	auto& keys = program.material_keys;
+	keys.clear();
 	if (sources.empty()) {
-		keys.clear();
-		DescriptorValue material_value;
-		DescriptorValue table_value;
-		if ((indirect.material_source != UINT32_MAX &&
-		     !clean.EvaluateDescriptor(indirect.material_source, material_value)) ||
-		    !clean.EvaluateDescriptor(indirect.table_source, table_value)) {
-			return false;
-		}
 		ShaderBufferResource table;
 		if (table_value.dword_count == 2u) {
 			table_base = (static_cast<uint64_t>(table_value.dwords[1]) << 32u) | table_value.dwords[0];
@@ -392,16 +602,20 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			table_base = table.Base48();
 			table_size = table.GetSize();
 		} else {
-			return false;
+			return Refuse(IndirectImageFailure::Stage::TableDescriptorUndecodable);
 		}
 		if (indirect.material_source == UINT32_MAX) {
 			uint32_t key_count = 0;
 			const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
 			if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
-			if (table_value.dword_count != 2u || !evaluated ||
-			    key_count > MaxIndirectImageProbes ||
+			if (table_value.dword_count != 2u || !evaluated) {
+				return Refuse(IndirectImageFailure::Stage::KeyCountUnevaluable);
+			}
+			failure.key_count   = key_count;
+			failure.probe_budget = MaxIndirectImageProbes;
+			if (key_count > MaxIndirectImageProbes ||
 			    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
-				return false;
+				return Refuse(IndirectImageFailure::Stage::KeyCountOverBudget);
 			}
 			keys.resize(key_count);
 			std::iota(keys.begin(), keys.end(), 0u);
@@ -411,7 +625,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			if (material_value.dword_count != 2u || table_value.dword_count != 2u ||
 			    !clean.Evaluate(indirect.selector_mask, mask) ||
 			    !clean.Evaluate(indirect.key_count, count) || count == 0u || count > 32u) {
-				return false;
+				return Refuse(IndirectImageFailure::Stage::SelectorMaskUnevaluable);
 			}
 			if (count < 32u) mask &= (1u << count) - 1u;
 			const auto material_base =
@@ -421,10 +635,16 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 				const auto index = std::countr_zero(mask);
 				const auto offset = static_cast<uint64_t>(indirect.selector_offset) +
 				                    static_cast<uint64_t>(index) * indirect.selector_stride;
-				if (offset > UINT32_MAX) return false;
+				failure.offset = offset;
+				if (offset > UINT32_MAX) {
+					return Refuse(IndirectImageFailure::Stage::MaskProbeOffsetOverflow);
+				}
 				uint32_t key = 0;
 				if (!ReadScalarTable(material_base, UINT64_MAX, static_cast<uint32_t>(offset),
-				                     runtime, {&key, 1})) return false;
+				                     runtime, {&key, 1})) {
+					RecheckAt(failure, material_base, UINT64_MAX, offset);
+					return Refuse(IndirectImageFailure::Stage::MaskProbeUnreadable);
+				}
 				keys.push_back(key);
 				mask &= mask - 1u;
 			}
@@ -432,27 +652,48 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			keys.erase(std::unique(keys.begin(), keys.end()), keys.end());
 		} else {
 			ShaderBufferResource material;
-			if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u ||
-			    material.Stride() != indirect.selector_stride) {
-				return false;
+			if (!DecodeBufferDescriptor(material_value, material) || table_value.dword_count != 4u) {
+				return Refuse(IndirectImageFailure::Stage::MaterialDescriptorUndecodable);
+			}
+			failure.selector_stride = indirect.selector_stride;
+			failure.material_stride = material.Stride();
+			failure.material_size   = material.GetSize();
+			if (material.Stride() != indirect.selector_stride) {
+				return Refuse(IndirectImageFailure::Stage::MaterialStrideMismatch);
 			}
 			// The first aligned offset includes the immediate added after shader U32 arithmetic.
 			const auto step = std::max<uint64_t>(4u,
 			    std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u));
 			const uint64_t first = indirect.selector_offset;
 			const auto size = material.GetSize();
-			const auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
-			const auto probe_count = size >= 4u && first <= limit ? (limit - first) / step + 1u : 0u;
+			auto limit = std::min(first + (uint64_t {1} << 32u) - step, size >= 4u ? size - 4u : 0u);
+			auto backed = size >= 4u;
+			if (backed && runtime.readable_extent != nullptr) {
+				// Probe no further than the pages actually behind the arena: a probe past them could
+				// only have been refused anyway, and a declared size far larger than its backing is
+				// what puts an otherwise ordinary table past the budget. Each probe reads a dword at
+				// its offset, so stop at the last offset whose whole word is backed.
+				const auto readable = runtime.readable_extent(runtime.userdata, material.Base48(), size);
+				backed = readable >= sizeof(uint32_t);
+				limit  = std::min(limit, backed ? readable - sizeof(uint32_t) : 0u);
+			}
+			const auto probe_count = backed && first <= limit ? (limit - first) / step + 1u : 0u;
+			failure.probe_count  = probe_count;
+			failure.probe_step   = step;
+			failure.probe_budget = MaxIndirectImageProbes;
 			if (probe_count > MaxIndirectImageProbes) {
-				return false;
+				return Refuse(IndirectImageFailure::Stage::ProbeCountOverBudget);
 			}
 			keys.reserve(static_cast<size_t>(probe_count) + 1u);
 			keys.push_back(0u);
 			for (uint64_t probe = 0, offset = first; probe < probe_count; ++probe, offset += step) {
 				uint32_t key = 0;
-				if (!ReadScalarTable(material.Base48(), size, offset + indirect.material_offset,
-				                     runtime, {&key, 1})) {
-					return false;
+				if (!ReadScalarTable(material.Base48(), size, offset + indirect.material_offset, runtime,
+				                     {&key, 1})) {
+					failure.offset = offset;
+					RecheckAt(failure, material.Base48(), material.GetSize(),
+					          offset + indirect.material_offset);
+					return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
 				}
 				// The shader narrows the key before it indexes the heap, so the enumeration must too
 				// or it probes records the draw can never select.
@@ -466,6 +707,14 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	const auto children_begin = snapshot.images.size();
 	const auto mapping_offset = snapshot.flattened_srt.size();
 	const auto root_image = specialization.images[image_index];
+	if (sources.empty()) {
+		// Ordinal 0 is the switch's default arm - where the emitted search leaves a key it did not
+		// match - so it has to name nothing. See the loop below.
+		DescriptorValue null_descriptor;
+		null_descriptor.dword_count = 8u;
+		null_descriptor.dwords.fill(0);
+		snapshot.images[image_index] = null_descriptor;
+	}
 	const auto key_count = sources.empty() ? keys.size() : sources.size();
 	snapshot.flattened_srt.resize(mapping_offset + 1u + key_count * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(key_count);
@@ -477,17 +726,26 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			const auto table_offset = static_cast<uint64_t>(key) * indirect.heap_stride +
 			                          indirect.table_offset + indirect.record_offset;
 			if (!ReadScalarTable(table_base, table_size, table_offset, runtime, candidate.dwords)) {
-				return false;
+				failure.key    = key;
+				failure.offset = table_offset;
+				RecheckAt(failure, table_base, table_size, table_offset);
+				return Refuse(IndirectImageFailure::Stage::HeapRecordUnreadable);
 			}
 		} else if (!clean.EvaluateDescriptor(sources[entry], candidate)) {
-			return false;
+			failure.key = key;
+			return Refuse(IndirectImageFailure::Stage::FiniteCandidateUnevaluable);
 		}
 		if (NullImageDescriptor(candidate) ||
 		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
 			candidate.dwords.fill(0);
 		}
+		// A key the host failed to enumerate resolves to ordinal 0: the search starts there and
+		// only leaves it on an exact match, and nothing tells the shader it missed - images have
+		// no feedback path, only buffers do. Seeding ordinal 0 with the first enumerated record
+		// therefore made every unresolved key sample a real texture, silently. It stays null, and
+		// every enumerated key gets a child of its own. A finite table's key always matches.
 		uint32_t ordinal = 0;
-		if (entry == 0) {
+		if (!sources.empty() && entry == 0) {
 			snapshot.images[image_index] = candidate;
 		} else if (snapshot.images[image_index] != candidate) {
 			const auto found = std::find(snapshot.images.begin() + children_begin,
@@ -495,7 +753,10 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 			ordinal = static_cast<uint32_t>(found - snapshot.images.begin() - children_begin + 1u);
 			if (found == snapshot.images.end()) {
 				if (snapshot.images.size() >= ShaderInfo::MaxImages) {
-					return false;
+					failure.keys            = static_cast<uint32_t>(key_count);
+					failure.distinct_images = static_cast<uint32_t>(snapshot.images.size());
+					failure.image_budget    = ShaderInfo::MaxImages;
+					return Refuse(IndirectImageFailure::Stage::ImageBudgetExhausted);
 				}
 				snapshot.images.push_back(candidate);
 				auto child = root_image;
@@ -511,7 +772,7 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 	} else {
 		const auto slot = IndirectMappingSlot(program, image_index);
 		if (slot >= mapping_offset) {
-			return false;
+			return Refuse(IndirectImageFailure::Stage::MappingSlotOutOfRange);
 		}
 		snapshot.flattened_srt[slot] = static_cast<uint32_t>(mapping_offset);
 		auto& root = specialization.images[image_index];
@@ -519,6 +780,46 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 		root.indirect_mapping_offset = static_cast<uint32_t>(slot);
 		root.indirect_search_iterations = std::bit_width(key_count);
 	}
+	return true;
+}
+
+// The enumeration above is the expensive half of a dispatch that uses a descriptor heap: one guest
+// read per material record, and a table of any size costs that on every dispatch that reaches it.
+// A dispatch that goes on to succeed has to pay it - the words behind the descriptors are the
+// answer and they move - but a dispatch that refuses pays it to reach a conclusion the last one
+// already reached. So refusals, and only refusals, are memoed against the descriptors that produced
+// them.
+bool MaterializeIndirectImage(const ResourcePlan& program,
+                              const DescriptorSource::IndirectDescriptor& indirect,
+                              const DescriptorValue& material_value,
+                              const DescriptorValue& table_value, uint32_t image_index,
+                              const SrtRuntime& runtime, SrtWalker& clean,
+                              ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                              IndirectImageFailure& failure) {
+	// A finite table has no descriptors of its own to key a refusal on.
+	if (!indirect.sources.empty()) {
+		return EnumerateIndirectImage(program, indirect, material_value, table_value, image_index,
+		                              runtime, clean, snapshot, specialization, failure);
+	}
+	ShaderBufferResource signature_material;
+	const auto           signature_extent =
+	    runtime.readable_extent != nullptr && DecodeBufferDescriptor(material_value, signature_material)
+	                  ? runtime.readable_extent(runtime.userdata, signature_material.Base48(),
+	                            signature_material.GetSize())
+	                  : 0u;
+	const auto signature = IndirectTableSignature(indirect, material_value, table_value, image_index,
+	                                              signature_extent);
+	if (const auto* remembered = RefusedTables().Find(signature, runtime)) {
+		failure = *remembered;
+		return false;
+	}
+	if (!EnumerateIndirectImage(program, indirect, material_value, table_value, image_index, runtime,
+	                            clean, snapshot, specialization, failure)) {
+		RefusedTables().Remember(signature, failure);
+		return false;
+	}
+	// A table that resolves now must not be held to an answer an earlier binding of it gave.
+	RefusedTables().Forget(signature);
 	return true;
 }
 
@@ -782,7 +1083,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			continue;
 		}
 		// The specialization names a directory slot; the mapping it points at is what has to be
-		// in bounds and hold at least two candidates.
+		// in bounds and hold at least one candidate. Two was right while ordinal 0 was the first
+		// enumerated record - a single key then needed no mapping at all, because the root was
+		// already that key's descriptor. Now that ordinal 0 means "no match", a one-key mapping
+		// still decides something: whether this draw's key is that key, or nothing.
 		const auto directory_end = IndirectDirectoryBase(program) + IndirectDirectoryWords(program);
 		const auto mapping_offset =
 		    static_cast<size_t>(root.indirect_mapping_offset) < directory_end
@@ -792,7 +1096,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		                               mapping_offset < snapshot.flattened_srt.size()
 		                           ? snapshot.flattened_srt[mapping_offset]
 		                           : 0u;
-		if (root.indirect_search_iterations == 0u || key_count < 2u ||
+		if (root.indirect_search_iterations == 0u || key_count == 0u ||
 		    mapping_offset + 1u + static_cast<size_t>(key_count) * 2u >
 		        snapshot.flattened_srt.size()) {
 			return SpecializationFail("indirect image specialization has an invalid key mapping");
@@ -1457,8 +1761,24 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 				continue;
 			}
 			const auto& indirect = *source->indirect_descriptor;
-			if (!MaterializeIndirectImage(program, indirect, i, observed, clean, snapshot, specialization)) {
-				MaterializeFailure() = "indirect image table";
+			DescriptorValue material;
+			DescriptorValue table;
+			if (indirect.sources.empty() &&
+			    ((indirect.material_source != UINT32_MAX &&
+			      !clean.EvaluateDescriptor(indirect.material_source, material)) ||
+			     !clean.EvaluateDescriptor(indirect.table_source, table))) {
+				MaterializeFailure() =
+				    fmt::format("indirect image table at pc 0x{:08x}: its own handles are not "
+				                "host-evaluable",
+				                image.first_use_pc);
+				return false;
+			}
+			IndirectImageFailure indirect_failure;
+			if (!MaterializeIndirectImage(program, indirect, material, table, i, observed, clean,
+			                              snapshot, specialization, indirect_failure)) {
+				MaterializeFailure() =
+				    fmt::format("indirect image table at pc 0x{:08x}: {}", image.first_use_pc,
+				                DescribeIndirectImageFailure(indirect_failure));
 				return false;
 			}
 		} else {

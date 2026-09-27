@@ -256,8 +256,9 @@ bool ReadLinearTestMemory(void *userdata, uint64_t address, std::span<uint32_t> 
 std::unique_ptr<Fixture>
 MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
                          bool memory_backed_material = false, uint32_t member_offset = 0,
-                         uint32_t material_stride = 224, uint32_t selector_bits = UINT32_MAX,
-                         uint32_t table_stride = 32, uint32_t table_offset = 0) {
+                         uint32_t material_stride = 224, uint32_t heap_stride = 32u,
+                         uint32_t heap_record_offset = 0u,
+                         uint32_t selector_bits = UINT32_MAX) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> material_words;
   std::array<Value, 4> heap_words;
@@ -311,14 +312,18 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
                     fixture->AddMemory(material_scalar, 0x10d8));
   if (selector_bits != UINT32_MAX)
     key = fixture->Emit(ValueOpcode::BitwiseAnd32, {key, Value(selector_bits)});
+  // A heap of plain T# strides by 32 and the shader shifts; a heap that keeps a T# inside a
+  // larger per-record struct strides by the record and the shader multiplies.
   const auto heap_offset =
-      fixture->Emit(ValueOpcode::IMul32, {key, Value(table_stride)});
+      heap_stride == 32u
+          ? fixture->Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(5u)})
+          : fixture->Emit(ValueOpcode::IMul32, {key, Value(heap_stride)});
   std::array<Value, 8> image_words;
   MemoryInfo heap_scalar;
   heap_scalar.kind = ResourceKind::ScalarBuffer;
   for (uint32_t dword = 0; dword < image_words.size(); dword++) {
     auto component = heap_scalar;
-    component.offset = table_offset + dword * sizeof(uint32_t);
+    component.offset = heap_record_offset + dword * sizeof(uint32_t);
     if (malformed && dword == image_words.size() - 1u) {
       component.offset += sizeof(uint32_t);
     }
@@ -522,10 +527,13 @@ void TestInvariantIndirectImageMaterialization() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // Image 0 is the miss slot and is always null; the enumerated keys start at 1.
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 1 &&
+            snapshot.images.size() == 2 &&
+            std::ranges::all_of(snapshot.images[0].dwords,
+                                [](uint32_t dword) { return dword == 0u; }) &&
             std::equal(image_descriptor.begin(), image_descriptor.end(),
-                       snapshot.images[0].dwords.begin()),
+                       snapshot.images[1].dwords.begin()),
         "invariant indirect image table did not materialize");
 
   user_data[5] = 0u;
@@ -535,7 +543,7 @@ void TestInvariantIndirectImageMaterialization() {
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
             memory.watched_dwords == 4u &&
             std::equal(image_descriptor.begin(), image_descriptor.end(),
-                       snapshot.images[0].dwords.begin()),
+                       snapshot.images[1].dwords.begin()),
         "partial scalar-buffer descriptor read crossed bounds instead of zeroing its tail");
   memory.fail_address = 0x2008u;
   Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
@@ -580,8 +588,8 @@ void TestInvariantIndirectImageMaterialization() {
   ResourceSpecialization dynamic_specialization;
   Check(MaterializeResources(resource_plan, runtime, dynamic_snapshot,
                              dynamic_specialization) &&
-            dynamic_snapshot.images.size() == 2 &&
-            dynamic_specialization.images.size() == 2,
+            dynamic_snapshot.images.size() == 3 &&
+            dynamic_specialization.images.size() == 3,
         "dynamic indirect image table did not materialize");
   const auto second_image = (0x2020u - memory.base) / 4u;
   memory.words[second_image + 1u] |= 3u << 30u;
@@ -594,16 +602,16 @@ void TestInvariantIndirectImageMaterialization() {
   ResourceSpecialization mixed_specialization;
   Check(MaterializeResources(resource_plan, runtime, mixed_snapshot,
                              mixed_specialization) &&
-            mixed_snapshot.images.size() == 2 &&
-            mixed_specialization.images.size() == 2 &&
-            mixed_specialization.images[0].dimension ==
-                Decoder::ImageDimension::Dim2D &&
-            !mixed_specialization.images[0].cube &&
+            mixed_snapshot.images.size() == 3 &&
+            mixed_specialization.images.size() == 3 &&
             mixed_specialization.images[1].dimension ==
+                Decoder::ImageDimension::Dim2D &&
+            !mixed_specialization.images[1].cube &&
+            mixed_specialization.images[2].dimension ==
                 Decoder::ImageDimension::Dim2DArray &&
-            mixed_specialization.images[1].cube &&
-            std::equal(mixed_snapshot.images[1].dwords.begin(),
-                       mixed_snapshot.images[1].dwords.end(),
+            mixed_specialization.images[2].cube &&
+            std::equal(mixed_snapshot.images[2].dwords.begin(),
+                       mixed_snapshot.images[2].dwords.end(),
                        memory.words.begin() + second_image),
         "mixed 2D and cube candidates were rejected or discarded");
   memory.words[second_image + 1u] =
@@ -618,11 +626,12 @@ void TestInvariantIndirectImageMaterialization() {
     memory.words[second_image + dword] = image_descriptor[dword];
   }
   ApplyResourceSpecialization(fixture->program, dynamic_specialization);
-  Check(fixture->program.info.images.size() == 2 &&
+  // One tracked image becomes three resources: the null miss slot plus the two keys.
+  Check(fixture->program.info.images.size() == 3 &&
             fixture->program.info.images[0].indirect_root == 0 &&
             fixture->program.info.images[0].indirect_search_iterations != 0 &&
-            fixture->program.info.images[0].indirect_resources.size() == 2 &&
-            dynamic_snapshot.images.size() == 2,
+            fixture->program.info.images[0].indirect_resources.size() == 3 &&
+            dynamic_snapshot.images.size() == 3,
         "dynamic indirect image table was not specialized transactionally");
   const auto &mapping = dynamic_specialization.images[0];
   const auto mapping_offset =
@@ -707,12 +716,12 @@ void TestInvariantIndirectImageMaterialization() {
   const auto* user_data_storage = snapshot.user_data.data();
   const auto* buffer_specialization_storage = specialization.buffers.data();
   const auto* image_specialization_storage = specialization.images.data();
-  const auto old_address = snapshot.images[0].dwords[0];
+  const auto old_address = snapshot.images[1].dwords[0];
   memory.words[(0x2000u - memory.base) / 4u] += 0x100u;
   memory.watched_reads = 0;
   Check(MaterializeResources(memory_backed_plan, memory_backed_runtime,
                              snapshot, specialization) && memory.watched_reads == 1u &&
-            snapshot.images[0].dwords[0] == old_address + 0x100u,
+            snapshot.images[1].dwords[0] == old_address + 0x100u,
         "cache refresh reused stale table contents or repeated its clean pointer read");
   Check(snapshot.buffers.data() == buffer_storage && snapshot.images.data() == image_storage &&
             snapshot.flattened_srt.data() == flat_storage &&
@@ -752,9 +761,12 @@ void TestInvariantIndirectImageMaterialization() {
     SrtRuntime split_runtime{.user_data = user_data,
                              .userdata = &split_memory,
                              .read_specialization_memory = ReadLinearTestMemory};
+    // Image 0 is the miss slot and is always null; the enumerated key is image 1.
     Check(MaterializeResources(split_plan, split_runtime, snapshot, specialization) &&
-              snapshot.images.size() == 1 &&
-              snapshot.images[0].dwords == image_descriptor &&
+              snapshot.images.size() == 2 &&
+              std::ranges::all_of(snapshot.images[0].dwords,
+                                  [](uint32_t word) { return word == 0u; }) &&
+              snapshot.images[1].dwords == image_descriptor &&
               split_memory.watched_reads == 1u,
           "indirect scalar offsets did not align and bound their components independently");
   }
@@ -923,28 +935,33 @@ void TestGuardedDirectImageTable() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 32u && specialization.images.size() == 32u &&
+            snapshot.images.size() == 33u && specialization.images.size() == 33u &&
             snapshot.flattened_srt[MappingOf(snapshot, specialization.images[0].indirect_mapping_offset)] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
   const auto captured_word = (table - memory.base) / 4u + 16u * 8u;
-  const auto original_descriptor = snapshot.images[16].dwords;
+  const auto original_descriptor = snapshot.images[17].dwords;
   const std::array<uint32_t, 8> captured_invalid{
       0x101f0000u, 0xcb500000u, 0x001fc01fu, 0xd0970facu,
       0x86000000u, 0x00500003u, 0x00000400u, 0x00005204u};
   std::copy(captured_invalid.begin(), captured_invalid.end(),
              memory.words.begin() + captured_word);
+  // The record no longer parses, so its key maps to the miss slot rather than to an image of its
+  // own: one fewer resource, the same 32 keys.
+  const auto mapping_base =
+      MappingOf(snapshot, specialization.images[0].indirect_mapping_offset);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
             snapshot.images.size() == 32u &&
-            snapshot.flattened_srt[MappingOf(snapshot, specialization.images[0].indirect_mapping_offset)] == 32u &&
-            std::ranges::all_of(snapshot.images[16].dwords,
+            snapshot.flattened_srt[mapping_base] == 32u &&
+            snapshot.flattened_srt[mapping_base + 2u + 16u * 2u] == 0u &&
+            std::ranges::all_of(snapshot.images[0].dwords,
                                 [](uint32_t word) { return word == 0u; }),
         "captured non-descriptor record became a host image or lost its key mapping");
   std::copy(original_descriptor.begin(), original_descriptor.end(),
              memory.words.begin() + captured_word);
   memory.words[(table - memory.base) / 4u + 31u * 8u] = 0x987u;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images[31].dwords[0] == 0x987u,
+            snapshot.images[32].dwords[0] == 0x987u,
         "direct table refresh reused stale descriptor contents");
   memory.fail_address = table + 31u * 32u + 28u;
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
@@ -1251,9 +1268,10 @@ void TestBoundedComputeImageLoop() {
   }
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
+    // count keys plus the miss slot the search falls back to.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == count &&
-              specialization.images.size() == count &&
+              snapshot.images.size() == count + 1u &&
+              specialization.images.size() == count + 1u &&
               snapshot.flattened_srt[MappingOf(
                   snapshot, specialization.images[0].indirect_mapping_offset)] == count &&
               snapshot.images.back().dwords[0] == 0x100u + count - 1u,
@@ -1600,7 +1618,7 @@ void TestUniformizedMaterialImageKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u &&
+            snapshot.images.size() == 3u &&
             memory.reads == 4u && memory.descriptor_reads == 2u &&
             snapshot.flattened_srt[MappingOf(
                 snapshot, specialization.images[0].indirect_mapping_offset)] == 2u &&
@@ -3608,6 +3626,216 @@ void TestConservativeBufferReachability() {
   }
 }
 
+// RE9 keeps each light's T# at +16 of a 48-byte record, so its heap neither strides by 32 nor
+// starts its descriptor at the record. The recognizer used to admit only the 32-byte shift, which
+// dropped the whole shader; the enumeration has always been able to walk any stride.
+void TestStridedIndirectImageTable() {
+  auto fixture = MakeIndirectImageFixture(false, 4u, false, 0u, 224u, 48u, 16u);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+
+  Check(fixture->program.info.images.size() == 1,
+        "strided indirect image table was not tracked as one image");
+  const auto source = fixture->program.info.images[0].source;
+  const auto &indirect =
+      fixture->program.descriptor_sources[source].indirect_descriptor;
+  Check(indirect.has_value() && indirect->heap_stride == 48u &&
+            indirect->table_offset == 16u && indirect->selector_stride == 224u,
+        "strided indirect image table did not record its record step");
+
+  // Material V# strides by 224 over two records; heap V# spans both 48-byte records.
+  std::array<uint32_t, 9> user_data{0x1000u,    224u << 16u, 2u, 0u, 0x2000u,
+                                    16u << 16u, 8u,          0u, 7u};
+  LinearTestMemory memory;
+  // The second material record names key 1; the first reads back as key 0.
+  memory.words[(0x1000u - memory.base + 36u) / 4u] = 1u;
+  std::array<uint32_t, 8> image_descriptor{};
+  image_descriptor[0] = 0x20u;
+  image_descriptor[1] =
+      static_cast<uint32_t>(
+          Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float)
+      << 20u;
+  image_descriptor[2] = 3u | (3u << 14u);
+  image_descriptor[3] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D)
+       << 28u);
+  // Key k lands at k * 48 + 16, so the two records are 0x2010 and 0x2040 - neither of which a
+  // 32-byte stride at offset 0 would have read.
+  for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
+    memory.words[(0x2010u - memory.base) / 4u + dword] = image_descriptor[dword];
+    memory.words[(0x2040u - memory.base) / 4u + dword] = image_descriptor[dword];
+  }
+
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.images.size() == 2 &&
+            std::equal(image_descriptor.begin(), image_descriptor.end(),
+                       snapshot.images[1].dwords.begin()),
+        "strided indirect image table did not materialize its records");
+}
+
+// Enumeration decides residency safely; it decides *selection* only if every key the shader can
+// produce is in the mapping AND lands on its own descriptor - and if a key that is not in the
+// mapping lands on nothing. The second half had no test, and had been wrong: the emitted search
+// starts at ordinal 0 and only leaves it on an exact match, so a key the host never enumerated
+// sampled whatever ordinal 0 held. This walks a heap end to end - materializes it, then replays
+// the binary search spirvEmitterImage emits - for every key the shader could compute, and then
+// for one it could not.
+void TestIndirectImageSelectionResolvesEveryKey() {
+  constexpr uint32_t kSelectorStride  = 112u;
+  constexpr uint32_t kHeapStride      = 48u;
+  constexpr uint32_t kHeapOffset      = 16u;
+  constexpr uint32_t kMaterialRecords = 8u;
+  constexpr uint32_t kHeapRecords     = 24u;
+  constexpr uint64_t kMaterialBase    = 0x1000u;
+  constexpr uint64_t kHeapBase        = 0x4000u;
+
+  auto fixture = MakeIndirectImageFixture(false, 4u, false, 0u, kSelectorStride,
+                                          kHeapStride, kHeapOffset);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+
+  Check(fixture->program.info.images.size() == 1,
+        "the heap shape was not tracked as one image");
+  const auto source = fixture->program.info.images[0].source;
+  const auto &indirect = fixture->program.descriptor_sources[source].indirect_descriptor;
+  Check(indirect.has_value() && indirect->heap_stride == kHeapStride &&
+            indirect->table_offset == kHeapOffset &&
+            indirect->selector_stride == kSelectorStride,
+        "the heap shape did not reach the enumeration intact");
+
+  LinearTestMemory memory;
+  memory.words.assign(0x8000u / 4u, 0u);
+
+  // Each heap record's T# names its own index, so a mis-selection shows up as a wrong base.
+  for (uint32_t record = 0; record < kHeapRecords; record++) {
+    const auto at = (kHeapBase - memory.base + record * kHeapStride + kHeapOffset) / 4u;
+    memory.words[at + 0u] = 0x20u + record * 0x40u;
+    memory.words[at + 1u] =
+        static_cast<uint32_t>(Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[at + 2u] = 3u | (3u << 14u);
+    memory.words[at + 3u] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+
+  const std::array<uint32_t, kMaterialRecords> keys{5u, 3u, 9u, 1u, 12u, 7u, 2u, 4u};
+  for (uint32_t record = 0; record < kMaterialRecords; record++) {
+    const auto base = (kMaterialBase - memory.base + record * kSelectorStride) / 4u;
+    // Everything else in the record is ordinary material data. The enumeration cannot tell those
+    // words from the key, so they become keys too - which is why the mapping is much larger than
+    // the table, and why a key that resolves to nothing must stay resolving to nothing.
+    for (uint32_t word = 0; word < kSelectorStride / 4u; word++) {
+      memory.words[base + word] = 0x3f800000u + record * 0x11u + word;
+    }
+    // The key's address is what the shader computes: the record, plus the offset it folded in,
+    // plus the scalar load's own immediate.
+    memory.words[base + (indirect->selector_offset + indirect->material_offset) / 4u] =
+        keys[record];
+  }
+
+  std::array<uint32_t, 9> user_data{
+      static_cast<uint32_t>(kMaterialBase), kSelectorStride << 16u, kMaterialRecords, 0u,
+      static_cast<uint32_t>(kHeapBase),     kHeapStride << 16u,     kHeapRecords,     0u, 7u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "the heap did not materialize");
+
+  const auto &root = specialization.images[0];
+  Check(root.indirect_search_iterations != 0u, "the table produced no runtime mapping");
+  const auto mapping = root.indirect_mapping_offset;
+  Check(mapping < snapshot.flattened_srt.size(), "the mapping slot is out of range");
+  const auto table = snapshot.flattened_srt[mapping];
+  Check(table < snapshot.flattened_srt.size(), "the mapping offset is out of range");
+  const auto count = snapshot.flattened_srt[table];
+
+  // Exactly the search spirvEmitterImage emits: low/high bounds, ordinal 0 until an exact match.
+  const auto Resolve = [&](uint32_t key) {
+    uint32_t low = 0;
+    uint32_t high = count;
+    uint32_t selected = 0;
+    for (uint32_t iteration = 0; iteration < root.indirect_search_iterations; iteration++) {
+      const bool active = low < high;
+      const auto mid = active ? (low + high) / 2u : 0u;
+      const auto entry = table + mid * 2u + 1u;
+      const auto mapped_key = snapshot.flattened_srt[entry];
+      const auto candidate = snapshot.flattened_srt[entry + 1u];
+      if (active && mapped_key == key) selected = candidate;
+      if (active && mapped_key < key) low = mid + 1u;
+      else if (active) high = mid;
+    }
+    return selected;
+  };
+
+  for (uint32_t record = 0; record < kMaterialRecords; record++) {
+    const auto key = keys[record];
+    const auto ordinal = Resolve(key);
+    Check(ordinal < snapshot.images.size(), "a key resolved past the bound descriptors");
+    Check(snapshot.images[ordinal].dwords[0] == 0x20u + key * 0x40u,
+          "a key the shader computes did not select its own heap record");
+  }
+
+  // And a key the shader cannot compute must not quietly borrow a real descriptor.
+  Check(std::ranges::all_of(snapshot.images[Resolve(0x4321u)].dwords,
+                            [](uint32_t word) { return word == 0u; }),
+        "an unresolved key selected heap record 0 instead of nothing");
+}
+
+// A refused table used to report only that it was refused. Each clause now names itself and the
+// two numbers that decided it, and - because reaching the answer costs one guest read per material
+// record - the answer is remembered so the next dispatch does not buy it again.
+void TestIndirectImageRefusalNamesItselfAndIsMemoed() {
+  auto fixture = MakeIndirectImageFixture(false);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+
+  // The shader scales its selector by 224 and this material V# strides by 128, so the records the
+  // enumeration would walk are not the records the draw selects.
+  std::array<uint32_t, 9> user_data{0x1100u,    128u << 16u, 2u, 0u, 0x2100u,
+                                    16u << 16u, 4u,          0u, 7u};
+  LinearTestMemory memory;
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "a material V# whose stride disagrees with the selector was accepted");
+  const std::string reason{LastMaterializeFailure()};
+  Check(reason.find("strides by 128") != std::string::npos &&
+            reason.find("selector by 224") != std::string::npos &&
+            reason.find("0x000010f0") != std::string::npos,
+        "the refusal did not name its clause, its numbers and its pc");
+
+  const auto reads = memory.reads;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            std::string{LastMaterializeFailure()} == reason,
+        "the memoed refusal changed its reason");
+  Check(memory.reads == reads,
+        "a refusal the descriptors decide was re-derived instead of remembered");
+
+  // Rebinding the material V# so its stride agrees is a different table, so the memo must not
+  // answer for it.
+  user_data[1] = 224u << 16u;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "the memo outlived the descriptors that produced it");
+}
+
 void TestConditionalIndirectImageMaterialization() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = MakeIndirectImageFixture(false);
@@ -4221,6 +4449,9 @@ int main() {
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
+    Run("strided indirect image table", TestStridedIndirectImageTable);
+    Run("indirect image selection", TestIndirectImageSelectionResolvesEveryKey);
+    Run("indirect image refusal reporting", TestIndirectImageRefusalNamesItselfAndIsMemoed);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
