@@ -20259,6 +20259,41 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   std::printf("[graphics] %-31s ok\n", test.name);
 }
 
+// A pixel shader that exports to several MRTs must keep every export. The draw path
+// attaches only the colour slots that reach info.outputs as StageOutputKind::Mrt, so a
+// dropped export leaves a bound render target with no writer at all - it never becomes a
+// Vulkan attachment and nothing ever notices. Cover the plain and the compressed
+// (two half-dwords per VGPR) encodings: a G-buffer fill normally uses the latter.
+void CheckMultiMrtExportOutputs(bool compressed) {
+  GraphicsCase test{};
+  test.name = compressed ? "MultiMrtCompressedExports" : "MultiMrtExports";
+  for (u32 i = 0; i < 8; i++) {
+    AppendVMovLiteral(&test.fragment_code, i, 0x3f000000u + i * 0x00080000u);
+  }
+  for (u32 target = 0; target < 4; target++) {
+    const bool last = target == 3;
+    test.fragment_code.push_back(EncodeExp0(target, 0xf, last, compressed, last));
+    test.fragment_code.push_back(compressed
+                                     ? EncodeExp1(target * 2, target * 2 + 1, 0, 0)
+                                     : EncodeExp1(0, 1, 2, 3));
+  }
+  AppendEnd(&test.fragment_code);
+
+  auto compiled = CompileFragmentCase(test);
+  std::vector<u32> slots;
+  for (const auto &output : compiled.program.info.outputs) {
+    if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
+      slots.push_back(output.index);
+    }
+  }
+  std::sort(slots.begin(), slots.end());
+  const std::vector<u32> expected{0u, 1u, 2u, 3u};
+  Require(test.name, "mrt outputs", slots == expected,
+          "expected Mrt outputs for slots 0,1,2,3, got " +
+              std::to_string(slots.size()) + " output(s)");
+  std::printf("[graphics] %-31s ok\n", test.name);
+}
+
 enum class CoverageClass {
   Covered,
   ControlOrMarker,
@@ -44556,6 +44591,8 @@ int main(int argc, char **argv) {
     RunGraphicsCase(&vulkan, test);
   }
   vulkan.CheckGpuSuspendPoint();
+  CheckMultiMrtExportOutputs(false);
+  CheckMultiMrtExportOutputs(true);
   vulkan.CheckGpuCommandLane();
   if (skipped_device_checks) {
     std::printf(
