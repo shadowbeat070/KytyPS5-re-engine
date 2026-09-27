@@ -572,9 +572,15 @@ struct PipelineCache::ProgramCache {
 
 	// A shader whose descriptors cannot be derived is dropped, not fatal: the draw is lost, the
 	// session is not. Report each distinct hash once so a per-frame skip does not flood the log.
-	// Permanent: the recompiler rejected the program, so no later dispatch can do better.
-	void ReportSkipped(ShaderType stage, uint64_t hash, uint32_t pc, std::string_view reason) {
-		skipped_shaders.insert(hash);
+	// Permanent for the key that was refused: the recompiler rejected that translation, so no later
+	// dispatch of it can do better. Keyed on the whole ProgramKey and not on the hash, because a
+	// refusal is a property of the translation and the translation is a function of more than the
+	// code - the user-data count and the stage's static state reach resource tracking, and the
+	// specialization reaches the backend. A hash-keyed skip let one refused shape disable every
+	// other shape of the same shader, including shapes already drawing.
+	void ReportSkipped(const ProgramKey& key, ShaderType stage, uint64_t hash, uint32_t pc,
+	                   std::string_view reason) {
+		skipped_shaders.insert(key);
 		if (!reported_shaders.insert(hash).second) {
 			return;
 		}
@@ -588,9 +594,9 @@ struct PipelineCache::ProgramCache {
 
 	// Not the shader's fault and not permanent for it: one permutation was refused, the channel
 	// that asked for it is frozen, and the generation before it still draws. Deliberately does
-	// not touch `skipped_shaders` - that set has no generation in it and would disable the
-	// working permutation too. One line per shader; the draw that hits the refusal is lost and
-	// the next one renders.
+	// not touch `skipped_shaders` at all - the refused generation is about to be rolled back, so
+	// recording it would only leave an entry nothing can ever ask for again. One line per shader;
+	// the draw that hits the refusal is lost and the next one renders.
 	void ReportRebuildRefused(ShaderType stage, uint64_t hash, std::string_view reason) {
 		if (!reported_shaders.insert(hash).second) {
 			return;
@@ -710,12 +716,6 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		// A shader already rejected once is rejected for good: skip it before paying for another
-		// translation, which would otherwise repeat on every dispatch.
-		if (skipped_shaders.contains(params.hash)) {
-			return {};
-		}
-
 		const auto  code_key   = ShaderCodeKey(params.code, params.back_code);
 		auto&       proven     = unfoldable[code_key];
 		lookup_key.stage           = stage;
@@ -724,6 +724,12 @@ struct PipelineCache::ProgramCache {
 		lookup_key.code_size       = static_cast<uint32_t>(params.code.size());
 		lookup_key.unfoldable_generation = proven.generation;
 		BuildStageStaticKey(input_info, lookup_key.static_state);
+		// A shape already rejected once is rejected for good: skip it before paying for another
+		// translation, which would otherwise repeat on every dispatch. Built after the key because
+		// the key is what was refused; building it costs a stage's static state and nothing more.
+		if (skipped_shaders.contains(lookup_key)) {
+			return {};
+		}
 		auto                                         entry = programs.find(lookup_key);
 		// Filled by MaterializeResources with the resources it had to bind null. Learning from it
 		// moves the generation above, so the next draw of this shader misses and re-translates
@@ -829,7 +835,8 @@ struct PipelineCache::ProgramCache {
 		// Checked before the cache branch because the other arm falls through to
 		// CompilePermutation, which would emit SPIR-V from the same unusable program.
 		if (!translated.status.ok) {
-			ReportSkipped(stage, params.hash, translated.status.pc, translated.status.reason);
+			ReportSkipped(lookup_key, stage, params.hash, translated.status.pc,
+			              translated.status.reason);
 			return {};
 		}
 		if (translated.program.uses_bvh_intersect_stub) {
@@ -857,18 +864,17 @@ struct PipelineCache::ProgramCache {
 			auto rejected = std::move(entry->second.permutations.back());
 			entry->second.permutations.pop_back();
 			// A permutation the channel asked for and the host refused must not take the shader
-			// with it. `skipped_shaders` is keyed on the hash alone, with no generation in it, so
-			// a refusal recorded there disables every generation - including the one before this
-			// rebuild, whose permutation draws fine and is still in `programs` because the
-			// channel never invalidates. Roll the generation back to it instead: the shot keeps
-			// the missing effect it had before the channel fired, which is the outcome the
-			// channel was trying to improve on and is strictly better than a shader that stops
-			// drawing at all.
+			// with it. The skip set now carries the generation, so a refusal no longer disables
+			// the one before this rebuild by itself - but that generation would still never be
+			// asked for again, because `proven.generation` only moves forward. Roll it back to
+			// the generation that draws: the shot keeps the missing effect it had before the
+			// channel fired, which is the outcome the channel was trying to improve on and is
+			// strictly better than a shader that stops drawing at all.
 			if (channel_rebuild && RefuseRebuild(proven)) {
 				ReportRebuildRefused(stage, params.hash, rejected.reason);
 				return {};
 			}
-			ReportSkipped(stage, params.hash, 0, rejected.reason);
+			ReportSkipped(lookup_key, stage, params.hash, 0, rejected.reason);
 			return {};
 		}
 		const auto& permutation = entry->second.permutations.back();
@@ -985,7 +991,9 @@ struct PipelineCache::ProgramCache {
 	// names nothing in the new. UnfoldableSet, Learn and RefuseRebuild live in unfoldableSet.h so
 	// the rollback can be tested without a device.
 	std::unordered_map<uint64_t, UnfoldableSet>                 unfoldable;
-	std::unordered_set<uint64_t>                                skipped_shaders;
+	// Keyed on the whole ProgramKey: see ReportSkipped. `reported_shaders` stays on the hash, so
+	// the log still carries one line per shader however many of its shapes refuse.
+	std::unordered_set<ProgramKey, ProgramKeyHash>              skipped_shaders;
 	// Log throttle only: a hash here has been reported once, whether the cause was permanent or
 	// transient. Kept apart from skipped_shaders so a transient failure does not disable a shader.
 	std::unordered_set<uint64_t>                                reported_shaders;
