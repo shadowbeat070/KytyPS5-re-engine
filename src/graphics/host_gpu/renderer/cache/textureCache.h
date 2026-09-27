@@ -128,9 +128,15 @@ public:
 	// or one left over a pool address the engine has since reused. Empty when nothing blocks.
 	[[nodiscard]] std::string DescribeGpuModifiedRegion(uint64_t address, uint64_t size);
 
+	// Inside a registered metadata surface, not only at its base: layers are cleared one by one.
 	[[nodiscard]] bool IsMeta(uint64_t address);
+	[[nodiscard]] bool IsWithinMeta(uint64_t address, uint64_t size);
 	[[nodiscard]] bool IsMetaCleared(uint64_t address, uint32_t slice);
 	[[nodiscard]] bool ClearMeta(uint64_t address);
+	// A CP-DMA fill or a compute clear landing on a metadata surface: marks only the whole,
+	// slice-aligned slices the write covers. A marked slice discards the attachment contents at
+	// load, so an address match on its own is not enough to spend it.
+	[[nodiscard]] bool ClearMetaSlices(uint64_t address, uint64_t size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	void UnmapMemory(uint64_t address, uint64_t size);
@@ -148,8 +154,17 @@ private:
 		enum class Type : uint8_t { CMask, FMask, HTile };
 
 		Type     type;
+		// Footprint of the registered metadata surface, so a writer that touches only part
+		// of it cannot be mistaken for one that cleared the whole thing. The registry is
+		// keyed by base address alone and outlives the guest allocation, so a matching base
+		// on its own proves nothing about what a writer covered.
+		uint64_t      range_size = 0;
+		uint32_t      slices     = 0;
 		MetaSliceMask clear_mask = MetaSliceMask::All();
 	};
+
+	// The registered surface whose footprint holds the address. Caller holds m_lock.
+	std::map<uint64_t, MetaDataInfo>::iterator FindMetaContaining(uint64_t address);
 
 	struct OverlapResult {
 		ImageId image;

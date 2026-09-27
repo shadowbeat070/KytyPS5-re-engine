@@ -370,10 +370,15 @@ struct TextureCacheTestAccess {
     return cache.DownloadImageMemory(id);
   }
 
-  static void RegisterHtileMeta(TextureCache &cache, uint64_t address) {
+  // Defaults to the 0x80 bytes the fixture's descriptors cover, as one slice.
+  static void RegisterHtileMeta(TextureCache &cache, uint64_t address,
+                                uint64_t range_size = 0x80,
+                                uint32_t slices = 1) {
     std::lock_guard lock(cache.m_lock);
     auto &metadata = cache.m_surface_metas[address];
     metadata.type = TextureCache::MetaDataInfo::Type::HTile;
+    metadata.range_size = range_size;
+    metadata.slices = slices;
     metadata.clear_mask = {};
   }
 
@@ -5436,6 +5441,245 @@ public:
             write_only_consumed &&
                 texture_cache.IsMetaCleared(write_only_meta, 0),
             "a metadata write-only fill was not consumed as a clear");
+    // Consuming the dispatch drops every store it would have made, so a dispatch that also writes
+    // something the metadata registry does not name must survive.
+    constexpr uint64_t mixed_meta = 0x0000000204202200ull;
+    constexpr uint64_t image_meta = 0x0000000204202300ull;
+    constexpr uint64_t plain_buffer = 0x0000000204300000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, mixed_meta);
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, image_meta);
+    const auto AddWrittenBuffer =
+        [](ShaderRecompiler::IR::CompiledShaderInfo &program,
+           ShaderRecompiler::IR::ResourceSnapshot &snapshot, uint64_t address) {
+          program.stage = ShaderType::Compute;
+          ShaderRecompiler::IR::BufferResource resource{};
+          resource.written = true;
+          resource.formatted = true;
+          program.info.buffers.push_back(resource);
+
+          ShaderBufferResource descriptor{};
+          descriptor.UpdateAddress48(address);
+          descriptor.fields[1] |= 16u << 16u;
+          descriptor.fields[2] = 8;
+          descriptor.fields[3] =
+              DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt)
+               << 12u);
+          ShaderRecompiler::IR::DescriptorValue value{};
+          value.dword_count = 4;
+          std::copy_n(descriptor.fields, value.dword_count, value.dwords.begin());
+          snapshot.buffers.push_back(value);
+        };
+
+    ShaderRecompiler::IR::CompiledShaderInfo mixed_program{};
+    ShaderRecompiler::IR::ResourceSnapshot mixed_snapshot;
+    AddWrittenBuffer(mixed_program, mixed_snapshot, mixed_meta);
+    AddWrittenBuffer(mixed_program, mixed_snapshot, plain_buffer);
+    ShaderComputeInputInfo mixed_input{};
+    mixed_input.stage.program = &mixed_program;
+    mixed_input.stage.resources = &mixed_snapshot;
+    Require(name, "mixed write dispatch preserved",
+            !RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+                executor, mixed_input, command) &&
+                !texture_cache.IsMetaCleared(mixed_meta, 0),
+            "a dispatch that also writes a plain buffer was replaced by a clear");
+
+    ShaderRecompiler::IR::CompiledShaderInfo image_program{};
+    ShaderRecompiler::IR::ResourceSnapshot image_snapshot;
+    AddWrittenBuffer(image_program, image_snapshot, image_meta);
+    ShaderRecompiler::IR::ImageResource written_image{};
+    written_image.written = true;
+    written_image.resource_class = ShaderRecompiler::IR::ImageResourceClass::Storage;
+    image_program.info.images.push_back(written_image);
+    image_snapshot.images.emplace_back();
+    ShaderComputeInputInfo image_input{};
+    image_input.stage.program = &image_program;
+    image_input.stage.resources = &image_snapshot;
+    Require(name, "storage image write preserved",
+            !RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+                executor, image_input, command) &&
+                !texture_cache.IsMetaCleared(image_meta, 0),
+            "a dispatch that writes a storage image was replaced by a clear");
+    // RE9's indirect-args producer: an atomic counter buffer next to a write-only buffer whose
+    // base the registry still names. Consuming it loses the counter increment.
+    constexpr uint64_t atomic_meta = 0x0000000204202400ull;
+    constexpr uint64_t counter_buffer = 0x0000000204310000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, atomic_meta);
+    ShaderRecompiler::IR::CompiledShaderInfo atomic_program{};
+    ShaderRecompiler::IR::ResourceSnapshot atomic_snapshot;
+    AddWrittenBuffer(atomic_program, atomic_snapshot, counter_buffer);
+    atomic_program.info.buffers.back().read = true;
+    atomic_program.info.buffers.back().atomic = true;
+    AddWrittenBuffer(atomic_program, atomic_snapshot, atomic_meta);
+    ShaderComputeInputInfo atomic_input{};
+    atomic_input.stage.program = &atomic_program;
+    atomic_input.stage.resources = &atomic_snapshot;
+    Require(name, "atomic counter dispatch preserved",
+            !RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+                executor, atomic_input, command) &&
+                !texture_cache.IsMetaCleared(atomic_meta, 0),
+            "a dispatch that atomically updates a counter was replaced by a clear");
+    scheduler.Finish();
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // Layered HTILE is cleared one slice at a time at an offset into the surface.
+  void CheckMetaSliceClears() {
+    constexpr const char *name = "MetaSliceClears";
+    constexpr uint64_t meta = 0x0000000204400000ull;
+    constexpr uint64_t slice = 0x10000;
+    constexpr uint32_t slices = 4;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    auto &texture_cache = context.GetTextureCache();
+    const auto Reset = [&] {
+      TextureCacheTestAccess::RegisterHtileMeta(texture_cache, meta,
+                                                slices * slice, slices);
+    };
+    const auto ClearedExactly = [&](std::initializer_list<uint32_t> expected) {
+      for (uint32_t index = 0; index < slices; index++) {
+        const bool want = std::ranges::find(expected, index) != expected.end();
+        if (texture_cache.IsMetaCleared(meta, index) != want) {
+          return false;
+        }
+      }
+      return true;
+    };
+
+    Reset();
+    Require(name, "one slice at its offset",
+            texture_cache.ClearMetaSlices(meta + slice, slice) &&
+                ClearedExactly({1}),
+            "a clear of slice 1 at its offset did not mark exactly that slice");
+    Reset();
+    Require(name, "whole surface",
+            texture_cache.ClearMetaSlices(meta, slices * slice) &&
+                ClearedExactly({0, 1, 2, 3}),
+            "a clear of the whole footprint did not mark every slice");
+    Reset();
+    Require(name, "two slices",
+            texture_cache.ClearMetaSlices(meta + 2 * slice, 2 * slice) &&
+                ClearedExactly({2, 3}),
+            "a clear spanning slices 2 and 3 did not mark exactly those");
+    Reset();
+    Require(name, "first slice from the base",
+            texture_cache.ClearMetaSlices(meta, slice) && ClearedExactly({0}),
+            "a one-slice clear at the base did not mark exactly slice 0");
+    Reset();
+    Require(name, "unaligned start refused",
+            !texture_cache.ClearMetaSlices(meta + slice / 2, slice) &&
+                ClearedExactly({}),
+            "a write starting inside a slice was taken as a clear");
+    Require(name, "short write refused",
+            !texture_cache.ClearMetaSlices(meta + slice, slice - 4) &&
+                !texture_cache.ClearMetaSlices(meta, 4) && ClearedExactly({}),
+            "a write shorter than one slice was taken as a clear");
+    Require(name, "containment",
+            texture_cache.IsMeta(meta) && texture_cache.IsMeta(meta + slice) &&
+                texture_cache.IsMeta(meta + slices * slice - 1) &&
+                !texture_cache.IsMeta(meta + slices * slice) &&
+                !texture_cache.IsMeta(meta - 1),
+            "IsMeta did not answer for exactly the registered footprint");
+    Require(name, "outside the footprint refused",
+            !texture_cache.ClearMetaSlices(meta + slices * slice, slice) &&
+                !texture_cache.ClearMetaSlices(meta - slice, slice) &&
+                ClearedExactly({}),
+            "a write outside the registered footprint was taken as a clear");
+
+    // A footprint the slice count does not divide gives no slice size to
+    // measure against.
+    constexpr uint64_t uneven_meta = 0x0000000204500000ull;
+    TextureCacheTestAccess::RegisterHtileMeta(texture_cache, uneven_meta,
+                                              3 * 0x1000 + 0x100, 3);
+    Require(
+        name, "uneven footprint refused",
+        texture_cache.IsMeta(uneven_meta + 0x1000) &&
+            !texture_cache.ClearMetaSlices(uneven_meta + 0x1000, 0x1000) &&
+            !texture_cache.ClearMetaSlices(uneven_meta, 3 * 0x1000 + 0x100) &&
+            !texture_cache.IsMetaCleared(uneven_meta, 0) &&
+            !texture_cache.IsMetaCleared(uneven_meta, 1),
+        "a footprint with no whole slice size was cleared");
+
+    // The compute-clear path measures the same way: a write-only dispatch over
+    // one slice.
+    const auto SliceDispatch =
+        [](uint64_t address, uint64_t size,
+           ShaderRecompiler::IR::CompiledShaderInfo &program,
+           ShaderRecompiler::IR::ResourceSnapshot &snapshot) {
+          program.stage = ShaderType::Compute;
+          ShaderRecompiler::IR::BufferResource resource{};
+          resource.written = true;
+          resource.formatted = true;
+          program.info.buffers.push_back(resource);
+          ShaderBufferResource descriptor{};
+          descriptor.UpdateAddress48(address);
+          descriptor.fields[1] |= 16u << 16u;
+          descriptor.fields[2] = static_cast<uint32_t>(size / 16u);
+          descriptor.fields[3] =
+              DstSel(4, 5, 6, 7) |
+              (static_cast<uint32_t>(Prospero::BufferFormat::k32_32_32_32UInt)
+               << 12u);
+          ShaderRecompiler::IR::DescriptorValue value{};
+          value.dword_count = 4;
+          std::copy_n(descriptor.fields, value.dword_count,
+                      value.dwords.begin());
+          snapshot.buffers.push_back(value);
+          ShaderComputeInputInfo input{};
+          input.stage.program = &program;
+          input.stage.resources = &snapshot;
+          return input;
+        };
+    auto &executor = context.GetRenderExecutor();
+    auto &command = scheduler.Current();
+    Reset();
+    ShaderRecompiler::IR::CompiledShaderInfo slice_program{};
+    ShaderRecompiler::IR::ResourceSnapshot slice_snapshot;
+    const auto slice_input =
+        SliceDispatch(meta + 3 * slice, slice, slice_program, slice_snapshot);
+    Require(
+        name, "compute clear of one slice",
+        RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, slice_input, command) &&
+            ClearedExactly({3}),
+        "a write-only dispatch over slice 3 did not clear exactly that slice");
+    Reset();
+    ShaderRecompiler::IR::CompiledShaderInfo whole_program{};
+    ShaderRecompiler::IR::ResourceSnapshot whole_snapshot;
+    const auto whole_input =
+        SliceDispatch(meta, slices * slice, whole_program, whole_snapshot);
+    Require(name, "compute clear of the whole footprint",
+            RenderExecutorTestAccess::TryConsumeComputeMetaClear(executor, whole_input,
+                                                                 command) &&
+                ClearedExactly({0, 1, 2, 3}),
+            "a write-only dispatch over exactly the metadata was not consumed as a clear");
+    Reset();
+    ShaderRecompiler::IR::CompiledShaderInfo pool_program{};
+    ShaderRecompiler::IR::ResourceSnapshot pool_snapshot;
+    const auto pool_input =
+        SliceDispatch(meta, 8 * slices * slice, pool_program, pool_snapshot);
+    Require(name, "pool fill past the metadata still runs",
+            !RenderExecutorTestAccess::TryConsumeComputeMetaClear(executor, pool_input,
+                                                                  command) &&
+                ClearedExactly({0, 1, 2, 3}),
+            "a fill running past the metadata footprint was dropped as a clear, or did "
+            "not record the clear");
+    Reset();
+    Reset();
+    ShaderRecompiler::IR::CompiledShaderInfo unaligned_program{};
+    ShaderRecompiler::IR::ResourceSnapshot unaligned_snapshot;
+    const auto unaligned_input = SliceDispatch(
+        meta + slice / 2, slice, unaligned_program, unaligned_snapshot);
+    Require(
+        name, "unaligned compute write preserved",
+        !RenderExecutorTestAccess::TryConsumeComputeMetaClear(
+            executor, unaligned_input, command) &&
+            ClearedExactly({}),
+        "a dispatch writing across a slice boundary was replaced by a clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }
@@ -7442,9 +7686,63 @@ public:
       resources.GetBufferCache().FillBuffer(base + metadata_b, sizeof(uint32_t),
                                             0, false);
       Require(
+          name, "metadata partial fill state",
+          !texture_cache.IsMetaCleared(base + metadata_b, 0),
+          "a fill covering one HTile word published a whole-surface clear");
+      resources.GetBufferCache().FillBuffer(
+          base + metadata_b, metadata_depth_b.info.metadata.range.size, 0,
+          false);
+      Require(
           name, "metadata buffer fill state",
           texture_cache.IsMetaCleared(base + metadata_b, 0),
           "BufferCache fill did not publish an exact-address metadata clear");
+
+      // A view spans only up to its last bound layer; same slice size keeps the
+      // widest footprint.
+      constexpr uint64_t atlas_data = 0x12700;
+      constexpr uint64_t atlas_meta = 0x13400;
+      constexpr uint64_t atlas_slice = 0x80;
+      auto MakeAtlasDepth = [&](uint32_t layers, uint64_t slice_size) {
+        auto desc = MakeLinearDesc(
+            base + atlas_data, layers * sizeof(uint32_t),
+            vk::Format::eD32Sfloat, Prospero::BufferFormat::k32Float,
+            Prospero::ImageType::kColor2D, {1, 1, 1}, layers, 4, 1);
+        desc.type = BindingType::DepthTarget;
+        desc.info.metadata.kind = ImageMetadataKind::Htile;
+        desc.info.metadata.range = {base + atlas_meta, layers * slice_size};
+        desc.info.htile_clear_mask = 0;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        return desc;
+      };
+      auto atlas = MakeAtlasDepth(4, atlas_slice);
+      const auto atlas_id = texture_cache.FindImage(atlas);
+      (void)texture_cache.FindDepthTarget(atlas_id, atlas);
+      (void)texture_cache.FindDepthTarget(atlas_id,
+                                          MakeAtlasDepth(2, atlas_slice));
+      resources.GetBufferCache().FillBuffer(base + atlas_meta + 2 * atlas_slice,
+                                            atlas_slice, 0, false);
+      Require(name, "layered metadata keeps its widest footprint",
+              !texture_cache.IsMetaCleared(base + atlas_meta, 0) &&
+                  !texture_cache.IsMetaCleared(base + atlas_meta, 1) &&
+                  texture_cache.IsMetaCleared(base + atlas_meta, 2) &&
+                  !texture_cache.IsMetaCleared(base + atlas_meta, 3),
+              "binding fewer layers shrank the HTile footprint, so the clear "
+              "of the next "
+              "slice was dropped");
+      (void)texture_cache.FindDepthTarget(atlas_id,
+                                          MakeAtlasDepth(2, atlas_slice / 2));
+      resources.GetBufferCache().FillBuffer(base + atlas_meta + atlas_slice / 2,
+                                            atlas_slice / 2, 0, false);
+      Require(
+          name, "recycled metadata takes the new footprint",
+          texture_cache.IsMetaCleared(base + atlas_meta, 1) &&
+              !texture_cache.IsMeta(base + atlas_meta + atlas_slice),
+          "a binding with a different HTile slice size kept the old footprint");
+      texture_cache.UnmapMemory(atlas.info.data.address, atlas.info.data.size);
+      Require(name, "layered metadata retirement",
+              !texture_cache.IsMeta(base + atlas_meta),
+              "retiring the layered depth image left its metadata registered");
 
       // R-Type Final 3 reuses an old color allocation inside a new stencil plane,
       // with the same metadata address changing from DCC to HTile.
@@ -43915,6 +44213,11 @@ int main(int argc, char **argv) {
     vulkan.CheckUnifiedTextureCacheFlow();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--meta-slice-clear-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckMetaSliceClears();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--dcc-clear-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckRenderExecutorColorMetadataClear();
@@ -44184,6 +44487,7 @@ int main(int argc, char **argv) {
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckMetaSliceClears();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
   vulkan.CheckCubeFaceStorageExpansion();

@@ -64,28 +64,44 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	if (resources.buffers.size() != program.info.buffers.size()) {
 		EXIT("compute runtime buffer count does not match shader metadata\n");
 	}
-	auto& cache = buffer.GetContext().GetTextureCache();
+	// Consuming the dispatch discards every store it would have made, so the dispatch has to be a
+	// clear of one metadata range and nothing else. Image, sampler and flat stores are never
+	// metadata, and a program that mixes bits cannot be writing a constant.
+	if (program.info.has_bitwise_xor || !program.info.images.empty() ||
+	    !program.info.samplers.empty() || program.info.writes_dma) {
+		return false;
+	}
+	auto&    cache           = buffer.GetContext().GetTextureCache();
+	uint32_t metadata_writes = 0;
+	uint32_t metadata_index  = 0;
 	for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
 		const auto& resource   = program.info.buffers[i];
 		const auto  descriptor = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-		if ((!resource.written || resource.read) && cache.IsMeta(descriptor.Base48())) {
+		const bool  is_meta    = cache.IsMeta(descriptor.Base48());
+		if (!resource.written && !resource.atomic) {
+			// A clear may read its value from a side buffer, but reading metadata back means the
+			// dispatch derives something from it instead of clearing it.
+			if (is_meta) {
+				return false;
+			}
+			continue;
+		}
+		if (resource.read || resource.atomic || !is_meta) {
+			// A read/modify/write is not a clear, and the registry outlives the guest allocation,
+			// so a base that is still registered is only a hint. Any other store is real work that
+			// consuming the dispatch would silently drop.
 			return false;
 		}
+		metadata_writes++;
+		metadata_index = i;
 	}
-
-	if (!program.info.has_bitwise_xor) {
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& resource = program.info.buffers[i];
-			if (resource.written) {
-				const auto descriptor =
-				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				if (cache.ClearMeta(descriptor.Base48())) {
-					return true;
-				}
-			}
-		}
+	if (metadata_writes != 1) {
+		return false;
 	}
-	return false;
+	const auto metadata =
+	    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[metadata_index]);
+	const bool cleared = cache.ClearMetaSlices(metadata.Base48(), metadata.GetSize());
+	return cleared && cache.IsWithinMeta(metadata.Base48(), metadata.GetSize());
 }
 
 bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
