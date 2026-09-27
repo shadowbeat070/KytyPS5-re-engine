@@ -749,15 +749,11 @@ void Translator::IMAGE_GATHER(const Decoder::Instruction& inst) {
 	}
 }
 
-// APPROXIMATION, NOT AN IMPLEMENTATION. image_bvh_intersect_ray / image_bvh64_intersect_ray are
-// the RDNA2 hardware ray-tracing primitive: each intersects a ray against ONE AMD-format BVH node
-// read from a raw guest address and returns four dwords - the sorted child pointers of a box node,
-// or hit distance and triangle data for a triangle node. Vulkan cannot express that. Ray query
-// (SPV_KHR_ray_query) runs against a driver-built opaque acceleration structure, not a
-// caller-supplied node at a guest address, so a faithful emulation means reimplementing AMD's node
-// layout and its box/triangle intersection math in SPIR-V.
+// image_bvh_intersect_ray and image_bvh64_intersect_ray with full-float rays run through the
+// BvhIntersect emulation. The encodings it does not cover - the a16 forms - are an
+// APPROXIMATION, NOT AN IMPLEMENTATION:
 //
-// Until then every intersection reports a MISS: 0xffffffff in all four result registers. That
+// every such intersection reports a MISS: 0xffffffff in all four result registers. That
 // value is well defined under both readings of the result. As a child pointer it is INVALID_NODE,
 // so the guest traversal loop pushes nothing and drains its stack; as an f32 distance it is a NaN,
 // so every "closer than t_max" compare is false. Traversal therefore terminates and reports no hit
