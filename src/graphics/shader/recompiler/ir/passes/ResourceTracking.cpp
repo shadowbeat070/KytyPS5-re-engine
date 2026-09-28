@@ -804,6 +804,38 @@ private:
 		return true;
 	}
 
+	static bool IsDynamicMemoryOrigin(Value value, uint32_t depth = 0) {
+		if (depth > 8) {
+			return false;
+		}
+		value            = value.Resolve();
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) {
+			return false;
+		}
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::LoadAddressU32 ||
+		    BufferAccessOf(op) != BufferAccess::None ||
+		    AddressOpcodeInfoOf(op).access != AddressAccess::None) {
+			return true;
+		}
+		for (size_t i = 0; i < inst->NumArgs(); i++) {
+			if (IsDynamicMemoryOrigin(inst->Arg(i), depth + 1)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	static bool IsDynamicDescriptor(const DescriptorSource& descriptor) {
+		for (uint32_t i = 0; i < descriptor.dword_count; i++) {
+			if (IsDynamicMemoryOrigin(descriptor.dwords[i])) {
+				return true;
+			}
+		}
+		return false;
+	}
+
 	uint32_t InternSource(const DescriptorSource& descriptor) {
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
@@ -2476,11 +2508,9 @@ private:
 			};
 			if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				// Two mechanisms, layered narrow-first. Decoding the V# in the shader over a raw
-				// device pointer needs no host-visible descriptor but only serves an unformatted,
-				// untyped DWORD x2/x3/x4 load, so it goes first. Resolving the table on the host into
-				// real, deduped bindings covers what that cannot express, so it picks up the rest
-				// rather than competing for the same accesses.
+				// Three mechanisms, layered narrow-first: each takes only what the ones above it cannot
+				// express, so no access that resolves today moves onto a wider one.
+				// 1. A raw, unformatted DWORD x2/x3/x4 load decodes the V# over a device pointer.
 				const bool raw_multi_dword = op == ValueOpcode::LoadBufferU32x2 ||
 				                             op == ValueOpcode::LoadBufferU32x3 ||
 				                             op == ValueOpcode::LoadBufferU32x4;
@@ -2493,20 +2523,49 @@ private:
 				auto*       root     = inst.Arg(0).Resolve().TryInstruction();
 				const auto* indirect = root != nullptr ? FindIndirectBuffer(*root) : nullptr;
 				if (indirect == nullptr) {
+					// 3. Any other descriptor sourced from memory: decode the V# with full addressing,
+					// reaching the stores, atomics, subword and formatted accesses 1 and 2 cannot.
+					if (root != nullptr && root->GetOpcode() == ValueOpcode::GetBufferResource) {
+						DescriptorSource descriptor;
+						MakeSource(*root, 4u, false, false, memory.resource * 4u, descriptor, flags.pc);
+						if (IsDynamicDescriptor(descriptor)) {
+							m_program.memory_info[flags.index].dynamic_buffer = true;
+							m_info.uses_dma                                   = true;
+							if (buffer != BufferAccess::Read) {
+								// The store-pointer helper is only emitted, and its writable set only
+								// published, when the program declares that it writes through DMA.
+								m_program.has_address_writes = true;
+								m_info.writes_dma            = true;
+							}
+							return true;
+						}
+					}
 					if (indirect == nullptr && take_indirect_load()) {
 						return true;
 					}
 					return Reject(flags.pc,
-					              fmt::format("{}; neither mechanism takes it: GPU-selected access "
-					                          "requires a raw DWORD x2/x3/x4 load or a recognisable "
-					                          "table",
+					              fmt::format("{}; no mechanism takes it: GPU-selected access "
+					                          "requires a raw DWORD x2/x3/x4 load, a recognisable "
+					                          "table, or descriptor dwords sourced from memory",
 					                          m_deferred_reject.empty()
 					                              ? "buffer descriptor is not a valid runtime value"
 					                              : m_deferred_reject));
 				}
+				// 2. A recognisable table resolves on the host into real, deduped bindings.
 				handle = root;
 				source = indirect->source;
 				m_applied_indirect_buffers.insert(root);
+			} else if (auto* carried = inst.Arg(0).Resolve().TryInstruction(); carried != nullptr) {
+				// A plan outlives a successful GetHandle only when its selector carries a phi the
+				// recognizer could not fold: it declines whenever the descriptor validates and the
+				// selector does not vary. The validator accepted that phi as the value the loop is
+				// entered with and left the evaluator to prove a fixpoint a cursor never reaches,
+				// so bind the table rather than the one record the first iteration selects.
+				if (const auto* planned = FindIndirectBuffer(*carried); planned != nullptr) {
+					handle = carried;
+					source = planned->source;
+					m_applied_indirect_buffers.insert(carried);
+				}
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {

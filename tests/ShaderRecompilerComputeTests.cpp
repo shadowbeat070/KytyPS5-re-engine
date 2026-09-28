@@ -939,6 +939,19 @@ void AppendStoreSgpr(std::vector<u32> *code, u32 value_sgpr, u32 dword_index) {
   AppendStoreVgpr(code, 30, dword_index);
 }
 
+// Puts a buffer descriptor in s[4:7] the way a GPU-driven engine does: read per lane, then made
+// wave-uniform with V_READFIRSTLANE_B32. A uniform S_BUFFER_LOAD_DWORDX4 of the same dwords is
+// folded into a host descriptor by the SRT walk; a per-lane origin cannot be.
+void AppendUnfoldableDescriptor(std::vector<u32> *code) {
+  for (u32 dword = 0; dword < 4; dword++) {
+    AppendVMovU32(code, 20, dword * 4u);
+    AppendBufferLoadDword(code, 4 + dword, 20);
+  }
+  for (u32 dword = 0; dword < 4; dword++) {
+    code->push_back(EncodeVop1(0x02, 4 + dword, Vgpr(4 + dword)));
+  }
+}
+
 void AppendStoreSgprAtLaneDwordOffset(std::vector<u32> *code, u32 value_sgpr,
                                       u32 lane_vgpr, u32 dword_offset) {
   code->push_back(EncodeVop1(0x01, 30, value_sgpr));
@@ -16941,7 +16954,10 @@ public:
       DestroyBuffer(&fault_readback);
       Require(test.name, "BDA faults",
               fault_word == *test.expected_bda_fault_word0,
-              "BDA accesses recorded unexpected page faults");
+              ("BDA accesses recorded unexpected page faults: expected " +
+               std::to_string(*test.expected_bda_fault_word0) + ", actual " +
+               std::to_string(fault_word))
+                  .c_str());
     }
     if (flattened_buffer.buffer != nullptr) {
       DestroyBuffer(&flattened_buffer);
@@ -29813,6 +29829,465 @@ TestCase BufferOffsetsUsePackedLaneAndStorageFallback() {
   return test;
 }
 
+TestCase DynamicBufferLoadStore() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000140000000ull;
+  std::vector<u32> code;
+
+  // 1. Put the dynamic buffer descriptor in s[4:7] in a form the host cannot fold.
+  AppendUnfoldableDescriptor(&code);
+
+  // 2. Dynamic buffer load: load dword from dynamic buffer s[4:7] at byte offset 16 into v1.
+  AppendVMovU32(&code, 20, 16);
+  code.push_back(EncodeMubuf0(0x0cu, 0, false, true)); // BUFFER_LOAD_DWORD, offen=true
+  code.push_back(EncodeMubuf1(1, 1, 20));             // dst v1, srsrc 1 (s[4:7]), vaddr v20
+
+  // 3. Modify the loaded value: v2 = v1 + 1 -> 0x12345679u
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 1)); // V_ADD_NC_U32: v2 = 1 + v1
+
+  // 4. Dynamic buffer store: store dword from v2 to dynamic buffer s[4:7] at byte offset 20.
+  AppendVMovU32(&code, 21, 20);
+  code.push_back(EncodeMubuf0(0x1cu, 0, false, true)); // BUFFER_STORE_DWORD, offen=true
+  code.push_back(EncodeMubuf1(2, 1, 21));             // src v2, srsrc 1 (s[4:7]), vaddr v21
+
+  // 5. Dynamic buffer subword load: load byte from dynamic buffer s[4:7] at byte offset 17 into v3.
+  // Dword 4 is 0x12345678u -> byte 0 is 0x78, byte 1 (offset 17) is 0x56.
+  AppendVMovU32(&code, 22, 17);
+  code.push_back(EncodeMubuf0(0x08u, 0, false, true)); // BUFFER_LOAD_UBYTE, offen=true
+  code.push_back(EncodeMubuf1(3, 1, 22));             // dst v3, srsrc 1 (s[4:7]), vaddr v22
+
+  // 6. Dynamic buffer subword store: store byte 0xab into dynamic buffer at byte offset 25.
+  AppendVMovLiteral(&code, 10, 0xabu);
+  AppendVMovU32(&code, 23, 25);
+  code.push_back(EncodeMubuf0(0x18u, 0, false, true)); // BUFFER_STORE_BYTE, offen=true
+  code.push_back(EncodeMubuf1(10, 1, 23));            // src v10, srsrc 1 (s[4:7]), vaddr v23
+
+  // 7. Output readback via standard output buffer s[48:51]:
+  // Store loaded v1 to dword 7, and loaded v3 to dword 8
+  AppendStoreVgpr(&code, 1, 7);
+  AppendStoreVgpr(&code, 3, 8);
+
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferLoadStore";
+  test.code = std::move(code);
+
+  test.initial = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0u,
+      0x12345678u,
+      0u,
+      0u,
+      0u,
+      0u,
+  };
+
+  test.expected = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0u,
+      0x12345678u,
+      0x12345679u,
+      0x0000ab00u,
+      0x12345678u,
+      0x00000056u,
+  };
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {
+      O::BUFFER_LOAD_DWORD,
+      O::V_READFIRSTLANE_B32,
+      O::V_MOV_B32,
+      O::BUFFER_LOAD_DWORD,
+      O::V_ADD_NC_U32,
+      O::BUFFER_STORE_DWORD,
+      O::BUFFER_LOAD_UBYTE,
+      O::BUFFER_STORE_BYTE,
+      O::S_ENDPGM,
+  };
+  return test;
+}
+
+// An atomic through a descriptor the shader decodes for itself - the access class a GPU-driven
+// chain uses to raise an indirect-args count.
+TestCase DynamicBufferAtomicAdd() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000190000000ull;
+  std::vector<u32> code;
+
+  AppendUnfoldableDescriptor(&code);
+
+  // Add 7 at byte offset 16 with glc set, so the pre-operation value comes back in v1.
+  AppendVMovU32(&code, 20, 16);
+  AppendVMovU32(&code, 1, 7);
+  code.push_back(EncodeMubuf0(0x32u, 0, false, true, true));
+  code.push_back(EncodeMubuf1(1, 1, 20));
+
+  AppendStoreVgpr(&code, 1, 7);
+
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferAtomicAdd";
+  test.code = std::move(code);
+
+  test.initial = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0x30020000u,
+      100u,
+      0u,
+      0u,
+      0u,
+  };
+
+  test.expected = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0x30020000u,
+      107u,
+      0u,
+      0u,
+      100u,
+  };
+
+  test.bda_mappings = {{GuestBase, 0}};
+  // A dynamic access resolves its own page; a fault here would mean it never reached memory.
+  test.expected_bda_fault_word0 = 0u;
+  test.opcodes = {
+      O::V_MOV_B32,         O::BUFFER_LOAD_DWORD,  O::V_READFIRSTLANE_B32,
+      O::BUFFER_ATOMIC_ADD, O::BUFFER_STORE_DWORD, O::S_ENDPGM,
+  };
+  test.required_spirv = {"OpAtomicIAdd"};
+  return test;
+}
+
+TestCase DynamicBufferLoadStoreDwordX4() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000150000000ull;
+  std::vector<u32> code;
+
+  // Load the dynamic buffer descriptor (4 dwords) from the default test buffer into s[4:7].
+  AppendUnfoldableDescriptor(&code);
+
+  // Dynamic vector load: BUFFER_LOAD_DWORDX4 into v[1:4] from dynamic buffer s[4:7] at byte offset 16.
+  AppendVMovU32(&code, 20, 16);
+  code.push_back(EncodeMubuf0(0x0eu, 0, false, true));
+  code.push_back(EncodeMubuf1(1, 1, 20));
+
+  // Dynamic vector store: BUFFER_STORE_DWORDX4 from v[1:4] to dynamic buffer s[4:7] at byte offset 32.
+  AppendVMovU32(&code, 21, 32);
+  code.push_back(EncodeMubuf0(0x1eu, 0, false, true));
+  code.push_back(EncodeMubuf1(1, 1, 21));
+
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferLoadStoreDwordX4";
+  test.code = std::move(code);
+
+  test.initial = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      // OOB_SELECT=3 (raw) plus DATA_FORMAT=32. A raw DWORDx4 load is served by the in-shader
+      // decode, which applies the descriptor's own out-of-range and format rules: with
+      // OOB_SELECT=0 and stride 0 every component is out of range, and a zero format reads zero.
+      0x30020000u,
+      0x11111111u,
+      0x22222222u,
+      0x33333333u,
+      0x44444444u,
+      0u,
+      0u,
+      0u,
+      0u,
+  };
+
+  test.expected = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0x30020000u,
+      0x11111111u,
+      0x22222222u,
+      0x33333333u,
+      0x44444444u,
+      0x11111111u,
+      0x22222222u,
+      0x33333333u,
+      0x44444444u,
+  };
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_bda_fault_word0 = 0u;
+  test.opcodes = {
+      O::BUFFER_LOAD_DWORD,
+      O::V_READFIRSTLANE_B32,
+      O::V_MOV_B32,
+      O::BUFFER_LOAD_DWORDX4,
+      O::BUFFER_STORE_DWORDX4,
+      O::S_ENDPGM,
+  };
+  return test;
+}
+
+TestCase DynamicBufferStoreAddTid() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000160000000ull;
+  std::vector<u32> code;
+
+  // Load dynamic descriptor from s[48:51] at offset 0 into s[4:7]
+  AppendUnfoldableDescriptor(&code);
+
+  // Store data = 0x12345678u
+  AppendVMovLiteral(&code, 0, 0x12345678u);
+
+  // BUFFER_STORE_DWORD to dynamic descriptor s[4:7]
+  // idxen=false, offen=false, offset=16 (immediate offset 16 bytes)
+  code.push_back(EncodeMubuf0(0x1cu, 16, false, false));
+  code.push_back(EncodeMubuf1(0, 1, 0));
+
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferStoreAddTid";
+  test.code = std::move(code);
+  test.compute_info.threads_num[0] = 32;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 0;
+  test.compute_info.wave_size = 32;
+  test.has_compute_info = true;
+  test.required_spirv = {"BuiltIn SubgroupLocalInvocationId"};
+
+  // 4 dwords descriptor + 32 dwords target buffer
+  test.initial = std::vector<u32>(36, 0);
+  test.initial[0] = static_cast<u32>(GuestBase);
+  test.initial[1] = static_cast<u32>((GuestBase >> 32u) & 0xffffu) | (4u << 16u); // stride = 4 bytes
+  test.initial[2] = 32u; // num_records = 32
+  test.initial[3] = (1u << 23u); // add_tid = 1
+
+  test.expected = test.initial;
+  for (u32 i = 0; i < 32; ++i) {
+    test.expected[4 + i] = 0x12345678u;
+  }
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {
+      O::BUFFER_LOAD_DWORD,
+      O::V_READFIRSTLANE_B32,
+      O::V_MOV_B32,
+      O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM,
+  };
+  return test;
+}
+
+TestCase DynamicBufferLoadStoreSwizzle() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x0000000170000000ull;
+  std::vector<u32> code;
+
+  // 1. Load dynamic descriptor into s[4:7] from s[48:51] at offset 0
+  AppendUnfoldableDescriptor(&code);
+
+  // 2. Swizzled load: BUFFER_LOAD_DWORD with index = 9 (v20), offset = 4 (v21)
+  // idxen=true, offen=true -> swizzled byte offset = 164 (dword 41)
+  AppendVMovU32(&code, 20, 9);
+  AppendVMovU32(&code, 21, 4);
+  code.push_back(EncodeMubuf0(0x0cu, 0, true, true));
+  code.push_back(EncodeMubuf1(1, 1, 20));
+
+  // 3. v2 = v1 + 1
+  code.push_back(EncodeVop2(0x25, 2, InlineU32(1), 1)); // V_ADD_NC_U32
+
+  // 4. Swizzled store: BUFFER_STORE_DWORD with index = 5 (v22), offset = 8 (v23)
+  // idxen=true, offen=true -> swizzled byte offset = 84 (dword 21)
+  AppendVMovU32(&code, 22, 5);
+  AppendVMovU32(&code, 23, 8);
+  code.push_back(EncodeMubuf0(0x1cu, 0, true, true));
+  code.push_back(EncodeMubuf1(2, 1, 22));
+
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferLoadStoreSwizzle";
+  test.code = std::move(code);
+
+  test.initial = std::vector<u32>(64, 0);
+  test.initial[0] = static_cast<u32>(GuestBase);
+  test.initial[1] = static_cast<u32>((GuestBase >> 32u) & 0xffffu) | (16u << 16u) | (1u << 31u); // stride=16, swizzle=1
+  test.initial[2] = 64u;
+  test.initial[3] = 0u; // index_stride enum = 0
+  test.initial[41] = 0xdeadbeefu;
+
+  test.expected = test.initial;
+  test.expected[21] = 0xdeadbef0u;
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.opcodes = {
+      O::BUFFER_LOAD_DWORD,
+      O::V_READFIRSTLANE_B32,
+      O::V_MOV_B32,
+      O::BUFFER_LOAD_DWORD,
+      O::V_ADD_NC_U32,
+      O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM,
+  };
+  return test;
+}
+
+// S_BUFFER_LOAD through an in-shader decoded descriptor, as RE9's mesh shaders do.
+TestCase DynamicBufferScalarLoad() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x00000001b0000000ull;
+  std::vector<u32> code;
+  AppendUnfoldableDescriptor(&code);
+  // A second descriptor in s[24:27] with a stride, so NUM_RECORDS counts elements.
+  for (u32 dword = 0; dword < 4; dword++) {
+    AppendVMovU32(&code, 20, (12 + dword) * 4u);
+    AppendBufferLoadDword(&code, 24 + dword, 20);
+  }
+  for (u32 dword = 0; dword < 4; dword++) {
+    code.push_back(EncodeVop1(0x02, 24 + dword, Vgpr(24 + dword)));
+  }
+
+  // s_buffer_load_dwordx4 s[8:11], s[4:7], 16
+  code.push_back(EncodeSmem0(0x0a, 8, 2));
+  code.push_back(EncodeSmem1(16, 125));
+  // s_buffer_load_dwordx8 s[12:19], s[4:7], s20 (24): the upper half is past NUM_RECORDS.
+  AppendSMovLiteral(&code, 20, 24);
+  code.push_back(EncodeSmem0(0x0b, 12, 2));
+  code.push_back(EncodeSmem1(0, 20));
+  // s_buffer_load_dword s21, s[4:7], s22 (19): the two low offset bits are ignored.
+  AppendSMovLiteral(&code, 22, 19);
+  code.push_back(EncodeSmem0(0x08, 21, 2));
+  code.push_back(EncodeSmem1(0, 22));
+  // s_buffer_load_dwordx4 s[28:31], s[24:27], 0: stride 4 x 3 records covers three dwords.
+  code.push_back(EncodeSmem0(0x0a, 28, 12));
+  code.push_back(EncodeSmem1(0, 125));
+
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreSgpr(&code, 8 + i, 16 + i);
+  }
+  for (u32 i = 0; i < 8; i++) {
+    AppendStoreSgpr(&code, 12 + i, 20 + i);
+  }
+  AppendStoreSgpr(&code, 21, 28);
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreSgpr(&code, 28 + i, 29 + i);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferScalarLoad";
+  test.code = std::move(code);
+  test.initial = std::vector<u32>(33, 0);
+  test.initial[0] = static_cast<u32>(GuestBase);
+  test.initial[1] = static_cast<u32>((GuestBase >> 32u) & 0xffffu);
+  test.initial[2] = 40u; // stride 0: NUM_RECORDS is a byte count, dwords 0-9
+  for (u32 i = 4; i < 12; i++) {
+    test.initial[i] = 0xa0000000u + i;
+  }
+  test.initial[12] = static_cast<u32>(GuestBase);
+  test.initial[13] = static_cast<u32>((GuestBase >> 32u) & 0xffffu) | (4u << 16u);
+  test.initial[14] = 3u;
+
+  test.expected = test.initial;
+  for (u32 i = 0; i < 4; i++) {
+    test.expected[16 + i] = test.initial[4 + i];
+    test.expected[20 + i] = test.initial[6 + i];
+  }
+  test.expected[28] = test.initial[4];
+  for (u32 i = 0; i < 3; i++) {
+    test.expected[29 + i] = test.initial[i];
+  }
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_bda_fault_word0 = 0u;
+  test.opcodes = {
+      O::BUFFER_LOAD_DWORD,     O::V_READFIRSTLANE_B32,    O::V_MOV_B32,
+      O::S_MOV_B32,             O::S_BUFFER_LOAD_DWORD,    O::S_BUFFER_LOAD_DWORDX4,
+      O::S_BUFFER_LOAD_DWORDX8, O::BUFFER_STORE_DWORD,     O::S_ENDPGM,
+  };
+  test.required_spirv = {"OpConvertUToPtr"};
+  return test;
+}
+
+// The 64-bit and float atomics through a decoded V#, each returning its pre-operation value.
+TestCase DynamicBufferAtomicOr64AndFMax() {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x00000001c0000000ull;
+  std::vector<u32> code;
+  AppendUnfoldableDescriptor(&code);
+
+  // buffer_atomic_or_x2 v[1:2], v20 (16), s[4:7] glc
+  AppendVMovU32(&code, 20, 16);
+  AppendVMovLiteral(&code, 1, 0x000000f0u);
+  AppendVMovLiteral(&code, 2, 0x0f000000u);
+  code.push_back(EncodeMubuf0(0x5au, 0, false, true, true));
+  code.push_back(EncodeMubuf1(1, 1, 20));
+
+  // buffer_atomic_fmax v3, v21 (24), s[4:7] glc
+  AppendVMovU32(&code, 21, 24);
+  AppendVMovLiteral(&code, 3, 0x40800000u); // 4.0
+  code.push_back(EncodeMubuf0(0x40u, 0, false, true, true));
+  code.push_back(EncodeMubuf1(3, 1, 21));
+
+  AppendStoreVgpr(&code, 1, 8);
+  AppendStoreVgpr(&code, 2, 9);
+  AppendStoreVgpr(&code, 3, 10);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = "DynamicBufferAtomicOr64AndFMax";
+  test.code = std::move(code);
+  test.initial = {
+      static_cast<u32>(GuestBase),
+      static_cast<u32>((GuestBase >> 32u) & 0xffffu),
+      0x00010000u,
+      0x30020000u,
+      0x12345601u,
+      0x10000002u,
+      0x3f800000u, // 1.0
+      0u,
+      0u,
+      0u,
+      0u,
+  };
+  test.expected = test.initial;
+  test.expected[4] = 0x123456f1u;
+  test.expected[5] = 0x1f000002u;
+  test.expected[6] = 0x40800000u;
+  test.expected[8] = 0x12345601u;
+  test.expected[9] = 0x10000002u;
+  test.expected[10] = 0x3f800000u;
+
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_bda_fault_word0 = 0u;
+  test.opcodes = {
+      O::BUFFER_LOAD_DWORD,     O::V_READFIRSTLANE_B32, O::V_MOV_B32,
+      O::BUFFER_ATOMIC_OR_X2,   O::BUFFER_ATOMIC_FMAX,  O::BUFFER_STORE_DWORD,
+      O::S_ENDPGM,
+  };
+  test.required_spirv = {"OpAtomicOr", "OpAtomicCompareExchange"};
+  return test;
+}
+
 TestCase BufferLoadVariants() {
   using O = ShaderOpcode;
 
@@ -36386,6 +36861,77 @@ void CheckIndirectImageKeySwitch() {
 
 // glc=1 asks for memory the rest of the device can see, which a spin on
 // a sibling workgroup's status word needs; glc=0 traffic must stay plain.
+// The buffer twin of CheckIndirectImageKeySwitch: same directory layout, same two hops, and the
+// same reason a pointer cannot be phi'd - each arm holds its own whole access.
+void CheckIndirectBufferKeySwitch() {
+  constexpr const char *name = "IndirectBufferKeySwitch";
+  constexpr uint32_t kMappingSlot = 5u;
+  using namespace ShaderRecompiler::IR;
+
+  Program program{};
+  program.stage = ShaderType::Compute;
+  program.wave_size = 32;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  program.shader_info_complete = true;
+  program.block_storage.push_back(std::make_unique<Block>());
+  auto *block = program.block_storage.back().get();
+  program.blocks.push_back(block);
+  program.block_info.push_back({.id = 0});
+
+  // Arg 0 of the handle is the key the tracker rewrote in: the record this access wants.
+  auto &key = block->AppendNewInst(ValueOpcode::LaneId);
+  auto &handle =
+      block->AppendNewInst(ValueOpcode::GetBufferResource,
+                           {Value(&key), Value(0u), Value(0u), Value(0u)});
+  handle.SetFlags<uint32_t>(0u);
+  MemoryInfo memory{};
+  memory.kind = ResourceKind::Buffer;
+  memory.resource = 0;
+  program.memory_info.push_back(memory);
+  const MemoryFlags memory_flags{0u, 0x2000u};
+  uint64_t memory_flag_bits = 0;
+  std::memcpy(&memory_flag_bits, &memory_flags, sizeof(memory_flags));
+  auto &load = block->AppendNewInst(
+      ValueOpcode::LoadBufferU32,
+      {Value(&handle), Value(0u), Value(0u), Value(0u), Value(true)},
+      memory_flag_bits);
+  block->AppendNewInst(ValueOpcode::ReferenceU32, {Value(&load)});
+
+  program.descriptor_sources.resize(1);
+  program.descriptor_sources[0].dword_count = 4;
+
+  BufferResource root{};
+  root.source = 0;
+  root.read = true;
+  root.indirect_root = 0;
+  root.indirect_mapping_offset = kMappingSlot;
+  root.indirect_search_iterations = 2u;
+  root.indirect_resources = {0u, 1u, 2u};
+  auto candidate = root;
+  candidate.indirect_search_iterations = 0;
+  candidate.indirect_resources.clear();
+  program.info.buffers = {root, candidate, candidate};
+
+  AllocateBindings(program);
+  ShaderComputeInputInfo compute{};
+  auto spirv =
+      ShaderRecompiler::Spirv::EmitProgram(program, {.compute = &compute});
+  ValidateSpirv(name, spirv);
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::string text;
+  Require(name, "SPIR-V disassembly", tools.Disassemble(spirv, &text),
+          "failed to disassemble indirect buffer shader");
+  Require(name, "key switch",
+          text.find("OpSwitch") != std::string::npos &&
+              text.find("OpPhi") != std::string::npos,
+          "a runtime-selected buffer did not emit a candidate switch");
+  // One arm per candidate past ordinal 0, each with its own access: three bindings, so two
+  // OpArrayLength for the arms plus one for the default.
+  Require(name, "per-candidate access", CountText(text, "OpArrayLength") == 3,
+          "the switch arms did not each hold their own buffer access");
+}
+
 void CheckGlcBufferAccessIsCoherent() {
   using O = ShaderOpcode;
   constexpr const char *name = "GlcBufferAccessIsCoherent";
@@ -38109,6 +38655,13 @@ std::vector<TestCase> MakeCases() {
   cases.push_back(ScalarBufferFromLoopReadlane(32));
   cases.push_back(ScalarBufferFromLoopReadlane(64));
   AddCase(BufferLoadStore);
+  AddCase(DynamicBufferLoadStore);
+  AddCase(DynamicBufferAtomicAdd);
+  AddCase(DynamicBufferLoadStoreDwordX4);
+  AddCase(DynamicBufferStoreAddTid);
+  AddCase(DynamicBufferLoadStoreSwizzle);
+  AddCase(DynamicBufferScalarLoad);
+  AddCase(DynamicBufferAtomicOr64AndFMax);
   AddCase(BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferLoadDwordNoAddressFlagsIgnoresVaddr);
@@ -44368,6 +44921,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--indirect-image-only") == 0) {
     CheckImageSamplerSpecialization();
     CheckIndirectImageKeySwitch();
+  CheckIndirectBufferKeySwitch();
     VulkanHarness vulkan;
     RunCase(&vulkan, ImageCubeGradientsPreserveDerivatives());
     return 0;
@@ -44543,6 +45097,7 @@ int main(int argc, char **argv) {
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch();
   CheckWave64WholeWaveResults();
+  CheckIndirectBufferKeySwitch();
   CheckGlcBufferAccessIsCoherent();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();

@@ -357,15 +357,26 @@ size_t IndirectDirectoryWords(const ResourcePlan& program) {
 	    std::ranges::any_of(program.info.images, [&](const ImageResource& image) {
 		    const auto* source = Source(program, image.source);
 		    return source != nullptr && source->indirect_descriptor.has_value();
+	    }) ||
+	    std::ranges::any_of(program.info.buffers, [&](const BufferResource& buffer) {
+		    const auto* source = Source(program, buffer.source);
+		    return source != nullptr && source->indirect_buffer.has_value();
 	    });
 	if (!has_table) {
 		return 0;
 	}
-	return program.info.images.size() * IndirectDirectoryStride;
+	// Images first, so an image slot keeps the number it has always had.
+	return (program.info.images.size() + program.info.buffers.size()) * IndirectDirectoryStride;
 }
 
 size_t IndirectMappingSlot(const ResourcePlan& program, uint32_t image_index) {
 	return IndirectDirectoryBase(program) + static_cast<size_t>(image_index) * IndirectDirectoryStride;
+}
+
+size_t IndirectBufferMappingSlot(const ResourcePlan& program, uint32_t buffer_index) {
+	return IndirectDirectoryBase(program) +
+	       (program.info.images.size() + static_cast<size_t>(buffer_index)) *
+	           IndirectDirectoryStride;
 }
 // Why an indirect image table could not be enumerated. Every clause below refuses for a different
 // reason with a different fix - a handle the host cannot decode, a probe budget the table outgrows,
@@ -938,6 +949,75 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 	return true;
 }
 
+// Binds every record the table can select and writes the key -> ordinal mapping the search reads.
+// Layout is the indirect image table's: a directory slot, the key count, then key/ordinal pairs.
+bool ExpandIndirectBuffer(const ResourcePlan& program, uint32_t root_index,
+                          const IndirectBuffer& resolved, ResourceSnapshot& snapshot,
+                          ResourceSpecialization& specialization) {
+	const auto keys = resolved.keys.size();
+	if (keys == 0 || resolved.candidates.size() != keys ||
+	    root_index >= specialization.buffers.size() || root_index >= snapshot.buffers.size()) {
+		return false;
+	}
+	DescriptorValue null_descriptor;
+	null_descriptor.dword_count = 4u;
+	null_descriptor.dwords.fill(0);
+
+	const auto slot          = IndirectBufferMappingSlot(program, root_index);
+	const auto directory_end = IndirectDirectoryBase(program) + IndirectDirectoryWords(program);
+	auto       mapping_offset = snapshot.flattened_srt.size();
+	if (mapping_offset < directory_end) {
+		mapping_offset = directory_end;
+	}
+	if (slot >= mapping_offset) {
+		return false;
+	}
+	const auto children_begin = snapshot.buffers.size();
+	if (children_begin + resolved.descriptors.size() > ShaderInfo::MaxDenseBuffers) {
+		return false;
+	}
+	snapshot.flattened_srt.resize(mapping_offset + 1u + keys * 2u);
+	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys);
+	// Ordinal 0 is the default arm, so the root names nothing rather than the first enumerated record.
+	snapshot.buffers[root_index] = null_descriptor;
+
+	std::vector<uint32_t> ordinal_of(resolved.descriptors.size(), 0u);
+	for (size_t entry = 0; entry < keys; entry++) {
+		const auto candidate = resolved.candidates[entry];
+		if (candidate >= resolved.descriptors.size()) {
+			return false;
+		}
+		uint32_t    ordinal    = 0;
+		const auto& descriptor = resolved.descriptors[candidate];
+		if (descriptor != null_descriptor) {
+			if (ordinal_of[candidate] == 0u) {
+				snapshot.buffers.push_back(descriptor);
+				auto child                       = specialization.buffers[root_index];
+				child.indirect_root              = root_index;
+				child.indirect_mapping_offset    = 0;
+				child.indirect_search_iterations = 0;
+				specialization.buffers.push_back(child);
+				ordinal_of[candidate] =
+				    static_cast<uint32_t>(snapshot.buffers.size() - children_begin);
+			}
+			ordinal = ordinal_of[candidate];
+		}
+		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = resolved.keys[entry];
+		snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
+	}
+	if (snapshot.buffers.size() == children_begin) {
+		// Every record was null: nothing to select between, and the root already reads nothing.
+		snapshot.flattened_srt.resize(mapping_offset);
+		return true;
+	}
+	snapshot.flattened_srt[slot] = static_cast<uint32_t>(mapping_offset);
+	auto& root                       = specialization.buffers[root_index];
+	root.indirect_root               = root_index;
+	root.indirect_mapping_offset     = static_cast<uint32_t>(slot);
+	root.indirect_search_iterations  = std::bit_width(keys);
+	return true;
+}
+
 } // namespace
 
 struct SamplerPlan {
@@ -992,6 +1072,36 @@ private:
 
 static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSnapshot& snapshot,
                                         ResourceSpecialization& specialization) {
+	// In place over the snapshot: an expanded table has already appended a child per record here.
+	specialization.buffers.resize(snapshot.buffers.size());
+	for (uint32_t i = 0; i < snapshot.buffers.size(); i++) {
+		const auto   describes = i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
+		auto&                descriptor_value = snapshot.buffers[i];
+		ShaderBufferResource descriptor;
+		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
+			return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
+		}
+		if (descriptor.Type() != 0) {
+			descriptor_value.dwords.fill(0);
+			descriptor = {};
+		}
+		auto       packed_stride = descriptor.PackedStride();
+		const auto stride        = packed_stride & 0x3fffu;
+		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
+		if (stride == 0u) {
+			packed_stride &= ~((1u << 14u) | (3u << 16u));
+		} else if (!swizzle) {
+			packed_stride &= ~(3u << 16u);
+		}
+		// A child answers for the same access as the root, so only the descriptor words differ.
+		const bool formatted = describes < program.info.buffers.size() &&
+		                       program.info.buffers[describes].formatted;
+		auto& entry              = specialization.buffers[i];
+		entry.packed_stride      = packed_stride;
+		entry.descriptor_format  = formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
+		entry.descriptor_swizzle = formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
+		entry.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+	}
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
 		auto&       image      = specialization.images[i];
@@ -1229,7 +1339,8 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 				continue;
 			}
 			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
-			if (memory.planning_only || memory.kind == ResourceKind::IndirectBuffer) {
+			if (memory.planning_only || memory.kind == ResourceKind::IndirectBuffer ||
+			    memory.dynamic_buffer) {
 				continue;
 			}
 			if (buffer != BufferAccess::None) {
@@ -1674,32 +1785,37 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		return true;
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
-	specialization.buffers.clear();
-	specialization.buffers.reserve(program.info.buffers.size());
+	// Sized before the loop: expanding a table appends a child to both and writes the root's slot here.
+	specialization.buffers.resize(program.info.buffers.size());
 	for (uint32_t i = 0; i < program.info.buffers.size(); ++i) {
 		const auto& buffer = program.info.buffers[i];
 		const auto* source = Source(program, buffer.source);
 		if (source != nullptr && source->indirect_buffer.has_value()) {
 			snapshot.buffers[i] = {.dword_count = 4u};
-			if (active.empty() || active[buffer.source]) {
-				DescriptorValue table;
-				IndirectBuffer  resolved;
-				if (!clean.EvaluateDescriptor(source->indirect_buffer->heap_source, table) ||
-				    !MaterializeIndirectBuffer(*source->indirect_buffer, table, runtime,
-				                               program.shader_hash, resolved)) {
-					MaterializeFailure() = "buffer heap descriptor";
-					return false;
-				}
-				// Stage one binds the one descriptor the table can select. A table with more than
-				// one needs a runtime selection this snapshot cannot express, so the draw is
-				// refused and the shader falls back to the in-shader V# decode.
-				if (resolved.descriptors.size() > 1u) {
-					MaterializeFailure() = "buffer table not single";
-					return false;
-				}
-				snapshot.buffers[i] = resolved.descriptors[resolved.candidates[0]];
+			if (!active.empty() && !active[buffer.source]) {
+				continue;
 			}
-		} else if (!evaluate(buffer.source, snapshot.buffers[i], buffer.written)) {
+			DescriptorValue table;
+			IndirectBuffer  resolved;
+			if (!clean.EvaluateDescriptor(source->indirect_buffer->heap_source, table) ||
+			    !MaterializeIndirectBuffer(*source->indirect_buffer, table, runtime,
+			                               program.shader_hash, resolved)) {
+				MaterializeFailure() = "buffer heap descriptor";
+				return false;
+			}
+			// One descriptor needs no selection at all: bind it and be done.
+			if (resolved.descriptors.size() == 1u) {
+				snapshot.buffers[i] = resolved.descriptors[resolved.candidates[0]];
+				continue;
+			}
+			// More than one: bind every record and let the access pick at runtime, as indirect images do.
+			if (!ExpandIndirectBuffer(program, i, resolved, snapshot, specialization)) {
+				MaterializeFailure() = "buffer table expansion";
+				return false;
+			}
+			continue;
+		}
+		if (!evaluate(buffer.source, snapshot.buffers[i], buffer.written)) {
 			// Which buffer, and whether it was the table's own root, is what separates a
 			// loop-carried heap record from an ordinary descriptor that simply would not read.
 			MaterializeFailure() =
@@ -1708,32 +1824,6 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 			                buffer.written ? " (written)" : "");
 			return false;
 		}
-		auto&                descriptor_value = snapshot.buffers[i];
-		ShaderBufferResource descriptor;
-		if (!DecodeBufferDescriptor(descriptor_value, descriptor)) {
-			return SpecializationFail(fmt::format("buffer descriptor {} has invalid width", i));
-		}
-		if (descriptor.Type() != 0) {
-			descriptor_value.dwords.fill(0);
-			descriptor = {};
-		}
-		auto       packed_stride = descriptor.PackedStride();
-		const auto stride        = packed_stride & 0x3fffu;
-		const bool swizzle       = stride != 0u && ((packed_stride >> 14u) & 1u) != 0u;
-		if (stride == 0u) {
-			packed_stride &= ~((1u << 14u) | (3u << 16u));
-		} else if (!swizzle) {
-			packed_stride &= ~(3u << 16u);
-		}
-		specialization.buffers.push_back({
-		    .packed_stride     = packed_stride,
-		    .descriptor_format = program.info.buffers[i].formatted
-		                             ? descriptor.Format()
-		                             : Prospero::BufferFormat::kInvalid,
-		    .descriptor_swizzle =
-		        program.info.buffers[i].formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7),
-		    .zero_stride_oob = descriptor.OutOfBounds() == 0u && stride == 0u,
-		});
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -1939,16 +2029,39 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	        program.binding_layout_complete);
 	// Not a fault: a permutation can be keyed on a specialization that came from a different
 	// tracking of the same shader, and the caller refuses it rather than dying on it.
-	if (program.info.buffers.size() != specialization.buffers.size() ||
+	if (program.info.buffers.size() > specialization.buffers.size() ||
 	    program.info.images.size() > specialization.images.size()) {
 		return false;
 	}
 
+	// Buffers grow the same way images do: one child per record the expanded table can select.
 	auto& buffers = program.info.buffers;
-	for (size_t index = 0; index < buffers.size(); index++) {
-		buffers[index].packed_stride      = specialization.buffers[index].packed_stride;
-		buffers[index].descriptor_format  = specialization.buffers[index].descriptor_format;
-		buffers[index].descriptor_swizzle = specialization.buffers[index].descriptor_swizzle;
+	const auto original_buffer_count = buffers.size();
+	buffers.reserve(specialization.buffers.size());
+	for (uint32_t index = 0; index < specialization.buffers.size(); index++) {
+		const auto& source = specialization.buffers[index];
+		if (index >= buffers.size()) {
+			if (source.indirect_root >= original_buffer_count) {
+				return false;
+			}
+			buffers.push_back(buffers[source.indirect_root]);
+		}
+		auto& buffer                      = buffers[index];
+		buffer.packed_stride              = source.packed_stride;
+		buffer.descriptor_format          = source.descriptor_format;
+		buffer.descriptor_swizzle         = source.descriptor_swizzle;
+		buffer.indirect_root              = source.indirect_root;
+		buffer.indirect_mapping_offset    = source.indirect_mapping_offset;
+		buffer.indirect_search_iterations = source.indirect_search_iterations;
+		buffer.indirect_resources.clear();
+	}
+	for (uint32_t index = 0; index < buffers.size(); index++) {
+		const auto root = buffers[index].indirect_root;
+		if (root != BufferResource::NoIndirectBuffer) {
+			EXIT_IF(root >= buffers.size());
+			// The root names itself first, so ordinal 0 is the arm the search falls to on no match.
+			buffers[root].indirect_resources.push_back(index);
+		}
 	}
 	auto& images = program.info.images;
 	const auto original_image_count = images.size();
@@ -2014,7 +2127,14 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::Read) {
 				const auto& memory = memory_info[inst.Flags<MemoryFlags>().index];
-				if (memory.kind == ResourceKind::Buffer &&
+				// An expanded table's root and a dynamic V# are placeholders, not the descriptor
+				// read.
+				const bool runtime_descriptor =
+				    memory.dynamic_buffer ||
+				    (memory.resource < buffers.size() &&
+				     buffers[memory.resource].indirect_root == memory.resource &&
+				     buffers[memory.resource].indirect_resources.size() >= 2u);
+				if (memory.kind == ResourceKind::Buffer && !runtime_descriptor &&
 				    specialization.buffers[memory.resource].zero_stride_oob) {
 					// Bounds mode 0 checks offset >= stride, so zero stride
 					// makes every vector read out of bounds regardless of its address.

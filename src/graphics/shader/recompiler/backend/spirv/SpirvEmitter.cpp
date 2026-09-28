@@ -140,12 +140,26 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 			              program.memory_info[index].kind == IR::ResourceKind::FlatLocal;
 		       });
 	};
+	// Any access whose V# the shader decodes from memory, stores and atomics included.
+	const auto dynamic_buffer_handle = [&](const IR::Inst& handle) {
+		return !handle.Uses().empty() &&
+		       std::ranges::any_of(handle.Uses(), [&](const IR::Use& use) {
+			       const auto op = use.user->GetOpcode();
+			       if (IR::BufferAccessOf(op) == IR::BufferAccess::None) {
+				       return false;
+			       }
+			       const auto index = use.user->Flags<IR::MemoryFlags>().index;
+			       return index < program.memory_info.size() &&
+			              program.memory_info[index].dynamic_buffer;
+		       });
+	};
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			const auto dense = inst.Flags<uint32_t>();
 			switch (inst.GetOpcode()) {
 				case IR::ValueOpcode::GetBufferResource:
-					if (planning_only_handle(inst) || indirect_buffer_handle(inst)) {
+					if (planning_only_handle(inst) || indirect_buffer_handle(inst) ||
+					    dynamic_buffer_handle(inst)) {
 						break;
 					}
 					if (dense >= program.info.buffers.size()) {
@@ -236,6 +250,11 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 				}
 				// A planning-only read is never tracked or emitted; its resource is still a register.
 				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer) {
+					// A dynamic V# has no host resource for the checks below, and needs the lane id.
+					if (memory.dynamic_buffer) {
+						requirements.subgroup_local_invocation_id = true;
+						continue;
+					}
 					requirements.coherent_buffers |= memory.coherent;
 
 					if (memory.resource >= program.info.buffers.size()) {

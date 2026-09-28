@@ -1411,9 +1411,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 			const auto op = inst.GetOpcode();
 			uint32_t first = 0;
 			if (op == IR::ValueOpcode::GetBufferResource) {
+				// A descriptor the shader decodes for itself keeps every dword it decodes.
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					return ir.memory_info[use.user->Flags<IR::MemoryFlags>().index].kind ==
-					       IR::ResourceKind::IndirectBuffer;
+					const auto& memory = ir.memory_info[use.user->Flags<IR::MemoryFlags>().index];
+					return memory.kind == IR::ResourceKind::IndirectBuffer || memory.dynamic_buffer;
 				})) {
 					continue;
 				}

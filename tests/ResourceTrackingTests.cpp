@@ -437,29 +437,48 @@ void TestIndirectBufferMaterialization() {
                        snapshot.buffers[1].dwords.begin()),
         "single-candidate indirect buffer table did not materialize");
 
-  // A second distinct record - an empty slot counts, since it selects nothing -
-  // needs a runtime selection stage one cannot express.
-  const auto prior_snapshot = snapshot;
-  const auto prior_specialization = specialization;
+  // A second record is bound as its own dense buffer. An empty slot counts as a record but
+  // selects nothing, so it maps to ordinal 0 and adds no buffer.
+  const auto root_index = 1u;
   for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
     memory.words[word(0x1000u + kStride + 8u) + dword] = 0u;
   }
-  Check(!MaterializeResources(resource_plan, runtime, snapshot,
-                              specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "a two-candidate indirect buffer table was accepted by stage one");
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "a table with an empty second record was refused");
+  Check(snapshot.buffers.size() == 3u &&
+            std::equal(descriptor.begin(), descriptor.end(),
+                       snapshot.buffers[2].dwords.begin()),
+        "the live record was not bound as its own dense buffer");
+  Check(std::all_of(snapshot.buffers[root_index].dwords.begin(),
+                    snapshot.buffers[root_index].dwords.end(),
+                    [](uint32_t dword) { return dword == 0u; }),
+        "the root binding still names memory a missed key could read");
 
-  // Two live descriptors split the table the same way.
+  // Two live descriptors split the table the same way, and each gets its own binding.
   memory.words[word(0x1000u + kStride + 8u)] = 0x1900u;
   memory.words[word(0x1000u + kStride + 8u) + 2u] = 64u;
   memory.words[word(0x1000u + kStride + 8u) + 3u] =
       Libs::Graphics::DstSel(4, 5, 6, 7);
-  Check(!MaterializeResources(resource_plan, runtime, snapshot,
-                              specialization) &&
-            SameResourceSnapshot(snapshot, prior_snapshot) &&
-            specialization == prior_specialization,
-        "two live indirect buffer candidates were accepted by stage one");
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 4u,
+        "two live indirect buffer candidates were not both bound");
+
+  // The search reads a directory slot, and the slot holds the offset of this table's mapping,
+  // whose first word is the key count. One hop short and the search reads the directory itself.
+  const auto &root = specialization.buffers[root_index];
+  Check(root.indirect_root == root_index && root.indirect_search_iterations != 0u,
+        "the expanded table did not name itself as an indirect root");
+  Check(root.indirect_mapping_offset < snapshot.flattened_srt.size(),
+        "the directory slot is outside the flattened SRT");
+  const auto mapping = snapshot.flattened_srt[root.indirect_mapping_offset];
+  Check(mapping > root.indirect_mapping_offset &&
+            mapping < snapshot.flattened_srt.size(),
+        "the directory slot does not point past itself at a mapping");
+  Check(snapshot.flattened_srt[mapping] == 2u,
+        "the mapping does not begin with this table's key count");
+  Check(mapping + 1u + snapshot.flattened_srt[mapping] * 2u <=
+            snapshot.flattened_srt.size(),
+        "the key/ordinal pairs run past the end of the flattened SRT");
 
   // A table whose declared stride is neither the selector stride nor byte
   // addressing is refused rather than probed.
@@ -467,9 +486,16 @@ void TestIndirectBufferMaterialization() {
   Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
         "an indirect buffer table with a foreign stride was probed");
 
+  // A non-consecutive table read is beyond what the host can enumerate, so the access falls to
+  // the in-shader decode. What must not happen is it being bound as an ordinary buffer.
   auto broken = MakeIndirectBufferFixture(kStride, true);
-  CheckTrackingRejected(*broken, "not a valid runtime value",
-                        "a non-consecutive table read was accepted");
+  const auto broken_status = broken->TryPlanAndTrack();
+  Check(broken_status.ok, "a non-consecutive table read was refused outright");
+  const bool dynamic = std::ranges::any_of(
+      broken->program.memory_info,
+      [](const auto &memory) { return memory.dynamic_buffer; });
+  Check(dynamic,
+        "a non-consecutive table read was accepted without the dynamic mark");
 }
 
 void TestInvariantIndirectImageMaterialization() {
@@ -4395,10 +4421,15 @@ void TestUniformDwordX4DescriptorLoad() {
             runtime, descriptor),
         "a DWORDX4 descriptor load read past its own table");
 
-  // An indexed load names a record per lane, which the host cannot pick.
+  // An indexed load names a record per lane: the walk does not re-execute the idxen/offen terms,
+  // so folding one into a host descriptor would bind the wrong record. It is served in the shader.
   auto [indexed, indexed_target] = Build(64u, true);
-  CheckTrackingRejected(*indexed, "malformed instruction LoadBufferU32x4",
-                        "an indexed DWORDX4 load reached a host descriptor");
+  const auto indexed_status = indexed->TryPlanAndTrack();
+  Check(indexed_status.ok, "an indexed DWORDX4 load was refused outright");
+  const bool indexed_dynamic = std::ranges::any_of(
+      indexed->program.memory_info,
+      [](const auto &memory) { return memory.dynamic_buffer; });
+  Check(indexed_dynamic, "an indexed DWORDX4 load reached a host descriptor");
 }
 
 } // namespace

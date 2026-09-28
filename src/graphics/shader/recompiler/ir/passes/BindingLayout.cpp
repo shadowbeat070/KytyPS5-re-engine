@@ -57,7 +57,10 @@ void AddBinding(BindingLayout& layout, DescriptorBindingKind kind,
 } // namespace
 
 SharedMemoryResources CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers) {
-	std::array<bool, ShaderInfo::MaxBuffers> live_buffers {};
+	// MaxBuffers caps what a shader TRACKS; an expanded table materializes up to MaxDenseBuffers,
+	// and `std::array::at` past the end throws into a binary built without exceptions.
+	std::array<bool, ShaderInfo::MaxDenseBuffers> live_buffers {};
+	EXIT_IF(program.info.buffers.size() > live_buffers.size());
 	SharedMemoryResources shared;
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
@@ -76,6 +79,10 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 				continue;
 			}
 			shared.lds |= memory.kind == ResourceKind::FlatLocal;
+			// A dynamic V# keeps no host buffer alive, and its resource index is still the raw SRSRC operand.
+			if (memory.dynamic_buffer) {
+				continue;
+			}
 			if (SharedAccessOf(op) != SharedAccess::None) {
 				if (memory.kind != ResourceKind::Lds && memory.kind != ResourceKind::Gds) {
 					BindingFail("typed shader contains invalid shared-memory metadata");
@@ -85,6 +92,11 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
 				EXIT_IF(memory.resource >= program.info.buffers.size());
 				live_buffers.at(memory.resource) = true;
+				// Nothing names a candidate, so without this the binding and the descriptor write disagree.
+				for (const auto candidate: program.info.buffers[memory.resource].indirect_resources) {
+					EXIT_IF(candidate >= program.info.buffers.size());
+					live_buffers.at(candidate) = true;
+				}
 			}
 		}
 	}

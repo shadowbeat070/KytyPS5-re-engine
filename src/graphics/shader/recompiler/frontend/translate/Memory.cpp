@@ -133,6 +133,7 @@ IR::MemoryInfo MemoryInfoFromDecoded(const Decoder::Instruction& decoded) {
 	                           decoded.opcode <= Decoder::Opcode::BUFFER_ATOMIC_FMAX;
 	memory.coherent = memory.kind == ResourceKind::Buffer && !buffer_atomic &&
 	                  (decoded.glc || decoded.dlc);
+	memory.glc           = decoded.glc;
 	memory.resource      = ResourceIndexFromOperand(decoded.src1);
 	memory.sampler       = ResourceIndexFromOperand(decoded.src2);
 	if (memory.kind == ResourceKind::ScalarBuffer) {
