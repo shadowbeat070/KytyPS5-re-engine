@@ -3074,6 +3074,127 @@ void TestLoopPhiWithDisagreeingEntries() {
                         "a merge did not name the two instructions that disagree");
 }
 
+// RE9 cs_b94b8a45d6d9a74c slot 31, and cs_90bf8b93e0ff9190 / cs_ed77e9e78c5540f8 alike: a scalar
+// read whose offset is a constant but whose descriptor the loop carries. A flattened slot holds one
+// word for the whole dispatch, so hoisting that read would make every iteration see the record the
+// first one named.
+void TestCarriedDescriptorReadIsNotFlattened() {
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *loop = fixture.AddBlock();
+  entry->AddBranch(loop);
+  loop->AddBranch(loop);
+
+  // The table the loop walks: its V# is carried, so each iteration names another record.
+  auto &phi =
+      loop->AppendNewInst(ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  const auto carried =
+      fixture.Emit(ValueOpcode::IAdd32, {Value(&phi), Value(48u)}, 0, loop);
+  phi.AddPhiOperand(entry, fixture.UserData(0));
+  phi.AddPhiOperand(loop, carried);
+
+  const auto carried_table =
+      fixture.Emit(ValueOpcode::GetBufferResource,
+                   {Value(&phi), fixture.UserData(1), fixture.UserData(2),
+                    fixture.UserData(3)},
+                   MemoryFlags{0, 0x20}, loop);
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  scalar.offset = 16u;
+  const auto carried_read =
+      fixture.Emit(ValueOpcode::ReadConstBuffer, {carried_table, Value(0u)},
+                   fixture.AddMemory(scalar, 0x24), loop);
+  // The read feeds a descriptor, which is what makes planning walk it at all.
+  const auto carried_handle =
+      fixture.Emit(ValueOpcode::GetBufferResource,
+                   {carried_read, carried_read, carried_read, carried_read},
+                   MemoryFlags{0, 0x28}, loop);
+  MemoryInfo carried_load;
+  carried_load.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {carried_handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(carried_load, 0x28), loop);
+
+  // An invariant descriptor read alongside it: this one names one record for the whole dispatch
+  // and must still be hoisted, or the flattened SRT stops carrying what it exists to carry.
+  const auto steady_table =
+      fixture.Emit(ValueOpcode::GetBufferResource,
+                   {fixture.UserData(4), fixture.UserData(5),
+                    fixture.UserData(6), fixture.UserData(7)},
+                   MemoryFlags{0, 0x30}, loop);
+  auto steady_scalar = scalar;
+  steady_scalar.offset = 32u;
+  const auto steady_read =
+      fixture.Emit(ValueOpcode::ReadConstBuffer, {steady_table, Value(0u)},
+                   fixture.AddMemory(steady_scalar, 0x34), loop);
+  const auto steady_handle =
+      fixture.Emit(ValueOpcode::GetBufferResource,
+                   {steady_read, steady_read, steady_read, steady_read},
+                   MemoryFlags{0, 0x38}, loop);
+  MemoryInfo steady_load;
+  steady_load.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {steady_handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(steady_load, 0x38), loop);
+
+  // Planning is what these checks are about; whether tracking then binds the table is not.
+  (void)fixture.TryPlanAndTrack();
+
+  const auto flattened = [&](Value value) {
+    return std::any_of(fixture.program.srt_reads.begin(),
+                       fixture.program.srt_reads.end(),
+                       [&](const SrtRead &read) {
+                         return read.value.Resolve() == value.Resolve();
+                       });
+  };
+  Check(!flattened(carried_read),
+        "a read through a loop-carried descriptor was hoisted into the flattened SRT");
+  Check(flattened(steady_read),
+        "a read through an invariant descriptor stopped being hoisted");
+
+  // The rule stops at scalar buffer reads. A raw address read has no table behind it to bind per
+  // record, so leaving one to the shader costs the tracker the descriptor it resolves today and
+  // buys nothing: RE9's ps_9503fb21376e3f02 goes from tracked to permanently rejected.
+  Fixture address_fixture;
+  auto *address_entry = address_fixture.block;
+  auto *address_loop = address_fixture.AddBlock();
+  address_entry->AddBranch(address_loop);
+  address_loop->AddBranch(address_loop);
+  auto &address_phi = address_loop->AppendNewInst(
+      ValueOpcode::Phi, {}, static_cast<uint64_t>(Type::U32));
+  const auto address_carried = address_fixture.Emit(
+      ValueOpcode::IAdd32, {Value(&address_phi), Value(8u)}, 0, address_loop);
+  address_phi.AddPhiOperand(address_entry, address_fixture.UserData(0));
+  address_phi.AddPhiOperand(address_loop, address_carried);
+  const auto carried_address = address_fixture.Emit(
+      ValueOpcode::GetAddressResource,
+      {Value(&address_phi), address_fixture.UserData(1)}, MemoryFlags{0, 0x40},
+      address_loop);
+  MemoryInfo address_word;
+  address_word.kind = ResourceKind::ScalarAddress;
+  const auto address_read = address_fixture.Emit(
+      ValueOpcode::LoadAddressU32,
+      {carried_address, Value(0u), Value(0u), Value(true)},
+      address_fixture.AddMemory(address_word, 0x44), address_loop);
+  const auto address_handle = address_fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {address_read, address_read, address_read, address_read},
+      MemoryFlags{0, 0x48}, address_loop);
+  MemoryInfo address_load;
+  address_load.kind = ResourceKind::Buffer;
+  address_fixture.Emit(
+      ValueOpcode::LoadBufferU32,
+      {address_handle, Value(0u), Value(0u), Value(0u), Value(true)},
+      address_fixture.AddMemory(address_load, 0x48), address_loop);
+  (void)address_fixture.TryPlanAndTrack();
+  Check(std::any_of(address_fixture.program.srt_reads.begin(),
+                    address_fixture.program.srt_reads.end(),
+                    [&](const SrtRead &read) {
+                      return read.value.Resolve() == address_read.Resolve();
+                    }),
+        "a carried address read stopped being hoisted, which only loses its descriptor");
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -4469,6 +4590,7 @@ int main() {
     Run("finite image bit scan sentinel", TestFiniteImageBitScanSentinel);
     Run("loop phi with no entry value", TestLoopPhiWithNoEntryValue);
     Run("loop phi with disagreeing entries", TestLoopPhiWithDisagreeingEntries);
+    Run("carried descriptor read", TestCarriedDescriptorReadIsNotFlattened);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("advancing loop phi", TestAdvancingLoopPhi);
