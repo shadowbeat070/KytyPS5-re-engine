@@ -700,11 +700,9 @@ bool EnumerateIndirectImage(const ResourcePlan& program,
 			keys.push_back(0u);
 			for (uint64_t probe = 0, offset = first; probe < probe_count; ++probe, offset += step) {
 				uint32_t key = 0;
-				if (!ReadScalarTable(material.Base48(), size, offset + indirect.material_offset, runtime,
-				                     {&key, 1})) {
+				if (!ReadScalarTable(material.Base48(), size, offset, runtime, {&key, 1})) {
 					failure.offset = offset;
-					RecheckAt(failure, material.Base48(), material.GetSize(),
-					          offset + indirect.material_offset);
+					RecheckAt(failure, material.Base48(), material.GetSize(), offset);
 					return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
 				}
 				// The shader narrows the key before it indexes the heap, so the enumeration must too

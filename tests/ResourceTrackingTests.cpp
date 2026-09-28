@@ -797,9 +797,24 @@ void TestInvariantIndirectImageMaterialization() {
           "indirect scalar offsets did not align and bound their components independently");
   }
 
+  // The material word need not start its record: the scalar load's own immediate is recorded,
+  // so this shape is recognized rather than refused.
+  auto wrapped_immediate = MakeIndirectImageFixture(false, 4u);
+  wrapped_immediate->PlanAndTrack();
+  Check(wrapped_immediate->program.resource_tracking_complete &&
+            wrapped_immediate->program.info.images.size() == 1,
+        "a material read at a nonzero immediate was refused");
+  const auto wrapped_source = wrapped_immediate->program.info.images[0].source;
+  Check(wrapped_source < wrapped_immediate->program.descriptor_sources.size() &&
+            wrapped_immediate->program.descriptor_sources[wrapped_source]
+                    .indirect_descriptor.has_value() &&
+            wrapped_immediate->program.descriptor_sources[wrapped_source]
+                    .indirect_descriptor->material_offset == 4u,
+        "the material read's immediate was not carried to the enumeration");
+
   // The shader packs flags above a 15-bit cube-image key in the final DWORD of
   // each 64-byte material record; the image occupies bytes 16..47 of its record.
-  auto packed = MakeIndirectImageFixture(false, 60u, false, 0u, 64u, 0x7fffu, 48u, 16u);
+  auto packed = MakeIndirectImageFixture(false, 60u, false, 0u, 64u, 48u, 16u, 0x7fffu);
   packed->PlanAndTrack();
   const auto packed_plan = ExtractResourcePlan(packed->program);
   LinearTestMemory packed_memory;
@@ -815,24 +830,29 @@ void TestInvariantIndirectImageMaterialization() {
   }
   SrtRuntime packed_runtime{.user_data = packed_data, .userdata = &packed_memory,
                             .read_specialization_memory = ReadLinearTestMemory};
+  // Image 0 is the miss slot; the mapping is reached through the directory slot.
+  const auto packed_mapping = [&] {
+    return snapshot.flattened_srt[snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset]];
+  };
   Check(MaterializeResources(packed_plan, packed_runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2u && snapshot.images[0].dwords == image_descriptor &&
-            snapshot.images[1].dwords[0] == image_descriptor[0] + 1u &&
-            snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset] == 2u,
+            snapshot.images.size() >= 3u && snapshot.images[1].dwords == image_descriptor &&
+            snapshot.images[2].dwords[0] == image_descriptor[0] + 1u && packed_mapping() == 2u,
         "packed material flags changed the table key or 48-byte descriptor addressing");
   packed_memory.words[60u / 4u] = 0xffff8002u;
   packed_memory.fail_address = 0x2070u;
   Check(MaterializeResources(packed_plan, packed_runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u &&
-            std::ranges::all_of(snapshot.images[2].dwords, [](uint32_t word) { return word == 0u; }),
+            packed_mapping() == 3u &&
+            std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
         "masked out-of-range descriptor did not return zero without reading past table bounds");
   packed_memory.fail_address = 0x205cu;
   Check(!MaterializeResources(packed_plan, packed_runtime, snapshot, specialization),
         "unreadable in-range DWORD in a 48-byte descriptor record was accepted");
-  auto overflowing = MakeIndirectImageFixture(false, 60u, false, 0u, 64u,
-                                               UINT32_MAX, 48u, 16u);
-  CheckFatal([&] { overflowing->PlanAndTrack(); }, "not a valid runtime value",
-             "unbounded table offset conflated shader U32 wrap with scalar immediate addition");
+  // The record offset wraps in U32 and the scalar immediate is added after it, so an
+  // unmasked key at a nonzero record offset still plans.
+  auto overflowing = MakeIndirectImageFixture(false, 60u, false, 0u, 64u, 48u, 16u);
+  overflowing->PlanAndTrack();
+  Check(overflowing->program.resource_tracking_complete,
+        "an unmasked key at a nonzero record offset was refused");
 }
 
 void TestGuardedDirectImageTable() {
@@ -3195,6 +3215,112 @@ void TestCarriedDescriptorReadIsNotFlattened() {
         "a carried address read stopped being hoisted, which only loses its descriptor");
 }
 
+// RE Engine indexes its material table with an alignment mask on a scalar-memory byte offset
+// (`s & -15`), not with a multiply. Hardware forces Dword alignment, so the offsets such a mask can
+// reach are exactly the multiples of 16: a record step, which the stride enumeration already walks.
+void TestAlignedMaterialSelectorIsARecordStep() {
+  for (const uint32_t spelling : {0xfffffff1u, 0xfffffff3u}) {
+    Fixture fixture;
+    std::array<Value, 4> material_words;
+    std::array<Value, 4> heap_words;
+    for (uint32_t dword = 0; dword < 4; dword++) {
+      material_words[dword] = fixture.UserData(dword);
+      heap_words[dword] = fixture.UserData(dword + 4u);
+    }
+    const auto material = fixture.Buffer(material_words, 0x2000);
+    const auto heap = fixture.Buffer(heap_words, 0x2000);
+    const auto invocation = fixture.Emit(
+        ValueOpcode::GetBuiltin,
+        {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+    const auto lane = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+    // The guest rounds the byte offset down instead of scaling an index.
+    const auto rounded = fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(spelling)});
+    MemoryInfo material_scalar;
+    material_scalar.kind = ResourceKind::ScalarBuffer;
+    const auto key = fixture.Emit(ValueOpcode::ReadConstBuffer, {material, rounded},
+                                  fixture.AddMemory(material_scalar, 0x2000));
+    const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(32u)});
+    std::array<Value, 8> descriptor_words;
+    for (uint32_t dword = 0; dword < 8; dword++) {
+      MemoryInfo heap_scalar;
+      heap_scalar.kind = ResourceKind::ScalarBuffer;
+      heap_scalar.offset = dword * 4u;
+      descriptor_words[dword] =
+          fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, record},
+                       fixture.AddMemory(heap_scalar, 0x2000));
+    }
+    const auto image = fixture.Image(descriptor_words, 0x2010);
+    const auto sampler =
+        fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x2010);
+    MemoryInfo sample;
+    sample.kind = ResourceKind::Image;
+    sample.image_dimension = Decoder::ImageDimension::Dim2D;
+    const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                      {image, sampler, fixture.ImageAddress()},
+                                      fixture.AddMemory(sample, 0x2010));
+    fixture.Emit(ValueOpcode::ReferenceU32,
+                 {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+
+    fixture.PlanAndTrack();
+    Check(fixture.program.resource_tracking_complete &&
+              fixture.program.info.images.size() == 1,
+          "an alignment-masked material offset was refused");
+    const auto source = fixture.program.info.images[0].source;
+    const auto &indirect =
+        fixture.program.descriptor_sources[source].indirect_descriptor;
+    // Both spellings agree on every bit hardware keeps, so both are a 16-byte step.
+    Check(indirect.has_value() && indirect->selector_stride == 16u &&
+              indirect->selector_offset == 0u,
+          "an alignment-masked material offset did not become a 16-byte record step");
+  }
+}
+
+// A scattered mask is not a record step and must stay refused - it would make the enumeration walk
+// a set of offsets that is not the table's own stride.
+void TestScatteredMaterialMaskIsStillRefused() {
+  Fixture fixture;
+  std::array<Value, 4> material_words;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    material_words[dword] = fixture.UserData(dword);
+    heap_words[dword] = fixture.UserData(dword + 4u);
+  }
+  const auto material = fixture.Buffer(material_words, 0x2000);
+  const auto heap = fixture.Buffer(heap_words, 0x2000);
+  const auto invocation = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::GlobalInvocationId)), Value(0u)});
+  const auto lane = fixture.Emit(ValueOpcode::ReadFirstLane, {invocation, Value(true)});
+  const auto scattered = fixture.Emit(ValueOpcode::BitwiseAnd32, {lane, Value(0xff00ff00u)});
+  MemoryInfo material_scalar;
+  material_scalar.kind = ResourceKind::ScalarBuffer;
+  const auto key = fixture.Emit(ValueOpcode::ReadConstBuffer, {material, scattered},
+                                fixture.AddMemory(material_scalar, 0x2000));
+  const auto record = fixture.Emit(ValueOpcode::IMul32, {key, Value(32u)});
+  std::array<Value, 8> descriptor_words;
+  for (uint32_t dword = 0; dword < 8; dword++) {
+    MemoryInfo heap_scalar;
+    heap_scalar.kind = ResourceKind::ScalarBuffer;
+    heap_scalar.offset = dword * 4u;
+    descriptor_words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, record},
+                                           fixture.AddMemory(heap_scalar, 0x2000));
+  }
+  const auto image = fixture.Image(descriptor_words, 0x2010);
+  const auto sampler =
+      fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x2010);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x2010));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+
+  const auto status = fixture.TryPlanAndTrack();
+  Check(!status.ok, "a scattered material mask was recognized as a record step");
+}
+
 void TestLoopCycleEnteredThroughRuntimeValue() {
   Fixture fixture;
   auto *entry = fixture.block;
@@ -3884,10 +4010,9 @@ void TestIndirectImageSelectionResolvesEveryKey() {
     for (uint32_t word = 0; word < kSelectorStride / 4u; word++) {
       memory.words[base + word] = 0x3f800000u + record * 0x11u + word;
     }
-    // The key's address is what the shader computes: the record, plus the offset it folded in,
-    // plus the scalar load's own immediate.
-    memory.words[base + (indirect->selector_offset + indirect->material_offset) / 4u] =
-        keys[record];
+    // The key's address is what the shader computes: the record plus the offset it folded in,
+    // which already carries the scalar load's own immediate.
+    memory.words[base + indirect->selector_offset / 4u] = keys[record];
   }
 
   std::array<uint32_t, 9> user_data{
@@ -4591,6 +4716,8 @@ int main() {
     Run("loop phi with no entry value", TestLoopPhiWithNoEntryValue);
     Run("loop phi with disagreeing entries", TestLoopPhiWithDisagreeingEntries);
     Run("carried descriptor read", TestCarriedDescriptorReadIsNotFlattened);
+    Run("aligned material selector", TestAlignedMaterialSelectorIsARecordStep);
+    Run("scattered material mask", TestScatteredMaterialMaskIsStillRefused);
     Run("runtime-rooted loop", TestLoopCycleEnteredThroughRuntimeValue);
     Run("invariant loop phi", TestInvariantLoopPhi);
     Run("advancing loop phi", TestAdvancingLoopPhi);
