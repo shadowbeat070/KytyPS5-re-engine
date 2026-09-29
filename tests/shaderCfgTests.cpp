@@ -192,6 +192,104 @@ CfgInstructionCoverage(const ShaderRecompiler::CFG::Graph &graph,
   return coverage;
 }
 
+// Walk a CFG the way the shader would, deciding every guest branch from a seed keyed by the
+// guest branch instruction and by how many times that branch has already been decided. The key
+// names the guest instruction, not the CFG block, so a structurized graph - which may add, merge,
+// split or duplicate blocks, or capture a guest predicate into a variable at the end of the code
+// that computes it - answers each decision exactly as the original graph did. What must then
+// match is the sequence of guest instructions executed.
+struct CfgWalk {
+  std::vector<uint32_t> executed;
+  bool finished = false;
+  bool exhausted = false;
+};
+
+uint64_t CfgWalkHash(uint64_t value) {
+  value += 0x9e3779b97f4a7c15ull;
+  value = (value ^ (value >> 30u)) * 0xbf58476d1ce4e5b9ull;
+  value = (value ^ (value >> 27u)) * 0x94d049bb133111ebull;
+  return value ^ (value >> 31u);
+}
+
+CfgWalk WalkCfg(const ShaderRecompiler::CFG::Graph &graph, uint64_t seed,
+                uint32_t step_limit = 1u << 16u) {
+  using ShaderRecompiler::CFG::ConditionExpression;
+  using ShaderRecompiler::CFG::TerminatorKind;
+
+  CfgWalk walk;
+  std::unordered_map<uint32_t, uint32_t> decided;
+  std::unordered_map<uint32_t, bool> variables;
+  const auto decide = [&](uint32_t branch) {
+    const auto visit = decided[branch]++;
+    return (CfgWalkHash(seed ^ (uint64_t{branch} << 20u) ^ visit) & 1u) != 0u;
+  };
+  const auto evaluate = [&](auto &&self, uint32_t index) -> bool {
+    const auto &value = graph.expressions.at(index);
+    switch (value.op) {
+    case ConditionExpression::Op::Constant: return value.lhs != 0;
+    case ConditionExpression::Op::Variable: return variables[value.lhs];
+    case ConditionExpression::Op::Not: return !self(self, value.lhs);
+    case ConditionExpression::Op::Or:
+      return self(self, value.lhs) || self(self, value.rhs);
+    case ConditionExpression::Op::Native: break;
+    }
+    std::abort();
+  };
+  uint32_t block_id = graph.entry_block;
+  for (uint32_t step = 0; step < step_limit; step++) {
+    const auto *block = graph.FindBlock(block_id);
+    if (block == nullptr) {
+      return walk;
+    }
+    for (auto inst = block->inst_begin; inst < block->inst_end; inst++) {
+      walk.executed.push_back(inst);
+    }
+    for (const auto &assignment : block->assignments) {
+      const auto &expression = graph.expressions.at(assignment.expression);
+      // A captured guest predicate ends the guest code that computes it.
+      variables[assignment.variable] =
+          expression.op == ConditionExpression::Op::Native
+              ? block->inst_end != block->inst_begin && decide(block->inst_end - 1u)
+              : evaluate(evaluate, assignment.expression);
+    }
+    const auto &terminator = block->terminator;
+    switch (terminator.kind) {
+    case TerminatorKind::Return:
+      walk.finished = true;
+      return walk;
+    case TerminatorKind::Branch:
+      block_id = terminator.true_block;
+      break;
+    case TerminatorKind::ConditionalBranch: {
+      const bool take = terminator.expression != UINT32_MAX
+                            ? evaluate(evaluate, terminator.expression)
+                            : block->inst_end != block->inst_begin &&
+                                  decide(block->inst_end - 1u);
+      block_id = take ? terminator.true_block : terminator.false_block;
+      break;
+    }
+    default:
+      return walk;
+    }
+  }
+  walk.exhausted = true;
+  return walk;
+}
+
+// Structurization may not change what the shader runs. Walk both graphs under many seeds and
+// require the same sequence of guest blocks every time.
+void CheckCfgPathsMatch(const ShaderRecompiler::CFG::Graph &original,
+                        const ShaderRecompiler::CFG::Graph &structured,
+                        const char *what, uint32_t seeds = 512u) {
+  for (uint32_t seed = 0; seed < seeds; seed++) {
+    const auto before = WalkCfg(original, seed);
+    const auto after = WalkCfg(structured, seed);
+    Check(!before.exhausted && !after.exhausted, what);
+    Check(before.finished && after.finished, what);
+    Check(before.executed == after.executed, what);
+  }
+}
+
 void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
   spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
   std::string messages;
@@ -15430,6 +15528,82 @@ void TestNewShaderRecompilerSpirvSizeBaselines() {
 }
 
 #include "ShaderRayTracingTests.inc"
+// RE9 ps_aba519e634a11781 (562 blocks, 26 loops): its clustered lighting jumps straight into the
+// middle of a later selection's arm, so that arm has two entries, the selection's own header and
+// a branch from outside it, and the entered block opens a loop.
+const uint32_t kEnteredRegionShader[] = {
+    EncodeSopc(0x06, 0, 0),
+    EncodeSopp(0x04, 4), // 0: jump into the region at 3, else 1
+    EncodeSopc(0x06, 1, 1),
+    EncodeSopp(0x04, 7), // 1: selection header -> merge 5, else 2
+    EncodeSMovB32(2, 129),
+    EncodeSopp(0x02, 0), // 2: the header's own way into 3
+    EncodeSMovB32(3, 129),
+    EncodeSopc(0x06, 2, 2),
+    EncodeSopp(0x04, 0xfffdu), // 3: entered block, loops on itself, else 4
+    EncodeSMovB32(4, 129),
+    EncodeSopp(0x02, 0), // 4 -> 5
+    EncodeSMovB32(5, 129),
+    0xbf810000u, // 5: merge
+};
+
+void TestNewShaderRecompilerCfgStructuresEnteredSelectionRegion() {
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{kEnteredRegionShader},
+                                           decoded);
+  const auto original = ShaderRecompiler::CFG::BuildGraph(decoded);
+  Check(original.blocks.size() == 6u && original.natural_loops.size() == 1u &&
+            original.natural_loops.front().header == 3u,
+        "entered-region fixture has the wrong native CFG");
+  const auto *entered = original.FindBlock(3u);
+  Check(entered != nullptr && entered->predecessors.size() == 3u,
+        "the entered block should be reached from outside the region, from "
+        "inside it, and from its own latch");
+
+  const auto native_coverage =
+      CfgInstructionCoverage(original, decoded.instructions.size());
+  const auto graph = ShaderRecompiler::CFG::Structurize(original);
+  Check(!graph.unsupported,
+        "an externally entered selection region did not structure");
+  const auto structured_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  for (size_t index = 0; index < structured_coverage.size(); index++) {
+    Check(structured_coverage[index] >= native_coverage[index],
+          "structurization dropped a guest instruction");
+  }
+  CheckCfgPathsMatch(original, graph,
+                     "structurizing an externally entered region changed the "
+                     "path the shader takes");
+
+  auto options = MakeCompileOptions(ShaderType::Pixel);
+  options.dump_ir = true;
+  auto result = RecompileForTest(kEnteredRegionShader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos &&
+            SpirvInstructionOpcodeCount(result.spirv, 251) == 0u,
+        "an externally entered selection region still took the dispatcher");
+  CheckSpirvBinaryValidates(result.spirv);
+
+  // The control: the same shape, with block 0 skipping the region instead of jumping into it,
+  // has one entry to begin with and is structured without copying anything.
+  uint32_t single_entry[std::size(kEnteredRegionShader)];
+  std::copy(std::begin(kEnteredRegionShader), std::end(kEnteredRegionShader),
+            std::begin(single_entry));
+  single_entry[1] = EncodeSopp(0x04, 9); // 0 -> the merge, not into the region
+  ShaderRecompiler::Decoder::Program single_decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{single_entry},
+                                           single_decoded);
+  auto single_graph = ShaderRecompiler::CFG::BuildGraph(single_decoded);
+  const auto single_coverage =
+      CfgInstructionCoverage(single_graph, single_decoded.instructions.size());
+  single_graph = ShaderRecompiler::CFG::Structurize(single_graph);
+  Check(!single_graph.unsupported,
+        "the single-entry control did not structure");
+  Check(CfgInstructionCoverage(single_graph,
+                               single_decoded.instructions.size()) ==
+            single_coverage,
+        "a region with one entry was copied anyway");
+}
 
 } // namespace
 } // namespace Libs::Graphics
@@ -15617,6 +15791,7 @@ int main() {
   TestPixelProgramCacheBindingIdentity();
   TestGraphicsPushConstantPlacement();
   TestNewShaderRecompilerUnsupportedMemoryDecode();
+  TestNewShaderRecompilerCfgStructuresEnteredSelectionRegion();
 
   TestNewShaderRecompilerVop3LaneReadDestinationEncoding();
 
