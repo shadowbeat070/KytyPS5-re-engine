@@ -8754,6 +8754,63 @@ void TestNewShaderRecompilerCfgLoopContinueSharedSelectionMerge() {
   CheckSpirvBinaryValidates(result.spirv);
 }
 
+void TestNewShaderRecompilerCfgLoopContinueArmSharesEnclosingMerge() {
+  // Captured from SILENT HILL 2 loading-screen compute shaders. The inner selection's else arm
+  // continues the loop, so the join it falls into does not post-dominate it.
+  const uint32_t shader[] = {
+      EncodeSMovB32(0, 129),     // 0x00 entry work
+      EncodeSopc(0x06, 1, 1),    // 0x04 loop header / enclosing selection condition
+      EncodeSopp(0x05, 6),       // 0x08 enclosing arm -> shared merge
+      EncodeSopc(0x06, 2, 2),    // 0x0c inner selection condition
+      EncodeSopp(0x05, 2),       // 0x10 inner arm -> inner join
+      EncodeSopc(0x06, 3, 3),    // 0x14 inner else arm
+      EncodeSopp(0x05, 5),       // 0x18 inner else arm -> latch (continue)
+      EncodeSMovB32(4, 129),     // 0x1c inner join work
+      EncodeSopp(0x02, 0),       // 0x20 inner join -> shared merge
+      EncodeSMovB32(5, 129),     // 0x24 shared merge work
+      EncodeSopc(0x06, 6, 6),    // 0x28 exit condition
+      EncodeSopp(0x05, 1),       // 0x2c -> s_endpgm, else fall through to the latch
+      EncodeSopp(0x02, 0xfff4u), // 0x30 latch -> loop header
+      0xbf810000u,               // 0x34 s_endpgm
+  };
+
+  ShaderRecompiler::Decoder::Program decoded;
+  ShaderRecompiler::Decoder::DecodeProgram(std::span{shader}, decoded);
+  auto graph = ShaderRecompiler::CFG::BuildGraph(decoded);
+  const auto original_coverage =
+      CfgInstructionCoverage(graph, decoded.instructions.size());
+  Check(graph.blocks.size() == 8u && graph.natural_loops.size() == 1u,
+        "loop-continue arm fixture has the wrong native CFG");
+  graph = ShaderRecompiler::CFG::Structurize(graph);
+  Check(!graph.unsupported,
+        graph.unsupported_reason.c_str());
+  Check(CfgInstructionCoverage(graph, decoded.instructions.size()) ==
+            original_coverage,
+        "loop-continue arm structurization changed semantic coverage");
+
+  std::vector<uint32_t> merges;
+  for (const auto &block : graph.blocks) {
+    if (block.terminator.merge_block == UINT32_MAX) {
+      continue;
+    }
+    Check(std::ranges::find(merges, block.terminator.merge_block) ==
+              merges.end(),
+          "structurization left two constructs sharing one merge block");
+    merges.push_back(block.terminator.merge_block);
+  }
+
+  auto options = MakeCompileOptions(ShaderType::Compute);
+  options.dump_ir = true;
+  auto result = RecompileForTest(shader, options);
+  Check(!result.program.dispatcher_fallback &&
+            result.ir_dump.find("mode=structured") != std::string::npos &&
+            SpirvInstructionOpcodeCount(result.spirv, 251u) == 0u,
+        "loop-continue arm shader unexpectedly selected dispatcher fallback");
+  Check(SpirvInstructionOpcodeCount(result.spirv, 59u) <= 16u,
+        "structured loop-continue arm shader still spills to function variables");
+  CheckSpirvBinaryValidates(result.spirv);
+}
+
 void TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders() {
   const uint32_t shader[] = {
       EncodeSopc(0x06, 0, 0),      // preheader condition
@@ -15095,6 +15152,7 @@ int main() {
   TestNewShaderRecompilerCfgMultipleLoopLatches();
   TestNewShaderRecompilerCfgDuplicateMergeStructuredSplit();
   TestNewShaderRecompilerCfgLoopContinueSharedSelectionMerge();
+  TestNewShaderRecompilerCfgLoopContinueArmSharesEnclosingMerge();
   TestNewShaderRecompilerCfgNestedEarlyExitLoopForwarders();
   TestNewShaderRecompilerCfgExecSccSharedArm();
   TestSharedReturnPreservesDescriptorDominance();
