@@ -22,6 +22,9 @@
 #include <unordered_set>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+std::string& MaterializeFailure();
+
 namespace {
 
 constexpr uint64_t AddressMask             = 0x0000ffffffffffffull;
@@ -38,9 +41,21 @@ struct IndirectBuffer {
 	std::vector<DescriptorValue> descriptors;
 };
 
+// Not memoed, so a failing table fails on every draw; print each reason at every doubling.
 bool SpecializationFail(std::string_view message) {
-	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
-	             static_cast<int>(message.size()), message.data());
+	static std::mutex                                mutex;
+	static std::unordered_map<std::string, uint64_t> counts;
+	uint64_t                                         count = 0;
+	{
+		const std::lock_guard<std::mutex> lock(mutex);
+		count = ++counts[std::string(message)];
+	}
+	MaterializeFailure() = message;
+	if ((count & (count - 1u)) == 0u) {
+		std::fprintf(stderr, "shader resource specialization failed: %.*s (occurrence %llu)\n",
+		             static_cast<int>(message.size()), message.data(),
+		             static_cast<unsigned long long>(count));
+	}
 	return false;
 }
 
