@@ -4108,6 +4108,112 @@ void TestIndirectImageRefusalNamesItselfAndIsMemoed() {
         "the memo outlived the descriptors that produced it");
 }
 
+// Refuses anything wider than one heap record, so every span and window falls back to the reads
+// the enumeration made one record at a time.
+bool ReadOneRecordAtATime(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  return values.size() <= 8u && ReadLinearTestMemory(userdata, address, values);
+}
+
+// A large table is read in spans and windows; the result, and the record a refusal names, must be
+// exactly what reading one record at a time produces.
+void TestLargeIndirectTablesReadInSpans() {
+  constexpr uint32_t kRecords = 4096u;
+  constexpr uint32_t kKeys = 1024u;
+  constexpr uint32_t kDistinct = 200u;
+  auto fixture = MakeIndirectImageFixture(false, 4u, false, 0u, 16u, 32u);
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  LinearTestMemory memory;
+  constexpr uint64_t material = 0x1000u;
+  constexpr uint64_t heap = material + kRecords * 16u + 0x1000u;
+  memory.words.assign((heap - memory.base + kKeys * 32u) / 4u, 0u);
+  for (uint32_t record = 0; record < kRecords; record++) {
+    memory.words[(material - memory.base) / 4u + record * 4u + 1u] =
+        (record * 2654435761u) % kKeys;
+  }
+  for (uint32_t key = 0; key < kKeys; key++) {
+    const auto word = (heap - memory.base) / 4u + key * 8u;
+    memory.words[word] = 0x40000000u + (key % kDistinct) * 0x100u;
+    memory.words[word + 1u] = static_cast<uint32_t>(
+        Libs::Graphics::Prospero::BufferFormat::k32_32_32_32Float) << 20u;
+    memory.words[word + 2u] = 3u | (3u << 14u);
+    memory.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor2D) << 28u);
+  }
+  std::array<uint32_t, 9> user_data{static_cast<uint32_t>(material), 16u << 16u, kRecords, 0u,
+                                    static_cast<uint32_t>(heap), 32u << 16u, kKeys, 0u, 7u};
+  const SrtRuntime spans{.user_data = user_data, .userdata = &memory,
+                         .read_specialization_memory = ReadLinearTestMemory};
+  auto single = spans;
+  single.read_specialization_memory = ReadOneRecordAtATime;
+
+  ResourceSnapshot spanned_snapshot, single_snapshot;
+  ResourceSpecialization spanned_specialization, single_specialization;
+  memory.reads = 0;
+  Check(MaterializeResources(plan, spans, spanned_snapshot, spanned_specialization) &&
+            memory.reads < 16u,
+        "a large indirect image table was not read in spans");
+  Check(MaterializeResources(plan, single, single_snapshot, single_specialization) &&
+            memory.reads > kRecords,
+        "the one-record reader did not fall back to per-record reads");
+  Check(spanned_snapshot.images.size() == kDistinct + 1u &&
+            SameResourceSnapshot(spanned_snapshot, single_snapshot) &&
+            spanned_specialization == single_specialization,
+        "reading a table in spans changed what it materializes");
+
+  // A refusal inside a span still names its own record, and the same one either way.
+  const auto material_record = 3001u;
+  memory.fail_address = material + material_record * 16u + 4u;
+  for (const auto &runtime : {spans, single}) {
+    Check(!MaterializeResources(plan, runtime, spanned_snapshot, spanned_specialization) &&
+              std::string{LastMaterializeFailure()}.find(
+                  fmt::format("material record at offset {} would", material_record * 16u + 4u)) !=
+                  std::string::npos,
+          "a refusal inside a material span named the wrong record");
+  }
+  const auto heap_key = 777u;
+  memory.fail_address = heap + heap_key * 32u + 12u;
+  for (const auto &runtime : {spans, single}) {
+    Check(!MaterializeResources(plan, runtime, spanned_snapshot, spanned_specialization) &&
+              std::string{LastMaterializeFailure()}.find(
+                  fmt::format("key {} names heap offset {} which", heap_key, heap_key * 32u)) !=
+                  std::string::npos,
+          "a refusal inside a heap window named the wrong record");
+  }
+  memory.fail_address = UINT64_MAX;
+
+  // A remembered buffer table answers with exactly what enumerating it produced, and a rewritten
+  // record is seen on the next dispatch.
+  constexpr uint32_t kStride = 48u;
+  auto buffer_fixture = MakeIndirectBufferFixture(kStride, false);
+  buffer_fixture->PlanAndTrack();
+  const auto buffer_plan = ExtractResourcePlan(buffer_fixture->program);
+  LinearTestMemory table;
+  table.words.assign(kRecords * kStride / 4u, 0u);
+  for (uint32_t record = 0; record < kRecords; record++) {
+    const auto word = record * kStride / 4u + 2u;
+    if (record % 7u == 3u) continue;
+    table.words[word] = 0x20000u + (record % 11u) * 0x100u;
+    table.words[word + 2u] = 64u;
+    table.words[word + 3u] = Libs::Graphics::DstSel(4, 5, 6, 7);
+  }
+  std::array<uint32_t, 4> buffer_user_data{static_cast<uint32_t>(table.base), kStride << 16u,
+                                           kRecords, 0u};
+  const SrtRuntime buffer_runtime{.user_data = buffer_user_data, .userdata = &table,
+                                  .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot first, second;
+  ResourceSpecialization first_specialization, second_specialization;
+  Check(MaterializeResources(buffer_plan, buffer_runtime, first, first_specialization) &&
+            MaterializeResources(buffer_plan, buffer_runtime, second, second_specialization) &&
+            first.buffers.size() == 2u + 11u && SameResourceSnapshot(first, second) &&
+            first_specialization == second_specialization,
+        "a remembered buffer table did not reproduce its enumeration");
+  table.words[5u * kStride / 4u + 2u] = 0x90000u;
+  Check(MaterializeResources(buffer_plan, buffer_runtime, second, second_specialization) &&
+            second.buffers.size() == first.buffers.size() + 1u,
+        "a rewritten buffer table record was served from the memo");
+}
+
 void TestConditionalIndirectImageMaterialization() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   auto fixture = MakeIndirectImageFixture(false);
@@ -4732,6 +4838,7 @@ int main() {
     Run("strided indirect image table", TestStridedIndirectImageTable);
     Run("indirect image selection", TestIndirectImageSelectionResolvesEveryKey);
     Run("indirect image refusal reporting", TestIndirectImageRefusalNamesItselfAndIsMemoed);
+    Run("large indirect tables read in spans", TestLargeIndirectTablesReadInSpans);
     Run("conditional indirect image", TestConditionalIndirectImageMaterialization);
     Run("shader info and bindings", TestShaderInfoAndBindingLayout);
     Run("image binding ABI", TestImageBindingAbi);
