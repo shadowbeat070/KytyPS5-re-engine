@@ -2758,6 +2758,82 @@ void TestWritableDescriptorPhi() {
         "control-dependent writable descriptor phi was not rejected transactionally");
 }
 
+// RE9 mesh 0e6382b2f7c0dfab: a decoded V# keeps its raw SRSRC operand as its resource.
+ResourcePlan DecodedBufferPlan(uint32_t raw_resource) {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *decoded = fixture.AddBlock();
+  auto *tracked = fixture.AddBlock();
+  fixture.block->AddBranch(decoded);
+  fixture.block->AddBranch(tracked);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch,
+      .true_block = 1,
+      .false_block = 2};
+  const auto control =
+      fixture.Buffer({Value(0x2000u), Value(0u), Value(200u), Value(0u)});
+  MemoryInfo scalar;
+  scalar.kind = ResourceKind::ScalarBuffer;
+  const auto flag =
+      fixture.Emit(ValueOpcode::ReadConstBuffer, {control, Value(196u)},
+                   fixture.AddMemory(scalar, 0x10));
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::SGreaterThanEqual32, {flag, Value(0u)});
+
+  const auto record =
+      fixture.Emit(ValueOpcode::GetAddressResource,
+                   {fixture.UserData(0), fixture.UserData(1)},
+                   MemoryFlags{0, 0x20}, decoded);
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  const auto base = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {record, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(global, 0x20), decoded);
+  const auto handle = fixture.Emit(
+      ValueOpcode::GetBufferResource, {base, Value(0u), Value(64u), Value(0u)},
+      MemoryFlags{0, 0x28}, decoded);
+  MemoryInfo raw;
+  raw.kind = ResourceKind::Buffer;
+  raw.resource = raw_resource;
+  const auto raw_flags = fixture.AddMemory(raw, 0x28);
+  fixture.Emit(ValueOpcode::LoadBufferU32x4,
+               {handle, Value(0u), Value(0u), Value(0u), Value(true)},
+               raw_flags, decoded);
+
+  const auto direct = fixture.Emit(
+      ValueOpcode::GetBufferResource,
+      {fixture.UserData(4), fixture.UserData(5), fixture.UserData(6),
+       fixture.UserData(7)},
+      MemoryFlags{0, 0x30}, tracked);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  fixture.Emit(ValueOpcode::LoadBufferU32,
+               {direct, Value(0u), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(buffer, 0x30), tracked);
+  fixture.PlanAndTrack();
+
+  const auto &memory = fixture.program.memory_info[raw_flags.index];
+  Check(memory.kind == ResourceKind::IndirectBuffer &&
+            memory.resource == raw_resource &&
+            fixture.program.info.buffers.size() == 2u,
+        "a raw DWORD x4 load over a GPU-read V# did not take the in-shader decode");
+  return ExtractResourcePlan(fixture.program);
+}
+
+void TestDecodedBufferControlFlow() {
+  // Past the tracked list: planning threw std::out_of_range.
+  const auto past = DecodedBufferPlan(5u);
+  Check(past.control_flow.size() == 3u && past.control_flow[1].sources.empty(),
+        "a decoded V# past the tracked buffers was not planned");
+  // Inside it: planning credited the decoded block with a buffer only the other arm reads.
+  const auto inside = DecodedBufferPlan(1u);
+  Check(inside.control_flow.size() == 3u &&
+            inside.control_flow[1].sources.empty() &&
+            inside.control_flow[2].sources ==
+                std::vector<uint32_t>{inside.info.buffers[1].source},
+        "a decoded V# was planned as the tracked buffer its raw operand names");
+}
+
 ResourcePlan ConditionalSamplerPlan(bool diamond, bool reverse, bool reverse_phi,
                                     bool nonuniform = false,
                                     bool writable = false) {
@@ -4886,6 +4962,7 @@ int main() {
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("indirect buffer table", TestIndirectBufferMaterialization);
+    Run("decoded buffer control flow", TestDecodedBufferControlFlow);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);
     Run("uniform buffer read addressing",

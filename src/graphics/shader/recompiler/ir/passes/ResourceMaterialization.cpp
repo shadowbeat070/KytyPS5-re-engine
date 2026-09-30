@@ -1902,17 +1902,30 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program& program, co
 			if (buffer == BufferAccess::None && image.access == ImageAccess::None) {
 				continue;
 			}
-			const auto& memory = program.memory_info.at(inst.Flags<MemoryFlags>().index);
-			if (memory.planning_only || memory.kind == ResourceKind::IndirectBuffer ||
-			    memory.dynamic_buffer) {
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index >= program.memory_info.size()) {
+				return {};
+			}
+			const auto& memory = program.memory_info[index];
+			// A V# the shader decodes itself binds nothing; its resource is still the raw operand.
+			if (memory.planning_only || memory.dynamic_buffer ||
+			    memory.kind == ResourceKind::IndirectBuffer) {
 				continue;
 			}
+			// Without every source, pruning could drop a live resource; plan none instead.
 			if (buffer != BufferAccess::None) {
-				block.sources.push_back(program.info.buffers.at(memory.resource).source);
+				if (memory.resource >= program.info.buffers.size()) {
+					return {};
+				}
+				block.sources.push_back(program.info.buffers[memory.resource].source);
 			} else {
-				block.sources.push_back(program.info.images.at(memory.resource).source);
+				if (memory.resource >= program.info.images.size() ||
+				    (image.needs_sampler && memory.sampler >= program.info.samplers.size())) {
+					return {};
+				}
+				block.sources.push_back(program.info.images[memory.resource].source);
 				if (image.needs_sampler) {
-					block.sources.push_back(program.info.samplers.at(memory.sampler).source);
+					block.sources.push_back(program.info.samplers[memory.sampler].source);
 				}
 			}
 		}
