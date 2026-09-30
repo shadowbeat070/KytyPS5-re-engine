@@ -42,6 +42,8 @@ struct GraphicContext {
 	bool                               maintenance8_enabled                  = false;
 	bool                               conditional_rendering_enabled         = false;
 	bool                               supports_block_texel_view              = false;
+	// A guest indirect draw with a GPU-written count stays on the GPU only with this.
+	bool                                      draw_indirect_count_enabled           = false;
 	bool                                      mesh_shader_enabled                   = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
 	uint32_t                           subgroup_size                         = 0;
