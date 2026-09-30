@@ -24,9 +24,11 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#include <atomic>
 #include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include <vulkan/vk_platform.h>
@@ -954,16 +956,30 @@ void WindowContext::UpdateTitle() {
 	    (has_title_id ? ", " : ""), (has_app_ver ? app_ver : ""), (has_app_ver ? " " : ""),
 	    device_name, processor_name, frame_num, current_fps);
 
-	struct TitleUpdate {
-		SDL_Window*  window;
-		std::string* text;
-	} update {window, &text};
-	EXIT_IF(!SDL_RunOnMainThread(
-	    [](void* data) {
-		    auto& title = *static_cast<TitleUpdate*>(data);
-		    SDL_SetWindowTitle(title.window, title.text->c_str());
-	    },
-	    &update, true));
+	// SDL can miss a main-thread wakeup and sleep through its 3 s joystick poll; never wait here.
+	static std::mutex       pending_mutex;
+	static std::string      pending_text;
+	static std::atomic_bool update_queued {false};
+	{
+		std::lock_guard lock(pending_mutex);
+		pending_text = std::move(text);
+	}
+	if (update_queued.exchange(true)) {
+		return;
+	}
+	if (!SDL_RunOnMainThread(
+	        [](void* data) {
+		        std::string title;
+		        {
+			        std::lock_guard lock(pending_mutex);
+			        title = pending_text;
+			        update_queued = false;
+		        }
+		        SDL_SetWindowTitle(static_cast<SDL_Window*>(data), title.c_str());
+	        },
+	        window, false)) {
+		update_queued = false;
+	}
 }
 
 } // namespace Libs::Graphics
