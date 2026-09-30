@@ -885,10 +885,71 @@ bool EnumerateIndirectImage(const ResourcePlan& program,
 			return Refuse(IndirectImageFailure::Stage::MappingSlotOutOfRange);
 		}
 		snapshot.flattened_srt[slot] = static_cast<uint32_t>(mapping_offset);
+		// Filled by WriteIndirectImageSlots once the bindings the ordinals land in are known.
+		const auto ordinals = snapshot.images.size() - children_begin + 1u;
+		snapshot.flattened_srt.push_back(static_cast<uint32_t>(ordinals));
+		snapshot.flattened_srt.resize(snapshot.flattened_srt.size() + ordinals, 0u);
 		auto& root = specialization.images[image_index];
 		root.indirect_root = image_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(slot);
-		root.indirect_search_iterations = std::bit_width(keys.size());
+		root.indirect_search_iterations = IndirectSearchIterations;
+	}
+	return true;
+}
+
+// Slot words place each ordinal exactly as AllocateBindings does.
+bool WriteIndirectImageSlots(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                             const ResourceSpecialization& specialization) {
+	const auto& images = specialization.images;
+	const auto  roots  = program.info.images.size();
+	bool        tables = false;
+	for (uint32_t index = 0; index < roots && !tables; index++) {
+		tables = images[index].indirect_root == index;
+	}
+	if (!tables) {
+		return true;
+	}
+	std::array<uint32_t, ImageBindingCount>   next {};
+	std::array<uint32_t, ShaderInfo::MaxImages> slots {};
+	for (uint32_t index = 0; index < images.size(); index++) {
+		const auto& image = images[index];
+		if (image.fmask) {
+			continue;
+		}
+		const auto& base = program.info.images[index < roots ? index : image.indirect_root];
+		ImageResource placed;
+		placed.resource_class = base.resource_class;
+		placed.atomic         = base.atomic;
+		placed.atomic64       = base.atomic64;
+		placed.depth_compare  = base.depth_compare;
+		placed.numeric_class  = image.numeric_class;
+		placed.dimension      = image.dimension;
+		const auto kind       = DescriptorBindingForImage(placed);
+		if (!kind.has_value()) {
+			return SpecializationFail(fmt::format("image resource {} has no binding", index));
+		}
+		auto& element = next[ImageBindingIndex(*kind)];
+		slots[index]  = IndirectImageSlot(IndirectImageShape(image.dimension, image.cube), element);
+		element += base.mip_mode == ImageMipMode::Dynamic ? image.mip_count : 1u;
+	}
+	for (uint32_t root = 0; root < roots; root++) {
+		if (images[root].indirect_root != root) {
+			continue;
+		}
+		const auto mapping = static_cast<size_t>(snapshot.flattened_srt[images[root].indirect_mapping_offset]);
+		const auto region  = mapping + 1u + static_cast<size_t>(snapshot.flattened_srt[mapping]) * 2u;
+		const auto words   = region < snapshot.flattened_srt.size() ? snapshot.flattened_srt[region] : 0u;
+		if (words == 0u || region + 1u + words > snapshot.flattened_srt.size()) {
+			return SpecializationFail("indirect image specialization has no slot words");
+		}
+		snapshot.flattened_srt[region + 1u] = slots[root];
+		uint32_t ordinal = 1;
+		for (uint32_t index = static_cast<uint32_t>(roots); index < images.size() && ordinal < words;
+		     index++) {
+			if (images[index].indirect_root == root) {
+				snapshot.flattened_srt[region + 1u + ordinal++] = slots[index];
+			}
+		}
 	}
 	return true;
 }
@@ -952,10 +1013,14 @@ bool MaterializeFiniteImage(const ResourcePlan& program,
 			return Refuse(IndirectImageFailure::Stage::MappingSlotOutOfRange);
 		}
 		snapshot.flattened_srt[slot] = static_cast<uint32_t>(mapping_offset);
+		// Filled by WriteIndirectImageSlots once the bindings the ordinals land in are known.
+		const auto ordinals = snapshot.images.size() - children_begin + 1u;
+		snapshot.flattened_srt.push_back(static_cast<uint32_t>(ordinals));
+		snapshot.flattened_srt.resize(snapshot.flattened_srt.size() + ordinals, 0u);
 		auto& root = specialization.images[image_index];
 		root.indirect_root = image_index;
 		root.indirect_mapping_offset = static_cast<uint32_t>(slot);
-		root.indirect_search_iterations = std::bit_width(key_count);
+		root.indirect_search_iterations = IndirectSearchIterations;
 	}
 	return true;
 }
@@ -1299,6 +1364,219 @@ bool ExpandIndirectBuffer(const ResourcePlan& program, uint32_t root_index,
 	return true;
 }
 
+// Powers of two first; quarter-octave steps when the tables cannot all afford them.
+size_t IndirectImageBucket(size_t count, bool fine) {
+	if (count < 2u) {
+		return count;
+	}
+	if (!fine) {
+		return std::bit_ceil(count);
+	}
+	const auto step = std::max<size_t>(1u, std::bit_floor(count) / 4u);
+	return (count + step - 1u) / step * step;
+}
+
+// A finite table's candidates are the shader's own, so its module has nothing to stabilise.
+bool FiniteImageTable(const ResourcePlan& program, uint32_t root) {
+	const auto* source = Source(program, program.info.images[root].source);
+	return source != nullptr && source->indirect_descriptor.has_value() &&
+	       !source->indirect_descriptor->sources.empty();
+}
+
+using ShapeList = std::array<std::pair<Decoder::ImageDimension, bool>, 3>;
+
+// The shapes a 2D-family table's sample can meet that none of its candidates has.
+uint32_t MissingShapes(const ResourcePlan& program, const ResourceSnapshot& snapshot, uint32_t root,
+                       size_t begin, size_t end, ShapeList& missing) {
+	using Decoder::ImageDimension;
+	const auto requested = program.info.images[root].dimension;
+	if (requested != ImageDimension::Dim2D && requested != ImageDimension::Dim2DArray) {
+		return 0;
+	}
+	std::array<bool, 3> present {};
+	for (auto index = begin; index < end; index++) {
+		const auto& descriptor = snapshot.images[index];
+		if (NullImageDescriptor(descriptor)) {
+			continue;
+		}
+		const auto dimension = DescriptorDimension(descriptor, requested);
+		if (DescriptorIsCube(descriptor)) {
+			present[2] = true;
+		} else if (dimension == ImageDimension::Dim2D || dimension == ImageDimension::Dim2DArray) {
+			present[dimension == ImageDimension::Dim2D ? 0u : 1u] = true;
+		} else {
+			return 0;
+		}
+	}
+	// Only an array request can meet a plain 2D array; a cube can meet either.
+	constexpr ShapeList shapes {{{ImageDimension::Dim2D, false},
+	                             {ImageDimension::Dim2DArray, false},
+	                             {ImageDimension::Dim2DArray, true}}};
+	uint32_t count = 0;
+	for (uint32_t shape = 0; shape < shapes.size(); shape++) {
+		if (!present[shape] && (shape != 1u || requested == ImageDimension::Dim2DArray)) {
+			missing[count++] = shapes[shape];
+		}
+	}
+	return count;
+}
+
+// Ordered by kind and null-padded to a bucket so the module survives heap streaming.
+void CanonicalizeIndirectImageTables(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                     ResourceSpecialization& specialization) {
+	struct Table {
+		uint32_t root;
+		size_t   begin;
+		size_t   end;
+	};
+	std::array<Table, ShaderInfo::MaxImages> tables;
+	size_t                                   table_count = 0;
+	const auto roots = program.info.images.size();
+	for (size_t index = roots; index < specialization.images.size(); index++) {
+		const auto root = specialization.images[index].indirect_root;
+		if (root < roots && FiniteImageTable(program, root)) {
+			continue;
+		}
+		if (table_count != 0u && tables[table_count - 1u].root == root &&
+		    tables[table_count - 1u].end == index) {
+			tables[table_count - 1u].end = index + 1u;
+		} else if (root < roots && table_count < tables.size()) {
+			tables[table_count++] = {root, index, index + 1u};
+		} else {
+			return;
+		}
+	}
+	const auto Kind = [&](uint32_t root, size_t index) {
+		const auto& descriptor = snapshot.images[index];
+		return (static_cast<uint32_t>(
+		            DescriptorDimension(descriptor, program.info.images[root].dimension))
+		        << 1u) |
+		       (DescriptorIsCube(descriptor) ? 1u : 0u);
+	};
+	for (size_t t = 0; t < table_count; t++) {
+		const auto& table = tables[t];
+		const auto  count = table.end - table.begin;
+		const auto  first = Kind(table.root, table.begin);
+		bool        mixed = false;
+		for (size_t index = table.begin + 1u; index < table.end && !mixed; index++) {
+			mixed = Kind(table.root, index) != first;
+		}
+		if (!mixed) {
+			continue;
+		}
+		// Stable, so the first-enumerated candidate of each kind still leads it.
+		static thread_local std::vector<uint32_t>        order;
+		static thread_local std::vector<uint32_t>        ordinal_of;
+		static thread_local std::vector<DescriptorValue> images;
+		order.resize(count);
+		std::iota(order.begin(), order.end(), 0u);
+		std::ranges::stable_sort(order, {}, [&](uint32_t child) {
+			return Kind(table.root, table.begin + child);
+		});
+		ordinal_of.assign(count + 1u, 0u);
+		images.assign(snapshot.images.begin() + static_cast<ptrdiff_t>(table.begin),
+		              snapshot.images.begin() + static_cast<ptrdiff_t>(table.end));
+		for (uint32_t position = 0; position < count; position++) {
+			snapshot.images[table.begin + position] = images[order[position]];
+			ordinal_of[order[position] + 1u]        = position + 1u;
+		}
+		// Children carry identical specializations until BuildResourceSpecialization reads them.
+		const auto slot    = IndirectMappingSlot(program, table.root);
+		const auto mapping = snapshot.flattened_srt[slot];
+		const auto keys    = snapshot.flattened_srt[mapping];
+		for (uint32_t entry = 0; entry < keys; entry++) {
+			auto& ordinal = snapshot.flattened_srt[mapping + 2u + entry * 2u];
+			ordinal       = ordinal_of[ordinal];
+		}
+	}
+	// The buckets only spare permutations; the shape arms keep the module, so they go first.
+	size_t reserved = 0;
+	for (size_t t = 0; t < table_count; t++) {
+		ShapeList missing;
+		reserved +=
+		    MissingShapes(program, snapshot, tables[t].root, tables[t].begin, tables[t].end, missing);
+	}
+	for (const bool fine: {false, true}) {
+		size_t padding = 0;
+		for (size_t t = 0; t < table_count; t++) {
+			const auto count = tables[t].end - tables[t].begin;
+			padding += IndirectImageBucket(count, fine) - count;
+		}
+		if (padding == 0u) {
+			return;
+		}
+		if (snapshot.images.size() + padding + reserved > ShaderInfo::MaxImages) {
+			continue;
+		}
+		DescriptorValue null_descriptor;
+		null_descriptor.dword_count = 8u;
+		null_descriptor.dwords.fill(0);
+		// Back to front, so the tables not yet padded keep their indices.
+		for (size_t t = table_count; t-- > 0u;) {
+			const auto& table = tables[t];
+			const auto  count = table.end - table.begin;
+			const auto  pad   = IndirectImageBucket(count, fine) - count;
+			const auto  child = specialization.images[table.begin];
+			snapshot.images.insert(snapshot.images.begin() + static_cast<ptrdiff_t>(table.end), pad,
+			                       null_descriptor);
+			specialization.images.insert(
+			    specialization.images.begin() + static_cast<ptrdiff_t>(table.end), pad, child);
+		}
+		return;
+	}
+}
+
+// Null candidates for shapes the heap lacks yet, so streaming never reaches the module.
+void PadIndirectImageShapes(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization) {
+	struct Table {
+		size_t    end;
+		ShapeList shapes;
+		uint32_t  count;
+	};
+	std::array<Table, ShaderInfo::MaxImages> tables;
+	size_t                                   table_count = 0;
+	size_t                                   added       = 0;
+	const auto                               roots       = program.info.images.size();
+	for (size_t index = roots; index < specialization.images.size();) {
+		const auto root = specialization.images[index].indirect_root;
+		if (root >= roots) {
+			return;
+		}
+		auto end = index;
+		while (end < specialization.images.size() &&
+		       specialization.images[end].indirect_root == root) {
+			end++;
+		}
+		auto& table = tables[table_count++];
+		table.end   = end;
+		table.count = FiniteImageTable(program, root)
+		                  ? 0u
+		                  : MissingShapes(program, snapshot, root, index, end, table.shapes);
+		added += table.count;
+		index = end;
+	}
+	if (added == 0u || snapshot.images.size() + added > ShaderInfo::MaxImages) {
+		return;
+	}
+	DescriptorValue null_descriptor;
+	null_descriptor.dword_count = 8u;
+	null_descriptor.dwords.fill(0);
+	// Back to front, so the tables not yet padded keep their indices.
+	for (size_t t = table_count; t-- > 0u;) {
+		const auto& table = tables[t];
+		for (uint32_t shape = 0; shape < table.count; shape++) {
+			auto child          = specialization.images[table.end - 1u];
+			child.dimension     = table.shapes[shape].first;
+			child.cube          = table.shapes[shape].second;
+			child.shape_padding = true;
+			const auto at       = static_cast<ptrdiff_t>(table.end + shape);
+			snapshot.images.insert(snapshot.images.begin() + at, null_descriptor);
+			specialization.images.insert(specialization.images.begin() + at, child);
+		}
+	}
+}
+
 } // namespace
 
 struct SamplerPlan {
@@ -1404,8 +1682,10 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		if (NullImageDescriptor(descriptor)) {
 			image.numeric_class = base.atomic ? Prospero::TextureNumericClass::Uint
 			                                  : Prospero::TextureNumericClass::Float;
-			image.dimension     = Decoder::ImageDimension::Dim2D;
-			image.cube          = false;
+			if (!image.shape_padding) {
+				image.dimension = Decoder::ImageDimension::Dim2D;
+				image.cube      = false;
+			}
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -1520,11 +1800,13 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			if (NullImageDescriptor(snapshot.images[candidate])) {
 				image.numeric_class     = image_class.numeric_class;
-				image.dimension         = image_class.dimension;
 				image.mip_count         = image_class.mip_count;
 				image.conversion_format = image_class.conversion_format;
 				image.shader_swizzle    = image_class.shader_swizzle;
-				image.cube              = image_class.cube;
+				if (!image.shape_padding) {
+					image.dimension = image_class.dimension;
+					image.cube      = image_class.cube;
+				}
 			}
 			const bool same_coordinates = image.dimension == image_class.dimension &&
 			                              image.cube == image_class.cube;
@@ -2163,6 +2445,8 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 			}
 		}
 	}
+	CanonicalizeIndirectImageTables(program, snapshot, specialization);
+	PadIndirectImageShapes(program, snapshot, specialization);
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
 		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
@@ -2181,7 +2465,8 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
-	return BuildResourceSpecialization(program, snapshot, specialization);
+	return BuildResourceSpecialization(program, snapshot, specialization) &&
+	       WriteIndirectImageSlots(program, snapshot, specialization);
 }
 
 // The caller holds one snapshot and one specialization per cached shader, and both outlive a
@@ -2284,7 +2569,7 @@ const char* FirstSpecializationDifference(const ResourceSpecialization& before,
 		if (a.shader_swizzle != b.shader_swizzle) {
 			return "image swizzle";
 		}
-		if (a.cube != b.cube || a.fmask != b.fmask) {
+		if (a.cube != b.cube || a.fmask != b.fmask || a.shape_padding != b.shape_padding) {
 			return "image kind";
 		}
 		if (a.indirect_root != b.indirect_root) {

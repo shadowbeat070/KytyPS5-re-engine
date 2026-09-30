@@ -900,7 +900,14 @@ void EmitProgram(EmitterState& state) {
 		dispatch.merge_label        = state.builder.AllocateId();
 		ctx.dispatcher_spills       = &dispatch.spills[0];
 		if (state.lane_count == 2) {
+			// In the low half's id order; the map is keyed by address, which varies per process.
+			std::vector<std::pair<uint32_t, const IR::Inst*>> low_half;
+			low_half.reserve(dispatch.spills[0].size());
 			for (const auto& [inst, id]: dispatch.spills[0]) {
+				low_half.emplace_back(id, inst);
+			}
+			std::ranges::sort(low_half);
+			for (const auto& [id, inst]: low_half) {
 				dispatch.spills[1].emplace(inst, state.builder.AllocateId());
 			}
 			high.dispatcher_spills = &dispatch.spills[1];

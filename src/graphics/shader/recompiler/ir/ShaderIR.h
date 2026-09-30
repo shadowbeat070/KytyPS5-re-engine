@@ -313,6 +313,21 @@ inline constexpr uint32_t FirstComparisonImageBinding = 22u;
 inline constexpr uint32_t FirstStorageImageBinding    = 29u;
 inline constexpr uint32_t ImageBindingCount           = 48u;
 
+// Fixed length, so neither module nor layout moves with the heap; ShaderInfo::MaxImages.
+inline constexpr uint32_t IndexedImageBindingElements = 256u;
+// An element of such a binding past the images it holds; the host binds its first element there.
+inline constexpr uint32_t PaddingImageResource = UINT32_MAX;
+// Bounds the looped search for any 32-bit key count; the key count never picks a permutation.
+inline constexpr uint32_t IndirectSearchIterations = 33u;
+
+// After the key/ordinal pairs: a count, then per ordinal shape << 16 | element.
+[[nodiscard]] constexpr uint32_t IndirectImageShape(Decoder::ImageDimension dimension, bool cube) {
+	return (static_cast<uint32_t>(dimension) << 1u) | (cube ? 1u : 0u);
+}
+[[nodiscard]] constexpr uint32_t IndirectImageSlot(uint32_t shape, uint32_t element) {
+	return (shape << 16u) | element;
+}
+
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
 	Samplers = FirstImageBinding + ImageBindingCount,
@@ -511,8 +526,8 @@ struct ShaderInfo {
 	// plus the buffers a shader tracks: 128 candidate slots and the 11 buffers RE9's two indirect
 	// tables track. 64 candidate slots would serve 63 keys, and both of those tables have already
 	// been measured reporting more than that (67 and 75). The device limits that bound it are the
-	// storage-buffer ones CreateDescriptorLayout now checks, and the emitted switch, at roughly 217
-	// SPIR-V words per candidate per access site.
+	// storage-buffer ones CreateDescriptorLayout now checks, and the emitted switch, which indexes
+	// contiguous candidates of one shape and costs an arm per candidate per access site otherwise.
 	static constexpr uint32_t MaxDenseBuffers = 138;
 	// Dense image slots a materialized shader may bind: the images it tracks plus the candidates an
 	// indirect image table expands into. Unlike MaxDenseBuffers above this is not a push-constant
@@ -550,6 +565,8 @@ struct ShaderInfo {
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
+
+static_assert(IndexedImageBindingElements == ShaderInfo::MaxImages);
 
 struct BlockInfo {
 	uint32_t        id       = 0;

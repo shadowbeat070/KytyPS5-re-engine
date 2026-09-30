@@ -1512,11 +1512,60 @@ bool IsIndirectBufferRoot(const ValueEmitContext& ctx, const IR::MemoryInfo& mem
 	       buffer.indirect_resources.size() >= 2u;
 }
 
+// Stride matters only for indexed/swizzled/lane-offset accesses, format only when formatted.
+struct IndirectBufferShape {
+	uint32_t               packed_stride      = 0;
+	Prospero::BufferFormat descriptor_format  = Prospero::BufferFormat::kInvalid;
+	uint32_t               descriptor_swizzle = 0;
+
+	bool operator==(const IndirectBufferShape&) const = default;
+};
+
+IndirectBufferShape IndirectBufferShapeOf(const EmitterState& state, const IR::Inst& inst,
+                                          const IR::MemoryInfo& mem, bool addressed,
+                                          uint32_t resource) {
+	const auto&         buffer = state.program.info.buffers[resource];
+	IndirectBufferShape shape {};
+	if (addressed) {
+		const auto index    = inst.Arg(1).Resolve();
+		const bool no_index = index.IsImmediate() && index.U32() == 0u &&
+		                      (buffer.packed_stride & (1u << 20u)) == 0u;
+		const bool swizzle =
+		    (buffer.packed_stride & 0x3fffu) != 0u && (buffer.packed_stride & (1u << 14u)) != 0u;
+		shape.packed_stride = no_index && !swizzle ? 0u : buffer.packed_stride;
+	}
+	if (mem.formatted) {
+		shape.descriptor_format  = buffer.descriptor_format;
+		shape.descriptor_swizzle = buffer.descriptor_swizzle;
+	}
+	return shape;
+}
+
+// Scopes the descriptor slot an access to `resource` indexes with instead of its own.
+struct DynamicBufferSlot {
+	DynamicBufferSlot(EmitterState& state_, uint32_t resource, uint32_t index, uint32_t byte_offset)
+	    : state(state_) {
+		state.dynamic_buffer_resource    = resource;
+		state.dynamic_buffer_index       = index;
+		state.dynamic_buffer_byte_offset = byte_offset;
+	}
+	~DynamicBufferSlot() {
+		state.dynamic_buffer_index       = 0;
+		state.dynamic_buffer_resource    = 0;
+		state.dynamic_buffer_byte_offset = 0;
+	}
+	DynamicBufferSlot(const DynamicBufferSlot&)            = delete;
+	DynamicBufferSlot& operator=(const DynamicBufferSlot&) = delete;
+
+	EmitterState& state;
+};
+
 // A pointer cannot be phi'd in logical addressing, so each arm holds its whole access.
 // Pass 0 as `result_type` for an access that produces no value.
 template <typename Fn>
 uint32_t EmitIndirectBufferSwitch(ValueEmitContext& ctx, const IR::Inst& inst,
-                                  const IR::MemoryInfo& mem, uint32_t result_type, Fn&& emit_for) {
+                                  const IR::MemoryInfo& mem, uint32_t result_type, bool addressed,
+                                  Fn&& emit_for) {
 	auto&       state  = ctx.state;
 	const auto& buffer = state.program.info.buffers[mem.resource];
 	const auto* handle = inst.Arg(0).Resolve().TryInstruction();
@@ -1524,37 +1573,114 @@ uint32_t EmitIndirectBufferSwitch(ValueEmitContext& ctx, const IR::Inst& inst,
 		ctx.Fail(inst, "indirect buffer access has no runtime key");
 		return result_type != 0 ? ConstantU32(state, 0) : 0u;
 	}
-	const auto selected =
-	    EmitIndirectCandidateSearch(state, buffer.indirect_mapping_offset,
-	                                buffer.indirect_search_iterations, ctx.Def(handle->Arg(0)));
-	const auto            candidates    = buffer.indirect_resources;
+	const auto  u32        = TypeU32(state);
+	const auto& candidates = buffer.indirect_resources;
+	const auto  count      = static_cast<uint32_t>(candidates.size());
+	const auto  key        = ctx.Def(handle->Arg(0));
+	const auto  search_key = std::make_pair(
+        state.current_block, std::array {state.lane_half, buffer.indirect_mapping_offset,
+                                         buffer.indirect_search_iterations, key});
+	auto found = 0u;
+	if (const auto cached = state.block_key_searches.find(search_key);
+	    state.current_block != nullptr && cached != state.block_key_searches.end()) {
+		found = cached->second;
+	} else {
+		found = EmitUnrolledCandidateSearch(state, buffer.indirect_mapping_offset,
+		                                    buffer.indirect_search_iterations, key);
+		if (state.current_block != nullptr) {
+			state.block_key_searches.emplace(search_key, found);
+		}
+	}
+
+	// Ordinal order, so group 0 holds the root, the arm a key that matched nothing falls to.
+	std::vector<uint32_t>            group_of(count, 0u);
+	std::vector<uint32_t>            group_ordinal;
+	std::vector<uint32_t>            group_size;
+	std::vector<IndirectBufferShape> group_shape;
+	for (uint32_t ordinal = 0; ordinal < count; ordinal++) {
+		const auto shape = IndirectBufferShapeOf(state, inst, mem, addressed, candidates[ordinal]);
+		const auto found_group = std::ranges::find(group_shape, shape);
+		const auto group       = static_cast<uint32_t>(found_group - group_shape.begin());
+		if (found_group == group_shape.end()) {
+			group_shape.push_back(shape);
+			group_ordinal.push_back(ordinal);
+			group_size.push_back(0u);
+		}
+		group_of[ordinal] = group;
+		group_size[group]++;
+	}
+	// Ordinal k must sit at the first candidate's slot + k - 1, or each candidate keeps an arm.
+	bool indexed = count >= 3u && std::ranges::any_of(group_size, [](uint32_t size) {
+		               return size > 1u;
+	               });
+	const auto first_slot =
+	    count >= 2u ? ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, candidates[1])
+	                : 0u;
+	for (uint32_t ordinal = 2; indexed && ordinal < count; ordinal++) {
+		indexed = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers,
+		                                candidates[ordinal]) == first_slot + ordinal - 1u;
+	}
+	if (!indexed) {
+		group_ordinal.resize(count);
+		group_size.assign(count, 1u);
+		for (uint32_t ordinal = 0; ordinal < count; ordinal++) {
+			group_ordinal[ordinal] = ordinal;
+			group_of[ordinal]      = ordinal;
+		}
+	}
+	// Clamped: the slot indexes the descriptor array directly, with no default arm.
+	const auto selected = indexed ? Select(state, u32,
+	                                       Binary(state, spv::OpULessThan, TypeBool(state), found,
+	                                              ConstantU32(state, count)),
+	                                       found, ConstantU32(state, 0u))
+	                              : found;
+	uint32_t slot        = 0;
+	uint32_t byte_offset = 0;
+	if (indexed) {
+		const auto root_slot =
+		    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, candidates[0]);
+		slot = Select(state, u32,
+		              Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, 0u)),
+		              ConstantU32(state, root_slot),
+		              Binary(state, spv::OpIAdd, u32, selected, ConstantU32(state, first_slot - 1u)));
+		state.builder.AddAnnotation(spv::OpDecorate, slot, spv::DecorationNonUniform);
+		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireCapability(spv::CapabilityStorageBufferArrayNonUniformIndexing);
+		byte_offset = EmitDynamicMemoryByteOffset(state, slot);
+	}
+	const auto emit_arm = [&](uint32_t group) {
+		auto per_candidate     = mem;
+		per_candidate.resource = candidates[group_ordinal[group]];
+		if (group_size[group] == 1u) {
+			return emit_for(per_candidate);
+		}
+		const DynamicBufferSlot scope(state, per_candidate.resource, slot, byte_offset);
+		return emit_for(per_candidate);
+	};
+	if (group_ordinal.size() == 1u) {
+		return emit_arm(0u);
+	}
 	const auto            default_label = state.builder.AllocateId();
 	const auto            merge_label   = state.builder.AllocateId();
-	std::vector<uint32_t> labels(candidates.size() - 1u);
+	std::vector<uint32_t> labels(group_ordinal.size(), default_label);
+	for (uint32_t group = 1; group < group_ordinal.size(); group++) {
+		labels[group] = state.builder.AllocateId();
+	}
+	// Only an ordinal outside the root's group needs a literal; the rest reach it by default.
 	std::vector<uint32_t> switch_words {spv::OpSwitch, selected, default_label};
-	for (uint32_t candidate = 1; candidate < candidates.size(); candidate++) {
-		labels[candidate - 1u] = state.builder.AllocateId();
-		switch_words.push_back(candidate);
-		switch_words.push_back(labels[candidate - 1u]);
+	for (uint32_t ordinal = 1; ordinal < count; ordinal++) {
+		if (group_of[ordinal] != 0u) {
+			switch_words.push_back(ordinal);
+			switch_words.push_back(labels[group_of[ordinal]]);
+		}
 	}
 	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(switch_words);
-	const auto emit_arm = [&](uint32_t resource) {
-		auto per_candidate     = mem;
-		per_candidate.resource = resource;
-		return emit_for(per_candidate);
-	};
 	std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
-	EmitLabel(state, default_label);
-	const auto default_value = emit_arm(candidates[0]);
-	if (result_type != 0) {
-		phi_words.push_back(default_value);
-		phi_words.push_back(state.current_label);
-	}
-	state.builder.AddFunction(spv::OpBranch, merge_label);
-	for (uint32_t candidate = 1; candidate < candidates.size(); candidate++) {
-		EmitLabel(state, labels[candidate - 1u]);
-		const auto value = emit_arm(candidates[candidate]);
+	for (uint32_t group = 0; group < group_ordinal.size(); group++) {
+		EmitLabel(state, labels[group]);
+		const auto value = emit_arm(group);
 		if (result_type != 0) {
 			phi_words.push_back(value);
 			phi_words.push_back(state.current_label);
@@ -1592,7 +1718,7 @@ uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 		});
 	};
 	if (IsIndirectBufferRoot(ctx, mem)) {
-		return EmitIndirectBufferSwitch(ctx, inst, mem, TypeU32(ctx.state), atomic);
+		return EmitIndirectBufferSwitch(ctx, inst, mem, TypeU32(ctx.state), true, atomic);
 	}
 	return atomic(mem);
 }
@@ -1615,7 +1741,7 @@ uint32_t EmitBufferAtomic64(ValueEmitContext& ctx, const IR::Inst& inst) {
 		    });
 	}
 	if (IsIndirectBufferRoot(ctx, mem)) {
-		return EmitIndirectBufferSwitch(ctx, inst, mem, TypeU64(ctx.state),
+		return EmitIndirectBufferSwitch(ctx, inst, mem, TypeU64(ctx.state), true,
 		                                [&](const IR::MemoryInfo& access) {
 			                                return EmitBufferAtomic64For(ctx, inst, access);
 		                                });
@@ -1823,7 +1949,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	// An expanded table leaves the root naming nothing, so a scalar read of the record payload has
 	// to pick its candidate the same way a load or a store does.
 	if (IsIndirectBufferRoot(ctx, mem)) {
-		ctx.Define(inst, EmitIndirectBufferSwitch(ctx, inst, mem, TypeU32(state), read));
+		ctx.Define(inst, EmitIndirectBufferSwitch(ctx, inst, mem, TypeU32(state), false, read));
 		return;
 	}
 	ctx.Define(inst, read(mem));
@@ -1866,7 +1992,7 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto result_type = buffer_components > 1u
 		                             ? TypeU32Composite(ctx.state, buffer_components)
 		                             : TypeU32(ctx.state);
-		ctx.Define(inst, EmitIndirectBufferSwitch(ctx, inst, mem, result_type, load));
+		ctx.Define(inst, EmitIndirectBufferSwitch(ctx, inst, mem, result_type, true, load));
 		return;
 	}
 	ctx.Define(inst, load(mem));
@@ -1947,7 +2073,7 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	};
 	if (IsIndirectBufferRoot(ctx, mem)) {
 		// No result to merge: the switch is emitted for its side effects and the phi is skipped.
-		EmitIndirectBufferSwitch(ctx, inst, mem, 0u, store);
+		EmitIndirectBufferSwitch(ctx, inst, mem, 0u, true, store);
 		return;
 	}
 	store(mem);

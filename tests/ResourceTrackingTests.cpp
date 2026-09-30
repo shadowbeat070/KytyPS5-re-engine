@@ -41,6 +41,12 @@ uint32_t MappingOf(const ResourceSnapshot &snapshot, uint32_t slot) {
                                               : std::numeric_limits<uint32_t>::max();
 }
 
+// The null shape arms sit at the end of their table, so these indices hold.
+size_t Materialized(const ResourceSpecialization &specialization) {
+  return static_cast<size_t>(std::ranges::count_if(
+      specialization.images, [](const auto &image) { return !image.shape_padding; }));
+}
+
 bool SameResourceSnapshot(const ResourceSnapshot &lhs,
                           const ResourceSnapshot &rhs) {
   return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
@@ -555,7 +561,7 @@ void TestInvariantIndirectImageMaterialization() {
   ResourceSpecialization specialization;
   // Image 0 is the miss slot and is always null; the enumerated keys start at 1.
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2 &&
+            Materialized(specialization) == 2 &&
             std::ranges::all_of(snapshot.images[0].dwords,
                                 [](uint32_t dword) { return dword == 0u; }) &&
             std::equal(image_descriptor.begin(), image_descriptor.end(),
@@ -614,8 +620,8 @@ void TestInvariantIndirectImageMaterialization() {
   ResourceSpecialization dynamic_specialization;
   Check(MaterializeResources(resource_plan, runtime, dynamic_snapshot,
                              dynamic_specialization) &&
-            dynamic_snapshot.images.size() == 3 &&
-            dynamic_specialization.images.size() == 3,
+            Materialized(dynamic_specialization) == 3 &&
+            dynamic_snapshot.images.size() == dynamic_specialization.images.size(),
         "dynamic indirect image table did not materialize");
   const auto second_image = (0x2020u - memory.base) / 4u;
   memory.words[second_image + 1u] |= 3u << 30u;
@@ -652,20 +658,24 @@ void TestInvariantIndirectImageMaterialization() {
     memory.words[second_image + dword] = image_descriptor[dword];
   }
   ApplyResourceSpecialization(fixture->program, dynamic_specialization);
-  // One tracked image becomes three resources: the null miss slot plus the two keys.
-  Check(fixture->program.info.images.size() == 3 &&
+  // Null miss slot, the two keys, then a null cube arm no key names.
+  Check(fixture->program.info.images.size() == 4 &&
             fixture->program.info.images[0].indirect_root == 0 &&
             fixture->program.info.images[0].indirect_search_iterations != 0 &&
-            fixture->program.info.images[0].indirect_resources.size() == 3 &&
-            dynamic_snapshot.images.size() == 3,
+            fixture->program.info.images[0].indirect_resources.size() == 4 &&
+            fixture->program.info.images[3].cube &&
+            dynamic_snapshot.images.size() == 4,
         "dynamic indirect image table was not specialized transactionally");
   const auto &mapping = dynamic_specialization.images[0];
   const auto mapping_offset =
       MappingOf(dynamic_snapshot, mapping.indirect_mapping_offset);
   const auto key_count = dynamic_snapshot.flattened_srt[mapping_offset];
-  Check(mapping.indirect_search_iterations == std::bit_width(key_count) &&
-            mapping_offset + 1u + key_count * 2u ==
-                dynamic_snapshot.flattened_srt.size(),
+  // The depth is one constant; the mapping holds exactly the keys, then a slot word per ordinal.
+  const auto slot_words = mapping_offset + 1u + key_count * 2u;
+  Check(mapping.indirect_search_iterations == IndirectSearchIterations &&
+            slot_words < dynamic_snapshot.flattened_srt.size() &&
+            dynamic_snapshot.flattened_srt[slot_words] == 3u &&
+            slot_words + 1u + 3u == dynamic_snapshot.flattened_srt.size(),
         "indirect image mapping retained worst-case padding");
 
   for (uint32_t dword = 0; dword < image_descriptor.size(); dword++) {
@@ -789,7 +799,7 @@ void TestInvariantIndirectImageMaterialization() {
                              .read_specialization_memory = ReadLinearTestMemory};
     // Image 0 is the miss slot and is always null; the enumerated key is image 1.
     Check(MaterializeResources(split_plan, split_runtime, snapshot, specialization) &&
-              snapshot.images.size() == 2 &&
+              Materialized(specialization) == 2 &&
               std::ranges::all_of(snapshot.images[0].dwords,
                                   [](uint32_t word) { return word == 0u; }) &&
               snapshot.images[1].dwords == image_descriptor &&
@@ -981,7 +991,8 @@ void TestGuardedDirectImageTable() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 33u && specialization.images.size() == 33u &&
+            Materialized(specialization) == 33u &&
+            snapshot.images.size() == specialization.images.size() &&
             snapshot.flattened_srt[MappingOf(snapshot, specialization.images[0].indirect_mapping_offset)] == 32u &&
             memory.reads == 34u && memory.descriptor_reads == 32u,
         "direct table did not retain all 32 reachable descriptors");
@@ -993,11 +1004,13 @@ void TestGuardedDirectImageTable() {
   std::copy(captured_invalid.begin(), captured_invalid.end(),
              memory.words.begin() + captured_word);
   // The record no longer parses, so its key maps to the miss slot rather than to an image of its
-  // own: one fewer resource, the same 32 keys.
+  // own: one fewer candidate, the same 32 keys, and its slot stays in the bucket as null.
   const auto mapping_base =
       MappingOf(snapshot, specialization.images[0].indirect_mapping_offset);
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 32u &&
+            Materialized(specialization) == 33u &&
+            std::ranges::all_of(snapshot.images[32].dwords,
+                                [](uint32_t word) { return word == 0u; }) &&
             snapshot.flattened_srt[mapping_base] == 32u &&
             snapshot.flattened_srt[mapping_base + 2u + 16u * 2u] == 0u &&
             std::ranges::all_of(snapshot.images[0].dwords,
@@ -1314,13 +1327,13 @@ void TestBoundedComputeImageLoop() {
   }
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
-    // count keys plus the miss slot the search falls back to.
+    // count keys, padded to their bucket, plus the miss slot the search falls back to.
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-              snapshot.images.size() == count + 1u &&
-              specialization.images.size() == count + 1u &&
+              Materialized(specialization) == std::bit_ceil(count) + 1u &&
+              snapshot.images.size() == specialization.images.size() &&
               snapshot.flattened_srt[MappingOf(
                   snapshot, specialization.images[0].indirect_mapping_offset)] == count &&
-              snapshot.images.back().dwords[0] == 0x100u + count - 1u,
+              snapshot.images[count].dwords[0] == 0x100u + count - 1u,
           "compute image table did not refresh for a changed loop bound");
   }
   for (const uint32_t count : {0u, UINT32_MAX}) {
@@ -1664,7 +1677,7 @@ void TestUniformizedMaterialImageKeys() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 3u &&
+            Materialized(specialization) == 3u &&
             memory.reads == 4u && memory.descriptor_reads == 2u &&
             snapshot.flattened_srt[MappingOf(
                 snapshot, specialization.images[0].indirect_mapping_offset)] == 2u &&
@@ -3948,7 +3961,7 @@ void TestStridedIndirectImageTable() {
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
   Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
-            snapshot.images.size() == 2 &&
+            Materialized(specialization) == 2 &&
             std::equal(image_descriptor.begin(), image_descriptor.end(),
                        snapshot.images[1].dwords.begin()),
         "strided indirect image table did not materialize its records");
@@ -4064,6 +4077,64 @@ void TestIndirectImageSelectionResolvesEveryKey() {
   Check(std::ranges::all_of(snapshot.images[Resolve(0x4321u)].dwords,
                             [](uint32_t word) { return word == 0u; }),
         "an unresolved key selected heap record 0 instead of nothing");
+
+  // With two cubes, every key still lands on its record, 2D sorts first, and padding names nothing.
+  const auto is_null = [](const DescriptorValue &image) {
+    return std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+  };
+  for (const auto key : {3u, 9u}) {
+    const auto at = (kHeapBase - memory.base + key * kHeapStride + kHeapOffset) / 4u;
+    memory.words[at + 1u] |= 3u << 30u;
+    memory.words[at + 2u] = 3u << 14u;
+    memory.words[at + 3u] =
+        Libs::Graphics::DstSel(4, 5, 6, 7) |
+        (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube) << 28u);
+    memory.words[at + 4u] = 11u;
+  }
+  ResourceSnapshot mixed;
+  ResourceSpecialization mixed_specialization;
+  Check(MaterializeResources(resource_plan, runtime, mixed, mixed_specialization),
+        "a heap holding cube records did not materialize");
+  const auto mixed_root = mixed_specialization.images[0];
+  const auto mixed_table = mixed.flattened_srt[mixed_root.indirect_mapping_offset];
+  const auto mixed_count = mixed.flattened_srt[mixed_table];
+  const auto ResolveMixed = [&](uint32_t key) {
+    uint32_t low = 0;
+    uint32_t high = mixed_count;
+    uint32_t selected = 0;
+    for (uint32_t iteration = 0; iteration < mixed_root.indirect_search_iterations; iteration++) {
+      const bool active = low < high;
+      const auto mid = active ? (low + high) / 2u : 0u;
+      const auto entry = mixed_table + mid * 2u + 1u;
+      if (active && mixed.flattened_srt[entry] == key) selected = mixed.flattened_srt[entry + 1u];
+      if (active && mixed.flattened_srt[entry] < key) low = mid + 1u;
+      else if (active) high = mid;
+    }
+    return selected;
+  };
+  for (const auto key : keys) {
+    const auto ordinal = ResolveMixed(key);
+    Check(ordinal < mixed.images.size() && mixed.images[ordinal].dwords[0] == 0x20u + key * 0x40u,
+          "reordering the candidates by kind sent a key to another record");
+  }
+  Check(is_null(mixed.images[ResolveMixed(0x4321u)]),
+        "reordering the candidates by kind gave an unresolved key a record");
+  const auto cube_at = [&](size_t index) {
+    return ((mixed.images[index].dwords[3] >> 28u) & 0xfu) ==
+           static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kCube);
+  };
+  size_t live = 0;
+  bool grouped = true;
+  for (size_t index = 1; index < mixed.images.size(); index++) {
+    if (is_null(mixed.images[index])) continue;
+    live++;
+    grouped &= index == 1u || cube_at(index) || !cube_at(index - 1u);
+  }
+  const auto padded = Materialized(mixed_specialization) - 1u;
+  Check(grouped && live >= 2u && padded == std::bit_ceil(live) &&
+            std::all_of(mixed.images.begin() + 1 + static_cast<ptrdiff_t>(live),
+                        mixed.images.end(), is_null),
+        "the candidates were not grouped by kind and padded to a null-filled bucket");
 }
 
 // A refused table used to report only that it was refused. Each clause now names itself and the
@@ -4108,14 +4179,12 @@ void TestIndirectImageRefusalNamesItselfAndIsMemoed() {
         "the memo outlived the descriptors that produced it");
 }
 
-// Refuses anything wider than one heap record, so every span and window falls back to the reads
-// the enumeration made one record at a time.
+// Refuses anything wider than one heap record, forcing the per-record fallback.
 bool ReadOneRecordAtATime(void *userdata, uint64_t address, std::span<uint32_t> values) {
   return values.size() <= 8u && ReadLinearTestMemory(userdata, address, values);
 }
 
-// A large table is read in spans and windows; the result, and the record a refusal names, must be
-// exactly what reading one record at a time produces.
+// Spans and windows must match per-record reads, including the record a refusal names.
 void TestLargeIndirectTablesReadInSpans() {
   constexpr uint32_t kRecords = 4096u;
   constexpr uint32_t kKeys = 1024u;
@@ -4156,7 +4225,14 @@ void TestLargeIndirectTablesReadInSpans() {
   Check(MaterializeResources(plan, single, single_snapshot, single_specialization) &&
             memory.reads > kRecords,
         "the one-record reader did not fall back to per-record reads");
-  Check(spanned_snapshot.images.size() == kDistinct + 1u &&
+  // 200 candidates cannot take a 256 bucket beside the root: 224 slots, the last 24 null.
+  Check(Materialized(spanned_specialization) == 224u + 1u &&
+            std::all_of(spanned_snapshot.images.begin() + kDistinct + 1u,
+                        spanned_snapshot.images.end(),
+                        [](const DescriptorValue &image) {
+                          return std::ranges::all_of(image.dwords,
+                                                     [](uint32_t word) { return word == 0u; });
+                        }) &&
             SameResourceSnapshot(spanned_snapshot, single_snapshot) &&
             spanned_specialization == single_specialization,
         "reading a table in spans changed what it materializes");
@@ -4182,8 +4258,7 @@ void TestLargeIndirectTablesReadInSpans() {
   }
   memory.fail_address = UINT64_MAX;
 
-  // A remembered buffer table answers with exactly what enumerating it produced, and a rewritten
-  // record is seen on the next dispatch.
+  // A remembered buffer table reproduces its enumeration and sees a rewritten record.
   constexpr uint32_t kStride = 48u;
   auto buffer_fixture = MakeIndirectBufferFixture(kStride, false);
   buffer_fixture->PlanAndTrack();

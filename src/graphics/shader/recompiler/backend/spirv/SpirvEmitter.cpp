@@ -49,6 +49,12 @@ void ValidateNativeProgram(const IR::Program& program, bool lds_storage) {
 		expected[static_cast<size_t>(*kind)].insert(expected[static_cast<size_t>(*kind)].end(),
 		                                            count, i);
 	}
+	for (uint32_t group = 0; group < IR::ImageBindingCount; group++) {
+		auto& resources = expected[IR::FirstImageBinding + group];
+		if (!resources.empty()) {
+			IR::PadIndexedImageBinding(program.info, resources);
+		}
+	}
 	if (!program.info.samplers.empty()) {
 		Expect(Kind::Samplers, Dense(program.info.samplers.size()));
 	}

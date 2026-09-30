@@ -35,6 +35,8 @@ struct ResourceSpecialization {
 		uint32_t                      indirect_feedback_keys     = 0;
 		bool                          cube                       = false;
 		bool                          fmask                      = false;
+		// A null candidate no key names, there only so its table always has an arm of this shape.
+		bool                          shape_padding              = false;
 		bool                          operator==(const Image&) const = default;
 	};
 

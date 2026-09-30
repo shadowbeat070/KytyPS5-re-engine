@@ -758,7 +758,7 @@ uint32_t LoadFlattenedSrtWord(EmitterState& state, uint32_t index) {
 	return value;
 }
 
-uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
+uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
                                      uint32_t iterations, uint32_t key) {
 	const auto LoadMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
@@ -813,6 +813,76 @@ uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
 		high = next_high;
 	}
 	return selected;
+}
+
+IndirectCandidateSearch EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
+                                                    uint32_t key) {
+	const auto LoadMapping = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	// Where the mapping sits is an allocation result: it moves when any earlier table's key count
+	// moves, and a constant here would put that in the module and in the permutation key, so one
+	// table gaining a key would rebuild every table after it. The directory slot is a function of
+	// the resource index alone, so it is the constant, and the offset is loaded through it.
+	IndirectCandidateSearch search;
+	search.mapping     = LoadMapping(ConstantU32(state, mapping_slot));
+	search.count       = LoadMapping(search.mapping);
+	const auto entry   = state.current_label;
+	const auto header  = state.builder.AllocateId();
+	const auto body    = state.builder.AllocateId();
+	const auto cont    = state.builder.AllocateId();
+	const auto merge   = state.builder.AllocateId();
+	const auto low     = state.builder.AllocateId();
+	const auto high    = state.builder.AllocateId();
+	search.selected    = state.builder.AllocateId();
+	const auto next_low      = state.builder.AllocateId();
+	const auto next_high     = state.builder.AllocateId();
+	const auto next_selected = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, header);
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), low, ConstantU32(state, 0u), entry,
+	                          next_low, cont);
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), high, search.count, entry, next_high,
+	                          cont);
+	state.builder.AddFunction(spv::OpPhi, TypeU32(state), search.selected, ConstantU32(state, 0u),
+	                          entry, next_selected, cont);
+	const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
+	state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, active, body, merge);
+	EmitLabel(state, body);
+	// Halving the distance rather than the sum cannot wrap, so every step shrinks the range.
+	const auto mid = Binary(state, spv::OpIAdd, TypeU32(state), low,
+	                        Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	                               Binary(state, spv::OpISub, TypeU32(state), high, low),
+	                               ConstantU32(state, 1u)));
+	const auto pair = Binary(state, spv::OpIAdd, TypeU32(state), search.mapping,
+	                         Binary(state, spv::OpIAdd, TypeU32(state),
+	                                Binary(state, spv::OpShiftLeftLogical, TypeU32(state), mid,
+	                                       ConstantU32(state, 1u)),
+	                                ConstantU32(state, 1u)));
+	const auto mapped_key = LoadMapping(pair);
+	const auto candidate =
+	    LoadMapping(Binary(state, spv::OpIAdd, TypeU32(state), pair, ConstantU32(state, 1u)));
+	const auto equal = Binary(state, spv::OpIEqual, TypeBool(state), mapped_key, key);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_selected, equal, candidate,
+	                          search.selected);
+	const auto less = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_low, less,
+	                          Binary(state, spv::OpIAdd, TypeU32(state), mid,
+	                                 ConstantU32(state, 1u)),
+	                          low);
+	state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_high, less, high, mid);
+	state.builder.AddFunction(spv::OpBranch, cont);
+	EmitLabel(state, cont);
+	state.builder.AddFunction(spv::OpBranch, header);
+	EmitLabel(state, merge);
+	return search;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

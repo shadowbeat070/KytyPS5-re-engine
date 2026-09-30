@@ -120,6 +120,18 @@ bool UsesFlattenedSrt(const Program& program) {
 	});
 }
 
+void PadIndexedImageBinding(const ShaderInfo& info, std::vector<uint32_t>& resources) {
+	if (std::ranges::none_of(resources, [&](uint32_t resource) {
+		    return info.images[resource].indirect_root != ImageResource::NoIndirectImage;
+	    })) {
+		return;
+	}
+	if (resources.size() > IndexedImageBindingElements) {
+		BindingFail("an indexed image binding holds more images than it can be padded to");
+	}
+	resources.resize(IndexedImageBindingElements, PaddingImageResource);
+}
+
 void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {
 	if (!program.shader_info_complete || program.binding_layout_complete) {
 		EXIT("shader binding layout failed: %s", !program.shader_info_complete
@@ -160,6 +172,7 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 	}
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {
+			PadIndexedImageBinding(program.info, image_groups[i]);
 			AddBinding(next, static_cast<DescriptorBindingKind>(FirstImageBinding + i),
 			           std::move(image_groups[i]));
 		}

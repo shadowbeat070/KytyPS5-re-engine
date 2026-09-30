@@ -953,34 +953,73 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			return;
 		}
 		// The slot holds this table's mapping offset; the mapping's first word is its key count.
-		const auto selected = EmitIndirectCandidateSearch(state, image.indirect_mapping_offset,
-		                                                  image.indirect_search_iterations, key);
-		const auto            default_label = state.builder.AllocateId();
-		const auto            merge_label   = state.builder.AllocateId();
-		std::vector<uint32_t> labels(image.indirect_resources.size() - 1u);
-		std::vector<uint32_t> switch_words {spv::OpSwitch, selected, default_label};
-		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
-			labels[candidate - 1u] = state.builder.AllocateId();
-			switch_words.push_back(candidate);
-			switch_words.push_back(labels[candidate - 1u]);
+		const auto search = EmitIndirectCandidateSearch(state, image.indirect_mapping_offset, key);
+		// Past the pairs and the slot-word count: the selected ordinal's shape and element.
+		const auto slot_index = Binary(
+		    state, spv::OpIAdd, TypeU32(state), search.mapping,
+		    Binary(state, spv::OpIAdd, TypeU32(state),
+		           Binary(state, spv::OpShiftLeftLogical, TypeU32(state), search.count,
+		                  ConstantU32(state, 1u)),
+		           Binary(state, spv::OpIAdd, TypeU32(state), search.selected,
+		                  ConstantU32(state, 2u))));
+		const auto slot_pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          slot_pointer, state.flattened_srt_variable,
+		                          ConstantU32(state, 0), slot_index);
+		const auto slot = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), slot, slot_pointer);
+		const auto element =
+		    Binary(state, spv::OpBitwiseAnd, TypeU32(state), slot, ConstantU32(state, 0xffffu));
+		// One arm per shape, so the candidates' count and order stay out of the module.
+		std::vector<std::pair<uint32_t, uint32_t>> arms;
+		for (const auto resource: image.indirect_resources) {
+			const auto& candidate = state.program.info.images[resource];
+			const auto  shape     = IR::IndirectImageShape(candidate.dimension, candidate.cube);
+			if (std::ranges::none_of(arms, [&](const auto& arm) { return arm.first == shape; })) {
+				arms.emplace_back(shape, resource);
+			}
 		}
-		state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
-		                          spv::SelectionControlMaskNone);
-		state.builder.AddFunction(switch_words);
-		std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
-		EmitLabel(state, default_label);
-		phi_words.push_back(EmitSample(image.indirect_resources[0]));
-		phi_words.push_back(default_label);
-		state.builder.AddFunction(spv::OpBranch, merge_label);
-		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
-			EmitLabel(state, labels[candidate - 1u]);
-			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
-			phi_words.push_back(labels[candidate - 1u]);
-			state.builder.AddFunction(spv::OpBranch, merge_label);
+		std::ranges::sort(arms);
+		state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+		state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+		state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+		const auto EmitArm = [&](uint32_t resource) {
+			state.dynamic_image_index    = element;
+			state.dynamic_image_resource = resource;
+			const auto sample            = EmitSample(resource);
+			state.dynamic_image_index    = 0;
+			return sample;
+		};
+		auto result = 0u;
+		if (arms.size() == 1u) {
+			result = EmitArm(arms[0].second);
+		} else {
+			const auto shape =
+			    Binary(state, spv::OpShiftRightLogical, TypeU32(state), slot, ConstantU32(state, 16u));
+			const auto            merge_label = state.builder.AllocateId();
+			std::vector<uint32_t> labels(arms.size());
+			std::vector<uint32_t> switch_words {spv::OpSwitch, shape};
+			for (uint32_t arm = 0; arm < arms.size(); arm++) {
+				labels[arm] = state.builder.AllocateId();
+				if (arm != 0u) {
+					switch_words.push_back(arms[arm].first);
+				}
+				switch_words.push_back(labels[arm]);
+			}
+			state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
+			                          spv::SelectionControlMaskNone);
+			state.builder.AddFunction(switch_words);
+			std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
+			for (uint32_t arm = 0; arm < arms.size(); arm++) {
+				EmitLabel(state, labels[arm]);
+				phi_words.push_back(EmitArm(arms[arm].second));
+				phi_words.push_back(state.current_label);
+				state.builder.AddFunction(spv::OpBranch, merge_label);
+			}
+			EmitLabel(state, merge_label);
+			state.builder.AddFunction(phi_words);
+			result = phi_words[2];
 		}
-		EmitLabel(state, merge_label);
-		state.builder.AddFunction(phi_words);
-		auto result = phi_words[2];
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
 		}

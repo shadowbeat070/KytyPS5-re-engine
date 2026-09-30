@@ -163,6 +163,8 @@ struct EmitterState {
 	uint32_t                   entry_label                           = 0;
 	uint32_t                   current_label                         = 0;
 	const IR::Block*           current_block                         = nullptr;
+	// Key searches emitted at a block's top level, reused by later accesses in that block.
+	std::map<std::pair<const IR::Block*, std::array<uint32_t, 4>>, uint32_t> block_key_searches;
 	uint32_t                   pixel_valid_mask_variable             = 0;
 	uint32_t                   stencil_bit_pass_variable             = 0;
 	// Loop budget guard: when armed, every loop header this emitter can reach charges one unit
@@ -487,17 +489,24 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                          uint32_t index, uint32_t pointer_type);
 
-// Walks the key-to-candidate mapping the host laid out in the flattened SRT and yields the
-// candidate slot the key names, or zero when the mapping does not hold it. Branchless: the search
-// always runs its full iteration count, so it stays one basic block whatever the key is. Images and
-// buffers lay their mappings out identically and share this.
 // One word of the flattened SRT by constant index.
 uint32_t LoadFlattenedSrtWord(EmitterState& state, uint32_t index);
 
+struct IndirectCandidateSearch {
+	uint32_t selected = 0;
+	uint32_t mapping  = 0;
+	uint32_t count    = 0;
+};
+
+// Unrolled: a loop per access made large buffer-table modules compile for seconds.
+uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
+                                     uint32_t iterations, uint32_t key);
+
+// A loop, so the key count never reaches the module; image tables only.
 // `mapping_slot` indexes the flattened SRT's directory, which holds the table's real mapping
 // offset. The offset itself never reaches the module - see ResourceMaterialization.cpp.
-uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
-                                     uint32_t iterations, uint32_t key);
+IndirectCandidateSearch EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_slot,
+                                                    uint32_t key);
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
 

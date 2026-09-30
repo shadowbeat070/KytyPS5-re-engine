@@ -15,6 +15,8 @@ struct SharedMemoryResources {
 
 SharedMemoryResources CollectMemoryResources(const Program& program, std::vector<uint32_t>& buffers);
 bool UsesFlattenedSrt(const Program& program);
+// Pads an image binding holding an indirect table's candidates to IndexedImageBindingElements.
+void PadIndexedImageBinding(const ShaderInfo& info, std::vector<uint32_t>& resources);
 
 const DescriptorBinding* FindBinding(const BindingLayout& layout, DescriptorBindingKind kind);
 

@@ -420,7 +420,11 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.info.samples         = 1;
 	desc.info.mip_layout[0]   = {0, 0, 1, 1};
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
-	desc.view_info.type       = vk::ImageViewType::e2D;
+	// An indirect table's null candidate can sit in a 2D-array binding, cube shapes included.
+	desc.view_info.type =
+	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+	        ? vk::ImageViewType::e2DArray
+	        : vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage
@@ -1325,6 +1329,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			if (ShaderRecompiler::IR::ImageBindingResourceClass(binding.kind) !=
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
 				for (const auto resource: binding.resources) {
+					if (resource == ShaderRecompiler::IR::PaddingImageResource) {
+						const auto first = m_descriptor_images[image_start];
+						m_descriptor_images.push_back(first);
+						continue;
+					}
 					m_descriptor_images.push_back(MakeImageInfo(
 					    descriptors.images.at(resource), m_image_occurrences.at(resource)++));
 				}
