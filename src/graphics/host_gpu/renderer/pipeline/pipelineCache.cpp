@@ -760,8 +760,13 @@ struct PipelineCache::ProgramCache {
 			stage = ShaderType::Compute;
 		}
 
+		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		const auto  code_key   = ShaderCodeKey(params.code, params.back_code);
+		uint64_t   code_key  = 0;
+		{
+			KYTY_PROFILER_BLOCK("ProgramCache::ShaderCodeKey");
+			code_key = ShaderCodeKey(params.code, params.back_code);
+		}
 		auto&       proven     = unfoldable[code_key];
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
@@ -799,6 +804,7 @@ struct PipelineCache::ProgramCache {
 				ReportUnmaterialized(stage, params.hash);
 				return {};
 			}
+			KYTY_PROFILER_BLOCK("ProgramCache permutation search");
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -1566,6 +1572,7 @@ void PipelineCache::GetStencilBitPrograms(const ShaderParams&         pixel_para
 ShaderProgram PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                const HW::ShaderRegisters&   sh,
                                                ShaderComputeInputInfo&      input_info) {
+	KYTY_PROFILER_FUNCTION();
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 	const auto        params      = PrepareProgram(regs, sh, input_info);
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
