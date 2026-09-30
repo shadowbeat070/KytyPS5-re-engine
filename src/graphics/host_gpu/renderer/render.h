@@ -74,6 +74,42 @@ struct DrawAutoArgs {
 	uint32_t         render_target_slice_offset = 0;
 };
 
+// Guest indirect records share the layouts of Vulkan's indirect commands.
+struct IndirectDrawArgs {
+	uint64_t args_addr                  = 0;
+	uint32_t max_count                  = 1;
+	uint32_t stride                     = 0;
+	// Guest dword that caps the record count at execution time, or 0.
+	uint64_t count_addr                 = 0;
+	bool     indexed                    = false;
+	uint32_t index_type_and_size        = 0;
+	uint64_t index_base_addr            = 0;
+	// In elements; the whole buffer is bound because the first index is only known on the GPU.
+	uint32_t index_buffer_size          = 0;
+	uint32_t render_target_slice_offset = 0;
+};
+
+// Drawn, or why the draw needs its counts on the CPU.
+enum class IndirectDrawResult : uint8_t {
+	Drawn,
+	MissingFeature,
+	Misaligned,
+	ArgsUnmapped,
+	MergedGeometry,
+	QuadList,
+	ColorResolve,
+	DepthStencilCopy,
+	IndexType,
+	IndexBufferUnset,
+	IndexBufferTooLarge,
+	IndexBufferUnmapped,
+	CustomRestart,
+	MeshStage,
+	Count,
+};
+
+[[nodiscard]] const char* IndirectDrawResultName(IndirectDrawResult result);
+
 struct SubmitInfo {
 	static constexpr uint32_t MaxSemaphores = 3;
 
@@ -176,6 +212,9 @@ public:
 private:
 	void DrawIndex(uint64_t submit_id, CommandBuffer& buffer, const DrawIndexArgs& args);
 	void DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const DrawAutoArgs& args);
+	// A refusal records nothing; the caller then reads the arguments on the CPU.
+	[[nodiscard]] IndirectDrawResult DrawIndirect(uint64_t submit_id, CommandBuffer& buffer,
+	                                              const IndirectDrawArgs& args);
 
 	struct GraphicsBindings {
 		std::array<PreparedBindings, 3> vertex;
@@ -192,14 +231,19 @@ private:
 	void               ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& target,
 	                                            uint8_t stencil_export_bits = 0);
 	[[nodiscard]] bool DepthStencilCopy(CommandBuffer& buffer);
+	[[nodiscard]] static bool IsDepthStencilCopy(const CommandBuffer& buffer);
 	[[nodiscard]] bool PrepareDrawRenderState(CommandBuffer& buffer,
 	                                          const DrawCallInfo& draw,
 	                                          uint32_t            render_target_slice_offset,
 	                                          DrawRenderState& state);
+	[[nodiscard]] bool PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInfo& draw,
+	                                      uint32_t render_target_slice_offset,
+	                                      DrawRenderState& state);
 	void ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buffer, const DrawCallInfo& draw,
 	                         DrawRenderState& state, vk::PrimitiveTopology topology,
 	                         const DrawEmitInfo& emit, const DrawIndexBufferSource& index_source,
-	                         bool primitive_restart_enable);
+	                         bool primitive_restart_enable,
+	                         const IndirectDrawArgs* indirect = nullptr);
 	[[nodiscard]] RenderState AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,

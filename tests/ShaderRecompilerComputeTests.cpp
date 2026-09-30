@@ -180,6 +180,15 @@ struct BufferCacheTestAccess {
   static bool IsBufferAllocated(const BufferCache &cache, BufferId id) {
     return cache.m_slot_buffers.is_allocated(id);
   }
+
+  // ReadMemory's drain without the GPU command lane, for a context that never started one.
+  static void DrainBuffer(BufferCache &cache, uint64_t address, uint64_t size) {
+    auto &buffer = cache.m_slot_buffers[cache.FindBuffer(address, size)];
+    if (cache.DownloadBufferMemory<false>(buffer, buffer.CpuAddress(),
+                                          buffer.Size())) {
+      cache.m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+    }
+  }
 };
 
 struct StreamBufferTestAccess {
@@ -389,6 +398,12 @@ struct RenderExecutorTestAccess {
   static void DrawAuto(RenderExecutor &executor, CommandBuffer &command,
                        const DrawAutoArgs &args) {
     executor.DrawAuto(0, command, args);
+  }
+
+  static IndirectDrawResult DrawIndirect(RenderExecutor &executor,
+                                         CommandBuffer &command,
+                                         const IndirectDrawArgs &args) {
+    return executor.DrawIndirect(0, command, args);
   }
 
   static bool TryConsumeComputeImageClear(RenderExecutor &executor,
@@ -18090,21 +18105,16 @@ public:
       registers.SetPsInputEna(2);
       registers.SetPsInputAddr(2);
       registers.SetPsInputSettings(0, 0);
-      for (const auto primitive : {Prospero::PrimitiveType::kRectList,
-                                    Prospero::PrimitiveType::kRectListLegacy}) {
-        const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
-                                    ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
-        user_config.SetPrimitiveType(primitive);
-        registers.SetModeControl({});
+      const auto clear_rect = [&] {
         TextureCacheTestAccess::ClearImage(cache, scheduler.Current(), sparse_color.image_id,
             {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1}, {});
-        RenderExecutorTestAccess::DrawAuto(
-            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+      };
+      const auto check_rect = [&](const char *rect_name, bool drawn) {
         const auto pixels = ReadCachedTexel(name, context, sparse_color.image_id,
                                             {}, {extent, extent, 1});
         for (u32 y = 0; y < extent; y++) {
           for (u32 x = 0; x < extent; x++) {
-            const bool inside = x >= 4 && x < 28 && y >= 4 && y < 28;
+            const bool inside = drawn && x >= 4 && x < 28 && y >= 4 && y < 28;
             const auto offset = 4 * (y * extent + x);
             const std::array<float, 4> expected{
                 inside ? (x + 0.5f - 4) / 24 : 0,
@@ -18117,6 +18127,132 @@ public:
             }
           }
         }
+      };
+      for (const auto primitive : {Prospero::PrimitiveType::kRectList,
+                                    Prospero::PrimitiveType::kRectListLegacy}) {
+        const char *rect_name = primitive == Prospero::PrimitiveType::kRectList
+                                    ? "RectListThreeRecords" : "LegacyRectListThreeRecords";
+        user_config.SetPrimitiveType(primitive);
+        registers.SetModeControl({});
+        clear_rect();
+        RenderExecutorTestAccess::DrawAuto(
+            executor, scheduler.Current(), {.vertex_count = 3, .instance_count = 1});
+        check_rect(rect_name, true);
+      }
+
+      // GPU-written arguments are read on the GPU, never drained; a zero count draws nothing.
+      if (m_draw_indirect_supported) {
+        constexpr const char *indirect_name = "GpuIndirectRectList";
+        constexpr uint64_t args_address = depth_address + 0x3c000;
+        constexpr uint64_t source_address = depth_address + 0x3d000;
+        constexpr uint64_t count_address = source_address + 0x100;
+        const std::array<u32, 8> records{3, 1, 0, 0, 3, 1, 0, 0};
+        std::memcpy(reinterpret_cast<void *>(source_address), records.data(), sizeof(records));
+        std::memset(reinterpret_cast<void *>(count_address), 0, sizeof(u32));
+        auto &buffers = context.GetBufferCache();
+        (void)buffers.ObtainBuffer(args_address, sizeof(records), true);
+        buffers.CopyBuffer(args_address, source_address, sizeof(records), false, false);
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kRectList);
+        clear_rect();
+        Require(indirect_name, "single record on the GPU",
+                RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                                                       {.args_addr = args_address}) ==
+                    IndirectDrawResult::Drawn,
+                "an eligible indirect draw fell back to reading its arguments on the CPU");
+        Require(indirect_name, "arguments stay GPU-owned",
+                buffers.IsRegionGpuModified(args_address, sizeof(records)),
+                "the indirect draw drained its GPU-written arguments");
+        check_rect(indirect_name, true);
+        clear_rect();
+        Require(indirect_name, "zero count on the GPU",
+                RenderExecutorTestAccess::DrawIndirect(
+                    executor, scheduler.Current(),
+                    {.args_addr = args_address, .max_count = 2, .stride = 16,
+                     .count_addr = count_address}) == IndirectDrawResult::Drawn,
+                "a counted indirect draw fell back to the CPU");
+        check_rect(indirect_name, false);
+        const u32 one = 1;
+        std::memcpy(reinterpret_cast<void *>(count_address), &one, sizeof(one));
+        Require(indirect_name, "counted records on the GPU",
+                RenderExecutorTestAccess::DrawIndirect(
+                    executor, scheduler.Current(),
+                    {.args_addr = args_address, .max_count = 2, .stride = 16,
+                     .count_addr = count_address}) == IndirectDrawResult::Drawn,
+                "a counted indirect draw fell back to the CPU");
+        check_rect(indirect_name, true);
+
+        // PPSA30803 issues empty draws whose stale depth register names a colour surface.
+        constexpr uint64_t empty_address = source_address + 0x200;
+        constexpr uint64_t stale_depth_address = depth_address + 0x10000;
+        const std::array<u32, 4> empty_record{3, 0, 0, 0};
+        std::memcpy(reinterpret_cast<void *>(empty_address), empty_record.data(),
+                    sizeof(empty_record));
+        HW::DepthRenderTarget stale_depth{};
+        stale_depth.z_info.format = Prospero::DepthFormat::kZ32F;
+        stale_depth.z_read_base_addr = stale_depth.z_write_base_addr = stale_depth_address;
+        stale_depth.size = {static_cast<uint16_t>(extent - 1),
+                            static_cast<uint16_t>(extent - 1), true};
+        registers.SetDepthRenderTarget(stale_depth);
+        registers.SetDepthControl(
+            {.z_enable = true, .zfunc = static_cast<uint8_t>(vk::CompareOp::eAlways)});
+        const auto stale_owners =
+            TextureCacheTestAccess::FindImages(cache, stale_depth_address, 0x10000, false);
+        for (u32 repeat = 0; repeat < 3; repeat++) {
+          Require(indirect_name, "empty record stays off the CPU",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                                                         {.args_addr = empty_address}) ==
+                      IndirectDrawResult::Drawn,
+                  "an empty indirect draw fell back to reading its arguments on the CPU");
+        }
+        Require(indirect_name, "empty draw resolves no target",
+                TextureCacheTestAccess::FindImages(cache, stale_depth_address, 0x10000,
+                                                   false) == stale_owners,
+                "an empty indirect draw bound its stale depth target and created an image");
+        registers.SetDepthControl({});
+        registers.SetDepthRenderTarget({});
+        // A count bound past the mapping is trimmed rather than sent to the CPU.
+        clear_rect();
+        Require(indirect_name, "count bound past the mapping",
+                RenderExecutorTestAccess::DrawIndirect(
+                    executor, scheduler.Current(),
+                    {.args_addr = args_address, .max_count = 0x100000, .stride = 16,
+                     .count_addr = count_address}) == IndirectDrawResult::Drawn,
+                "an overlong count bound sent a counted indirect draw to the CPU");
+        check_rect(indirect_name, true);
+        // A refusal names itself before anything reads the records.
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kQuadListLegacy);
+        Require(indirect_name, "quad list refusal",
+                RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                                                       {.args_addr = args_address}) ==
+                        IndirectDrawResult::QuadList &&
+                    buffers.IsRegionGpuModified(args_address, sizeof(records)),
+                "a quad-list indirect draw was not refused by name, or read its records");
+        user_config.SetPrimitiveType(Prospero::PrimitiveType::kRectList);
+
+        // Through a DRAW_INDIRECT packet the records stay on the GPU.
+        GraphicsInitJmpTables();
+        {
+          CommandProcessor processor(context, 0);
+          processor.GetCtx() = registers;
+          processor.GetUcfg() = user_config;
+          processor.GetShCtx() = shaders;
+          processor.BufferInit();
+          processor.SetDrawIndirectArgsBaseAddress(args_address);
+          const std::array<u32, 5> packet{KYTY_PM4(5, Pm4::IT_DRAW_INDIRECT, 0u), 0u,
+                                          0u, 0u, 2u};
+          clear_rect();
+          Pm4Execution execution;
+          Require(indirect_name, "packet processed",
+                  processor.Process(execution, packet) == Pm4ProcessResult::Complete,
+                  "the DRAW_INDIRECT packet did not complete");
+          Require(indirect_name, "packet leaves arguments GPU-owned",
+                  buffers.IsRegionGpuModified(args_address, sizeof(records)),
+                  "the command processor read the GPU-written indirect arguments");
+          check_rect(indirect_name, true);
+        }
+        scheduler.Begin(registers, user_config, shaders);
+        BufferCacheTestAccess::DrainBuffer(buffers, args_address, sizeof(records));
+        std::printf("[gpu]     %-32s ok\n", indirect_name);
       }
       DestroyBuffer(&stencil_readback);
 
@@ -19464,6 +19600,7 @@ public:
 
 private:
   bool m_rasterization_supported = true;
+  bool m_draw_indirect_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -19500,6 +19637,9 @@ private:
     m_runtime_context.shader_image_int64_atomics_enabled = true;
     m_runtime_context.attachment_feedback_loop_enabled = m_rasterization_supported;
     m_runtime_context.provoking_vertex_last_enabled = m_rasterization_supported;
+    m_runtime_context.draw_indirect_first_instance_enabled = m_draw_indirect_supported;
+    m_runtime_context.multi_draw_indirect_enabled = m_draw_indirect_supported;
+    m_runtime_context.draw_indirect_count_enabled = m_draw_indirect_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -19697,6 +19837,9 @@ private:
           "[host]    ProductionRasterization   unavailable, rasterization cases "
           "will be skipped\n");
     }
+    m_draw_indirect_supported = available_features.drawIndirectFirstInstance &&
+                                available_features.multiDrawIndirect &&
+                                available_features12.drawIndirectCount;
 
     float priority = 1.0f;
     vk::DeviceQueueCreateInfo queue_info{};
@@ -19712,6 +19855,7 @@ private:
     auto device_features11 = WindowContext::RequiredVulkan11Features();
     auto device_features12 = WindowContext::RequiredVulkan12Features();
     device_features12.shaderSharedInt64Atomics = true;
+    device_features12.drawIndirectCount = m_draw_indirect_supported;
     vk::PhysicalDeviceWorkgroupMemoryExplicitLayoutFeaturesKHR workgroup_layout{};
     workgroup_layout.workgroupMemoryExplicitLayout = true;
     device_features12.pNext = &device_features11;
@@ -19768,6 +19912,8 @@ private:
     device_features.shaderFloat64 = available_features.shaderFloat64;
     device_features.fillModeNonSolid = m_rasterization_supported;
     device_features.tessellationShader = m_rasterization_supported;
+    device_features.drawIndirectFirstInstance = m_draw_indirect_supported;
+    device_features.multiDrawIndirect = m_draw_indirect_supported;
     device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
