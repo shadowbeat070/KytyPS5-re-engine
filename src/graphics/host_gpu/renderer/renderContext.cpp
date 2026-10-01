@@ -158,6 +158,23 @@ void RenderContext::PrepareBda(bool stores) {
 	m_fault_process_pending = true;
 }
 
+void RenderContext::PrefetchBda(uint64_t address) {
+	constexpr uint64_t Window = 256 * 1024;
+	if (address == 0) {
+		return;
+	}
+	const auto begin = address & ~(BufferCache::CACHING_PAGESIZE - 1);
+	if (begin > UINT64_MAX - Window) {
+		return;
+	}
+	std::shared_lock lock(m_mapped_ranges_mutex);
+	m_mapped_ranges.ForEachInRange(begin, Window, [&](uint64_t start, uint64_t end) {
+		if (start <= address && end > address) {
+			m_buffer_cache.PrefetchBda(start, end - start);
+		}
+	});
+}
+
 void RenderContext::RunGarbageCollector() {
 	if (m_fault_process_pending) {
 		m_fault_process_pending = false;
