@@ -780,6 +780,25 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 	});
 }
 
+void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size) {
+	const auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
+	const auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
+	if (begin >= end || !GuestRange {begin, end - begin}.Valid()) {
+		return;
+	}
+	RangeSet missing;
+	for (auto page = begin; page < end; page += CACHING_PAGESIZE) {
+		const auto* owner = m_page_table.Find(page >> PageTable::kPageBits);
+		if (owner == nullptr || !*owner) {
+			missing.Add(page, CACHING_PAGESIZE);
+		} else {
+			TouchBuffer(m_slot_buffers[*owner]);
+		}
+	}
+	missing.ForEach(
+	    [this](uint64_t first, uint64_t last) { (void)FindBuffer(first, last - first); });
+}
+
 void BufferCache::MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked) {
 	KYTY_PROFILER_FUNCTION();
 	const auto& ranges = all_tracked ? m_bda_tracked_ranges : m_bda_unmarked_ranges;

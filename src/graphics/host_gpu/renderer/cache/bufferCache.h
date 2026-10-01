@@ -96,6 +96,7 @@ public:
 	void               ProcessFaultBuffer();
 	// A BDA fault on an owned page can only come from a store, which promotes the page to tracked.
 	void               ResolveBdaFault(uint64_t vaddr, uint64_t size);
+	void               PrefetchBda(uint64_t vaddr, uint64_t size);
 	void               SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
 	// Marks the tracked pages a BDA store can reach GPU-written, restricted to mapped memory.
 	void               MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked);

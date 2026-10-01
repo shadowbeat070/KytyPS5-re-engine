@@ -3644,6 +3644,10 @@ void TestDmaAddressMaterialization() {
         "typed address operations did not enable DMA");
   Check(fixture.program.info.writes_dma,
         "a FLAT address store did not report a BDA store");
+  Check(fixture.program.info.dma_read_pointers.size() == 1 &&
+            fixture.program.info.dma_read_pointers[0] ==
+                DmaReadPointer{.user_data = true, .lo = 0, .hi = 1},
+        "a user-data DMA read pointer was not named for prefetch");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
   SrtRuntime runtime{.user_data = user_data};
   ResourceSnapshot snapshot;
@@ -3652,6 +3656,39 @@ void TestDmaAddressMaterialization() {
                              specialization),
         "DMA shader resources did not materialize");
   ApplyResourceSpecialization(fixture.program, specialization);
+}
+
+void TestDmaReadPointerFromSrt() {
+  Fixture fixture;
+  const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1), 0x10);
+  MemoryInfo word;
+  word.kind = ResourceKind::ScalarAddress;
+  std::array<Value, 2> pointer;
+  for (uint32_t dword = 0; dword < 2; dword++) {
+    pointer[dword] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                  {table, Value(dword * 4u), Value(0u), Value(true)},
+                                  fixture.AddMemory(word, 0x10 + dword * 4u));
+  }
+  MemoryInfo global;
+  global.kind = ResourceKind::Global;
+  fixture.Emit(ValueOpcode::LoadAddressU32,
+               {fixture.Address(pointer[0], pointer[1], 0x20), Value(0u), Value(0u), Value(true)},
+               fixture.AddMemory(global, 0x20));
+  const auto lane = fixture.Emit(ValueOpcode::UndefU32);
+  fixture.Emit(ValueOpcode::StoreAddressU32,
+               {fixture.Address(pointer[0], pointer[1], 0x28), lane, Value(0u), Value(9u),
+                Value(true)},
+               fixture.AddMemory(global, 0x28));
+  fixture.PlanAndTrack();
+
+  const auto& pointers = fixture.program.info.dma_read_pointers;
+  Check(pointers.size() == 1 && !pointers[0].user_data,
+        "an SRT-held DMA read pointer was not named for prefetch, or a store was");
+  const auto& reads = fixture.program.srt_reads;
+  Check(pointers[0].lo < reads.size() && pointers[0].hi < reads.size() &&
+            reads[pointers[0].lo].value.Resolve() == pointer[0].Resolve() &&
+            reads[pointers[0].hi].value.Resolve() == pointer[1].Resolve(),
+        "the prefetch slots do not name the two pointer dwords");
 }
 
 void TestDynamicFlatAddressesUseDma() {
@@ -5155,6 +5192,7 @@ int main() {
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
+    Run("DMA read pointer from SRT", TestDmaReadPointerFromSrt);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);

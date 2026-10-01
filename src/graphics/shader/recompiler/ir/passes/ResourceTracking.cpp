@@ -309,6 +309,7 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma   = false;
 		m_info.writes_dma = false;
+		m_info.dma_read_pointers.clear();
 		m_shader_writes   = HasShaderMemoryWrites(program);
 
 	}
@@ -2479,6 +2480,44 @@ private:
 		return true;
 	}
 
+	// An unmapped BDA page reads zero until its fault is processed after the dispatch.
+	void RecordDmaReadPointer(const Inst& handle) {
+		DmaReadPointer pointer;
+		for (uint32_t word = 0; word < 2u; word++) {
+			const auto* source = handle.Arg(word).Resolve().TryInstruction();
+			if (source == nullptr) {
+				return;
+			}
+			uint32_t index = 0;
+			bool     user  = false;
+			if (source->GetOpcode() == ValueOpcode::ReadConst) {
+				const auto slot = source->Arg(1).Resolve();
+				if (!slot.IsImmediate() || slot.GetType() != Type::U32) {
+					return;
+				}
+				index = slot.U32();
+			} else if (source->GetOpcode() == ValueOpcode::GetUserData &&
+			           source->Arg(0).GetType() == Type::ScalarReg) {
+				index = RegIndex(source->Arg(0).ScalarRegister());
+				user  = true;
+			} else {
+				return;
+			}
+			if (word == 0u) {
+				pointer.user_data = user;
+				pointer.lo        = index;
+			} else if (user != pointer.user_data) {
+				return;
+			} else {
+				pointer.hi = index;
+			}
+		}
+		if (std::ranges::find(m_info.dma_read_pointers, pointer) ==
+		    m_info.dma_read_pointers.end()) {
+			m_info.dma_read_pointers.push_back(pointer);
+		}
+	}
+
 	bool ValidateAddressHandle(Value value, uint32_t pc) const {
 		const auto* handle = value.Resolve().TryInstruction();
 		if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetAddressResource) {
@@ -2770,6 +2809,9 @@ private:
 				return false;
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
+			if (address_info.access == AddressAccess::Read) {
+				RecordDmaReadPointer(*inst.Arg(0).Resolve().TryInstruction());
+			}
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
 				// The store goes through the page table, so the emitter needs its own store-pointer

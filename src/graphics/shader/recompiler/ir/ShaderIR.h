@@ -545,6 +545,14 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
+struct DmaReadPointer {
+	bool     user_data = false;
+	uint32_t lo        = 0;
+	uint32_t hi        = 0;
+
+	bool operator==(const DmaReadPointer& other) const = default;
+};
+
 struct ShaderInfo {
 	static constexpr uint32_t MaxBuffers      = 64;
 	// Dense buffer slots a materialized shader may bind: the buffers it tracks plus the candidates
@@ -593,6 +601,7 @@ struct ShaderInfo {
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
 	bool                             writes_dma         = false;
+	std::vector<DmaReadPointer>      dma_read_pointers;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };
