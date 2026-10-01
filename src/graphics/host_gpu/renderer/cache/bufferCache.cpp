@@ -802,7 +802,7 @@ void BufferCache::ResolveBdaFault(uint64_t vaddr, uint64_t size) {
 	});
 }
 
-void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size) {
+void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size, bool store) {
 	const auto begin = vaddr & ~(CACHING_PAGESIZE - 1);
 	const auto end   = (vaddr + size + CACHING_PAGESIZE - 1) & ~(CACHING_PAGESIZE - 1);
 	if (begin >= end || !GuestRange {begin, end - begin}.Valid()) {
@@ -819,6 +819,16 @@ void BufferCache::PrefetchBda(uint64_t vaddr, uint64_t size) {
 	}
 	missing.ForEach(
 	    [this](uint64_t first, uint64_t last) { (void)FindBuffer(first, last - first); });
+	if (!store) {
+		return;
+	}
+	constexpr uint64_t StoreWindow = 64 * 1024;
+	const auto         tracked_end = std::min(end, begin + StoreWindow);
+	for (auto page = begin; page < tracked_end; page += CACHING_PAGESIZE) {
+		if (!m_bda_tracked_ranges.Contains(page, CACHING_PAGESIZE)) {
+			ResolveBdaFault(page, CACHING_PAGESIZE);
+		}
+	}
 }
 
 void BufferCache::ForgetBdaResidency(uint64_t vaddr, uint64_t size) {

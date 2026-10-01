@@ -545,12 +545,13 @@ struct BindingLayout {
 	bool operator==(const BindingLayout& other) const = default;
 };
 
-struct DmaReadPointer {
+struct DmaPointer {
 	bool     user_data = false;
+	bool     store     = false;
 	uint32_t lo        = 0;
 	uint32_t hi        = 0;
 
-	bool operator==(const DmaReadPointer& other) const = default;
+	bool operator==(const DmaPointer& other) const = default;
 };
 
 struct ShaderInfo {
@@ -601,7 +602,7 @@ struct ShaderInfo {
 	bool                             has_bitwise_xor    = false;
 	bool                             uses_dma           = false;
 	bool                             writes_dma         = false;
-	std::vector<DmaReadPointer>      dma_read_pointers;
+	std::vector<DmaPointer>          dma_pointers;
 
 	bool operator==(const ShaderInfo& other) const = default;
 };

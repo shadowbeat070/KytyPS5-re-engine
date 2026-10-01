@@ -309,7 +309,7 @@ public:
 		m_info.sampled_pairs.clear();
 		m_info.uses_dma   = false;
 		m_info.writes_dma = false;
-		m_info.dma_read_pointers.clear();
+		m_info.dma_pointers.clear();
 		m_shader_writes   = HasShaderMemoryWrites(program);
 
 	}
@@ -2480,9 +2480,10 @@ private:
 		return true;
 	}
 
-	// An unmapped BDA page reads zero until its fault is processed after the dispatch.
-	void RecordDmaReadPointer(const Inst& handle) {
-		DmaReadPointer pointer;
+	// An unmapped BDA page reads zero and drops stores until its fault is processed.
+	void RecordDmaPointer(const Inst& handle, bool store) {
+		DmaPointer pointer;
+		pointer.store = store;
 		for (uint32_t word = 0; word < 2u; word++) {
 			const auto* source = handle.Arg(word).Resolve().TryInstruction();
 			if (source == nullptr) {
@@ -2512,9 +2513,8 @@ private:
 				pointer.hi = index;
 			}
 		}
-		if (std::ranges::find(m_info.dma_read_pointers, pointer) ==
-		    m_info.dma_read_pointers.end()) {
-			m_info.dma_read_pointers.push_back(pointer);
+		if (std::ranges::find(m_info.dma_pointers, pointer) == m_info.dma_pointers.end()) {
+			m_info.dma_pointers.push_back(pointer);
 		}
 	}
 
@@ -2809,9 +2809,8 @@ private:
 				return false;
 			}
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
-			if (address_info.access == AddressAccess::Read) {
-				RecordDmaReadPointer(*inst.Arg(0).Resolve().TryInstruction());
-			}
+			RecordDmaPointer(*inst.Arg(0).Resolve().TryInstruction(),
+			                 address_info.access == AddressAccess::Write);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
 				// The store goes through the page table, so the emitter needs its own store-pointer

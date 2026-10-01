@@ -3644,9 +3644,9 @@ void TestDmaAddressMaterialization() {
         "typed address operations did not enable DMA");
   Check(fixture.program.info.writes_dma,
         "a FLAT address store did not report a BDA store");
-  Check(fixture.program.info.dma_read_pointers.size() == 1 &&
-            fixture.program.info.dma_read_pointers[0] ==
-                DmaReadPointer{.user_data = true, .lo = 0, .hi = 1},
+  Check(fixture.program.info.dma_pointers.size() == 1 &&
+            fixture.program.info.dma_pointers[0] ==
+                DmaPointer{.user_data = true, .lo = 0, .hi = 1},
         "a user-data DMA read pointer was not named for prefetch");
   std::array<uint32_t, 2> user_data{0x2008u, 0u};
   SrtRuntime runtime{.user_data = user_data};
@@ -3658,7 +3658,7 @@ void TestDmaAddressMaterialization() {
   ApplyResourceSpecialization(fixture.program, specialization);
 }
 
-void TestDmaReadPointerFromSrt() {
+void TestDmaPointerFromSrt() {
   Fixture fixture;
   const auto table = fixture.Address(fixture.UserData(0), fixture.UserData(1), 0x10);
   MemoryInfo word;
@@ -3681,9 +3681,11 @@ void TestDmaReadPointerFromSrt() {
                fixture.AddMemory(global, 0x28));
   fixture.PlanAndTrack();
 
-  const auto& pointers = fixture.program.info.dma_read_pointers;
-  Check(pointers.size() == 1 && !pointers[0].user_data,
-        "an SRT-held DMA read pointer was not named for prefetch, or a store was");
+  const auto& pointers = fixture.program.info.dma_pointers;
+  Check(pointers.size() == 2 && !pointers[0].user_data && !pointers[0].store &&
+            pointers[1].store && pointers[1].lo == pointers[0].lo &&
+            pointers[1].hi == pointers[0].hi,
+        "the SRT-held pointer of a DMA load and a DMA store was not named for prefetch");
   const auto& reads = fixture.program.srt_reads;
   Check(pointers[0].lo < reads.size() && pointers[0].hi < reads.size() &&
             reads[pointers[0].lo].value.Resolve() == pointer[0].Resolve() &&
@@ -5192,7 +5194,7 @@ int main() {
     Run("buffer store active value", TestBufferStoreUsesItsOwnActiveValue);
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
-    Run("DMA read pointer from SRT", TestDmaReadPointerFromSrt);
+    Run("DMA pointer from SRT", TestDmaPointerFromSrt);
     Run("dynamic FLAT address", TestDynamicFlatAddressesUseDma);
     Run("buffer swizzle specialization", TestBufferSwizzleSpecialization);
     Run("conditional buffer materialization", TestConditionalBufferMaterialization);
