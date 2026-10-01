@@ -982,7 +982,7 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 		const auto& program  = *prepared.runtime->program;
 		const auto& snapshot = *prepared.runtime->resources;
 
-		for (const auto& pointer: program.info.dma_read_pointers) {
+		for (const auto& pointer: program.info.dma_pointers) {
 			uint32_t lo = 0;
 			uint32_t hi = 0;
 			if (pointer.user_data) {
@@ -1001,7 +1001,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				lo = snapshot.flattened_srt[pointer.lo];
 				hi = snapshot.flattened_srt[pointer.hi];
 			}
-			m_context.PrefetchBda(static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u));
+			m_context.PrefetchBda(static_cast<uint64_t>(lo) | (static_cast<uint64_t>(hi) << 32u),
+			                      pointer.store);
 		}
 
 		prepared.buffer_sources.clear();
