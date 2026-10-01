@@ -726,6 +726,7 @@ struct ResourcePlan {
 		struct Entry {
 			uint64_t value      = 0;
 			uint64_t generation = 0;
+			bool     lane_dependent = false;
 		};
 
 		std::vector<Entry> values;
@@ -789,6 +790,13 @@ struct ResourcePlan {
 	mutable std::vector<uint8_t>            visited_blocks;
 	mutable std::vector<uint32_t>           pending_blocks;
 	mutable std::vector<uint32_t>           material_keys;
+	bool                                    frozen_values = false;
+	struct ClosedBallot {
+		enum State : uint8_t { Unknown, Open, Closed, Known };
+		State    state = Unknown;
+		uint64_t mask  = 0;
+	};
+	mutable std::vector<ClosedBallot> closed_ballots;
 };
 
 struct Program: ResourcePlan {
