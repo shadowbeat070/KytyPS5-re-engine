@@ -247,6 +247,25 @@ void ReportUploadSourceRefused(const Image& image) {
 	     RefusalReporter::RepeatSuffix(repeat, occurrences));
 }
 
+// A replacement may hold more layers than requested only where its data range covers them.
+bool GrowLayers(ImageInfo& info, const ImageInfo& requested, const ImageInfo& cached) {
+	if (info.resources.levels != 1 || requested.resources.levels != 1 ||
+	    requested.resources.layers == 0 || requested.IsVolume() ||
+	    requested.data.size % requested.resources.layers != 0 ||
+	    requested.mip_layout[0].offset != 0 ||
+	    requested.mip_layout[0].size != requested.data.size ||
+	    cached.data.address != requested.data.address) {
+		return false;
+	}
+	const auto size = requested.data.size / requested.resources.layers * info.resources.layers;
+	if (cached.data.size < size) {
+		return false;
+	}
+	info.data.size          = size;
+	info.mip_layout[0].size = size;
+	return true;
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -956,6 +975,12 @@ ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingTyp
 		info.mip_layout = cached.info.mip_layout;
 	} else {
 		info.resources = std::max(requested.resources, cached.info.resources);
+		const bool covered = cached.info.data.address == requested.data.address &&
+		                     cached.info.data.size <= requested.data.size;
+		if (info.resources != requested.resources && !covered &&
+		    !GrowLayers(info, requested, cached.info)) {
+			info.resources = requested.resources;
+		}
 	}
 	info.htile_clear_mask     = 0;
 	const auto replacement_id = InsertImage(info);
