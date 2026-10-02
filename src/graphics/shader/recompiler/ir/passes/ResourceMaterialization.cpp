@@ -179,6 +179,40 @@ bool DecodeBufferDescriptor(const DescriptorValue& descriptor, ShaderBufferResou
 	return true;
 }
 
+struct ReadCapture {
+	SrtRuntime                                  source;
+	std::vector<std::pair<uint64_t, uint64_t>>& ranges;
+};
+
+bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (!capture.source.read_specialization_memory(capture.source.userdata, address, values)) {
+		return false;
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool CaptureConditionRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (!capture.source.read_condition_memory(capture.source.userdata, address, values)) {
+		return false;
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
+bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (capture.source.read_memory != nullptr) {
+		if (!capture.source.read_memory(capture.source.userdata, address, values)) return false;
+	} else {
+		std::memcpy(values.data(), reinterpret_cast<const void*>(address), values.size_bytes());
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
 const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	if (source >= program.descriptor_sources.size()) {
 		return nullptr;
@@ -1231,6 +1265,18 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		result = std::move(cached.result);
 		return true;
 	};
+	if (word_count != 0 && runtime.hash_specialization_block != nullptr) {
+		const auto address = heap.Base48() & AddressMask & ~uint64_t {3};
+		const auto bytes   = static_cast<uint64_t>(word_count) * sizeof(uint32_t);
+		uint64_t   content = 0;
+		bool       hashed  = false;
+		if (bytes - 1u <= AddressMask - address) {
+			hashed = runtime.hash_specialization_block(runtime.userdata, address, bytes, &content);
+		}
+		if (bool accepted = false; hashed && Remembered(content, accepted)) {
+			return accepted;
+		}
+	}
 
 	// One read of the whole table, not four per record. A successful read writes every word.
 	static thread_local std::vector<uint32_t> table_words;
@@ -2374,13 +2420,30 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 	}
 	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
 	auto& reads = snapshot.specialization_reads;
-	reads = program.source_reads;
-	SrtReadCapture capture {runtime, reads};
-	const auto observed = capture_reads ? capture.ObservedRuntime() : runtime;
+	reads.clear();
+	ReadCapture capture {runtime, reads};
+	SrtRuntime observed = runtime;
+	if (capture_reads) {
+		observed.userdata = &capture;
+		observed.read_specialization_memory = runtime.read_specialization_memory != nullptr
+		                                         ? CaptureStrictRead : nullptr;
+		observed.read_memory = CaptureOrdinaryRead;
+	}
+	if (capture_reads && runtime.read_condition_memory != nullptr) {
+		observed.read_condition_memory = CaptureConditionRead;
+	}
+	SrtRuntime condition_runtime = observed;
+	if (observed.read_condition_memory != nullptr) {
+		condition_runtime.read_memory                = observed.read_condition_memory;
+		condition_runtime.read_specialization_memory = observed.read_condition_memory;
+	}
 	SrtWalker clean(program, CleanRuntime(observed));
+	SrtWalker conditions(program, condition_runtime);
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
 	FlatRefreshFailure flat_failure;
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune)) {
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune,
+	                              observed.read_condition_memory != nullptr ? &conditions
+	                                                                         : nullptr)) {
 		MaterializeFailure() =
 		    fmt::format("flat srt refresh: {}", DescribeFlatRefreshFailure(flat_failure));
 		return false;
