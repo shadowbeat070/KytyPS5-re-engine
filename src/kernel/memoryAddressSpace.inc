@@ -811,6 +811,51 @@ public:
 		return m_backing->ReadBackingPartial(vaddr, data, size);
 	}
 
+	uint64_t ReadMappedPartial(uint64_t vaddr, void* data, uint64_t size) {
+		if (data == nullptr || size == 0) {
+			return 0;
+		}
+		auto* destination = static_cast<uint8_t*>(data);
+		std::memset(destination, 0, size);
+		if (UINT64_MAX - vaddr < size) {
+			return 0;
+		}
+
+		std::lock_guard lock(m_mutex);
+		const auto      end    = vaddr + size;
+		uint64_t        copied = 0;
+		for (auto current = vaddr; current < end;) {
+			auto*      piece   = destination + (current - vaddr);
+			const auto mapping = FindMappedContainingUnlocked(current);
+			if (mapping != m_mapped.end()) {
+				const auto& region = mapping->second;
+				const auto  bytes  = std::min(end, region.vaddr + region.size) - current;
+				if (region.type == MappingType::Backing) {
+					copied += m_backing->ReadBackingPartial(current, piece, bytes);
+				} else {
+					std::memcpy(piece, reinterpret_cast<const void*>(current), bytes);
+					copied += bytes;
+				}
+				current += bytes;
+				continue;
+			}
+			const auto next      = m_mapped.lower_bound(current);
+			const auto hole_end  = next != m_mapped.end() ? std::min(end, next->second.vaddr) : end;
+			const auto hole_size = hole_end - current;
+			const bool reserved =
+			    std::any_of(m_owned.begin(), m_owned.end(), [&](const auto& range) {
+				    return VirtualRangesOverlap(current, hole_size, range.first, range.second);
+			    });
+			uint64_t readable = 0;
+			if (!reserved && Graphics::HostMemoryQueryReadable(current, hole_size, readable)) {
+				std::memcpy(piece, reinterpret_cast<const void*>(current), readable);
+				copied += readable;
+			}
+			current = hole_end;
+		}
+		return copied;
+	}
+
 	bool BackingContains(uint64_t vaddr, uint64_t size) { return m_backing->Contains(vaddr, size); }
 
 	bool Protect(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {

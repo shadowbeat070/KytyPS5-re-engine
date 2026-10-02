@@ -124,6 +124,8 @@ bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t
 // Zero-fills the destination, copies back whatever the guest has committed over the span, and
 // returns how many bytes were real. For a caller that cannot refuse, such as an image upload.
 uint64_t                  ReadBackingPartial(uint64_t vaddr, void* data, uint64_t size);
+// The same for any mapped guest span; a concurrent unmap leaves zeros instead of a host fault.
+uint64_t ReadGuestMemoryPartial(uint64_t vaddr, void* data, uint64_t size);
 // The committed prefix, whether a PRT aperture covers it, and the covering plus neighbouring
 // virtual ranges. For failure reports only.
 [[nodiscard]] std::string DescribeGuestRange(uint64_t vaddr, uint64_t size);

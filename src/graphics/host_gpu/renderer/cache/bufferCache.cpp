@@ -59,6 +59,28 @@ void ReportImageBackingSubstitute(uint64_t vaddr, uint64_t size, uint64_t backed
 	     RefusalReporter::RepeatSuffix(repeat, occurrences));
 }
 
+RefusalReporter g_buffer_backing_reports;
+
+bool ReadGuestForUpload(uint64_t vaddr, void* destination, uint64_t size) {
+	if (Libs::LibKernel::Memory::TryReadBacking(vaddr, destination, size)) {
+		return true;
+	}
+	const auto backed = Libs::LibKernel::Memory::ReadGuestMemoryPartial(vaddr, destination, size);
+	if (backed == size) {
+		return true;
+	}
+	const auto occurrences = g_buffer_backing_reports.Observe(0, 0, 0);
+	if (occurrences != 0) {
+		char repeat[32] = "";
+		std::printf("BufferCache: buffer upload over unmapped guest memory addr=0x%016" PRIx64
+		            " size=0x%016" PRIx64 " backed=0x%016" PRIx64 ", rest uploaded as zeros %s%s\n",
+		            vaddr, size, backed,
+		            Libs::LibKernel::Memory::DescribeGuestRange(vaddr, size).c_str(),
+		            RefusalReporter::RepeatSuffix(repeat, occurrences));
+	}
+	return false;
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -451,17 +473,23 @@ BufferId BufferCache::CreateBuffer(uint64_t vaddr, uint64_t size) {
 
 bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t size, bool is_written,
                                     bool is_texel_buffer) {
-	StreamHold                  hold(m_staging_buffer);
-	std::vector<vk::BufferCopy> copies;
-	uint64_t                    total_size = 0;
-	vk::Buffer                  source;
+	StreamHold                                 hold(m_staging_buffer);
+	std::vector<vk::BufferCopy>                copies;
+	std::vector<std::pair<uint64_t, uint64_t>> unbacked;
+	uint64_t                                   total_size = 0;
+	vk::Buffer                                 source;
 	m_memory_tracker.ForEachUploadRange(
 	    vaddr, size, is_written,
 	    [&](uint64_t address, uint64_t bytes) noexcept {
 		    copies.emplace_back(total_size, buffer.Offset(address), bytes);
 		    total_size += bytes;
 	    },
-	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size); });
+	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, unbacked); });
+	if (!is_written) {
+		for (const auto& [address, bytes]: unbacked) {
+			m_memory_tracker.MarkRegionAsCpuModified(address, bytes);
+		}
+	}
 	if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
@@ -495,7 +523,8 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 }
 
 vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> copies,
-                                     uint64_t total_size) {
+                                     uint64_t                                    total_size,
+                                     std::vector<std::pair<uint64_t, uint64_t>>& unbacked) {
 	if (copies.empty()) {
 		return nullptr;
 	}
@@ -504,7 +533,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	if (mapped != nullptr) {
 		for (auto& copy: copies) {
 			const auto address = buffer.CpuAddress() + copy.dstOffset;
-			std::memcpy(mapped + copy.srcOffset, reinterpret_cast<const void*>(address), copy.size);
+			if (!ReadGuestForUpload(address, mapped + copy.srcOffset, copy.size)) {
+				unbacked.emplace_back(address, copy.size);
+			}
 			copy.srcOffset += base_offset;
 		}
 		m_staging_buffer.Commit();
@@ -515,8 +546,9 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 	                                         vk::BufferUsageFlagBits::eTransferSrc, total_size);
 	for (const auto& copy: copies) {
 		const auto address = buffer.CpuAddress() + copy.dstOffset;
-		std::memcpy(temporary->Mapped().data() + copy.srcOffset,
-		            reinterpret_cast<const void*>(address), copy.size);
+		if (!ReadGuestForUpload(address, temporary->Mapped().data() + copy.srcOffset, copy.size)) {
+			unbacked.emplace_back(address, copy.size);
+		}
 	}
 	temporary->Flush(0, total_size);
 	const auto handle = temporary->Handle();
@@ -539,7 +571,7 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		    m_graphics.physical_device_properties.limits.minUniformBufferOffsetAlignment, 1);
 		auto [mapped, offset] = m_stream_buffer.Map(size, alignment, false);
 		if (mapped != nullptr) {
-			std::memcpy(mapped, reinterpret_cast<const void*>(vaddr), size);
+			(void)ReadGuestForUpload(vaddr, mapped, size);
 			m_stream_buffer.Commit();
 			return {&m_stream_buffer, offset};
 		}

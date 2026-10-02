@@ -7,6 +7,7 @@
 #include "common/threads.h"
 #include "common/virtualMemory.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/hostMemory.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "libs/errno.h"
 #include "libs/libs.h"
@@ -1092,6 +1093,16 @@ uint64_t ReadBackingPartial(uint64_t vaddr, void* data, uint64_t size) {
 		return 0;
 	}
 	return g_guest_address_space->ReadBackingPartial(vaddr, data, size);
+}
+
+uint64_t ReadGuestMemoryPartial(uint64_t vaddr, void* data, uint64_t size) {
+	if (g_guest_address_space == nullptr) {
+		if (data != nullptr && size != 0) {
+			std::memset(data, 0, size);
+		}
+		return 0;
+	}
+	return g_guest_address_space->ReadMappedPartial(vaddr, data, size);
 }
 
 std::string DescribeGuestRange(uint64_t vaddr, uint64_t size) {
