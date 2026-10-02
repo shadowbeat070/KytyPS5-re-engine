@@ -193,6 +193,15 @@ bool CaptureStrictRead(void* userdata, uint64_t address, std::span<uint32_t> val
 	return true;
 }
 
+bool CaptureConditionRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	auto& capture = *static_cast<ReadCapture*>(userdata);
+	if (!capture.source.read_condition_memory(capture.source.userdata, address, values)) {
+		return false;
+	}
+	capture.ranges.emplace_back(address, values.size_bytes());
+	return true;
+}
+
 bool CaptureOrdinaryRead(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	auto& capture = *static_cast<ReadCapture*>(userdata);
 	if (capture.source.read_memory != nullptr) {
@@ -1260,6 +1269,18 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		result = std::move(cached.result);
 		return true;
 	};
+	if (word_count != 0 && runtime.hash_specialization_block != nullptr) {
+		const auto address = heap.Base48() & AddressMask & ~uint64_t {3};
+		const auto bytes   = static_cast<uint64_t>(word_count) * sizeof(uint32_t);
+		uint64_t   content = 0;
+		bool       hashed  = false;
+		if (bytes - 1u <= AddressMask - address) {
+			hashed = runtime.hash_specialization_block(runtime.userdata, address, bytes, &content);
+		}
+		if (bool accepted = false; hashed && Remembered(content, accepted)) {
+			return accepted;
+		}
+	}
 
 	// One read of the whole table, not four per record. A successful read writes every word.
 	static thread_local std::vector<uint32_t> table_words;
@@ -2386,10 +2407,21 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		                                         ? CaptureStrictRead : nullptr;
 		observed.read_memory = CaptureOrdinaryRead;
 	}
+	if (capture_reads && runtime.read_condition_memory != nullptr) {
+		observed.read_condition_memory = CaptureConditionRead;
+	}
+	SrtRuntime condition_runtime = observed;
+	if (observed.read_condition_memory != nullptr) {
+		condition_runtime.read_memory                = observed.read_condition_memory;
+		condition_runtime.read_specialization_memory = observed.read_condition_memory;
+	}
 	SrtWalker clean(program, CleanRuntime(observed));
+	SrtWalker conditions(program, condition_runtime);
 	SrtWalker walker(program, observed, program.clean_flat_slots, &clean);
 	FlatRefreshFailure flat_failure;
-	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune)) {
+	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune,
+	                              observed.read_condition_memory != nullptr ? &conditions
+	                                                                         : nullptr)) {
 		MaterializeFailure() =
 		    fmt::format("flat srt refresh: {}", DescribeFlatRefreshFailure(flat_failure));
 		return false;

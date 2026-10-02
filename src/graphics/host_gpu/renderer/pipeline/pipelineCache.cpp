@@ -6,12 +6,15 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderReadCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/pipeline/unfoldableSet.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -277,6 +280,68 @@ bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t
 
 }
 
+bool ReadShaderLine(uint64_t address, void* data, uint64_t size) {
+	return Libs::Graphics::GuestRange {address, size}.Valid() &&
+	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size);
+}
+
+bool ShaderReadMayDrain(uint64_t address, std::span<uint32_t> values) {
+	return Libs::Graphics::GuestRange {address, values.size_bytes()}.Valid() &&
+	       Libs::Graphics::GuestGpu::IsGpuThread();
+}
+
+template <bool Permissive>
+bool ReadShaderGuestMemoryCached(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	return static_cast<Libs::Graphics::ShaderGuestReadCache*>(userdata)->Read(
+	    address, values, ReadShaderLine,
+	    [](uint64_t word_address, std::span<uint32_t> words, bool& drained) {
+		    if (words.empty()) {
+			    return false;
+		    }
+		    if (Libs::LibKernel::Memory::TryReadGpuCleanBacking(word_address, words.data(),
+		                                                        words.size_bytes())) {
+			    return true;
+		    }
+		    drained = ShaderReadMayDrain(word_address, words);
+		    return Permissive ? ReadShaderGuestMemoryPermissive(nullptr, word_address, words)
+		                      : ReadShaderGuestMemory(nullptr, word_address, words);
+	    });
+}
+
+bool ReadShaderGuestMemoryClean(void* userdata, uint64_t address, std::span<uint32_t> values) {
+	const auto read = [](uint64_t word_address, std::span<uint32_t> words, bool&) {
+		return !words.empty() && Libs::LibKernel::Memory::TryReadGpuCleanBacking(
+		                             word_address, words.data(), words.size_bytes());
+	};
+	if (userdata == nullptr) {
+		bool drained = false;
+		return read(address, values, drained);
+	}
+	return static_cast<Libs::Graphics::ShaderGuestReadCache*>(userdata)->Read(
+	    address, values, ReadShaderLine, read);
+}
+
+bool HashShaderGuestBlock(void*, uint64_t address, uint64_t size, uint64_t* hash) {
+	const std::unique_ptr<XXH3_state_t, decltype(&XXH3_freeState)> state(XXH3_createState(),
+	                                                                     XXH3_freeState);
+	if (size == 0 || state == nullptr || XXH3_64bits_reset(state.get()) != XXH_OK) {
+		return false;
+	}
+	const auto visit = [](void* context, const uint8_t* data, uint64_t bytes) {
+		XXH3_64bits_update(static_cast<XXH3_state_t*>(context), data, static_cast<size_t>(bytes));
+	};
+	if (!Libs::LibKernel::Memory::TryVisitGpuCleanBacking(address, size, visit, state.get())) {
+		return false;
+	}
+	*hash = XXH3_64bits_digest(state.get());
+	return true;
+}
+
+Libs::Graphics::ShaderGuestReadCache& ShaderReadCache() {
+	static thread_local Libs::Graphics::ShaderGuestReadCache cache;
+	return cache;
+}
+
 // Asked only after a read has already refused, so it re-probes and may well answer that the range
 // reads back now - that answer is itself the finding, not a contradiction.
 const char* DescribeShaderReadRefusal(void*, uint64_t address) {
@@ -540,6 +605,11 @@ private:
 	int64_t               m_start;
 };
 
+bool EnvSwitch(const char* name) {
+	const char* text = std::getenv(name);
+	return text != nullptr && std::strcmp(text, "0") != 0;
+}
+
 } // namespace
 
 std::size_t PipelineCache::GraphicsPipelineKeyHash::operator()(const GraphicsPipelineKey& key) const {
@@ -788,13 +858,22 @@ struct PipelineCache::ProgramCache {
 		// moves the generation above, so the next draw of this shader misses and re-translates
 		// with the proof in hand.
 		std::vector<uint32_t>                        reported_unfoldable;
-		ShaderRecompiler::IR::SrtRuntime             runtime {
-		    .user_data                  = user_data,
-		    .shader_base                = params.Base(),
-		    .read_memory                = ReadShaderGuestMemoryPermissive,
-		    .read_specialization_memory = ReadShaderGuestMemory,
-		    .readable_extent            = ReadableShaderExtent,
-		    .describe_read_refusal      = DescribeShaderReadRefusal,
+		auto&                                        read_cache = ShaderReadCache();
+		read_cache.Reset();
+		static const bool no_read_cache = EnvSwitch("KYTY_NO_SHADER_READ_CACHE");
+		static const bool no_heap_hash  = EnvSwitch("KYTY_NO_HEAP_HASH_IN_PLACE");
+		ShaderRecompiler::IR::SrtRuntime runtime {
+		    .user_data   = user_data,
+		    .shader_base = params.Base(),
+		    .read_memory =
+		        no_read_cache ? ReadShaderGuestMemoryPermissive : ReadShaderGuestMemoryCached<true>,
+		    .userdata = no_read_cache ? nullptr : &read_cache,
+		    .read_specialization_memory =
+		        no_read_cache ? ReadShaderGuestMemory : ReadShaderGuestMemoryCached<false>,
+		    .readable_extent           = ReadableShaderExtent,
+		    .describe_read_refusal     = DescribeShaderReadRefusal,
+		    .hash_specialization_block = no_heap_hash ? nullptr : HashShaderGuestBlock,
+		    .read_condition_memory     = ReadShaderGuestMemoryClean,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;

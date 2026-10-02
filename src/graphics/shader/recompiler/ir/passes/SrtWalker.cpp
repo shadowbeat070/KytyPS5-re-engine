@@ -2130,7 +2130,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 }
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailure* failure,
-                                  bool prune) {
+                                  bool prune, SrtWalker* conditions) {
 	const auto refuse = [&](FlatRefreshFailure::Stage stage, uint32_t flat_offset) {
 		if (failure != nullptr) {
 			failure->stage       = stage;
@@ -2223,7 +2223,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 			if (!refresh(slot)) return false;
 		}
 		uint32_t condition = 0;
-		auto& predicate = m_clean_evaluator != nullptr ? *m_clean_evaluator : *this;
+		auto&    predicate = conditions != nullptr          ? *conditions
+		                     : m_clean_evaluator != nullptr ? *m_clean_evaluator
+		                                                    : *this;
 		if (prune && !block.condition.IsEmpty() &&
 		    m_runtime.read_specialization_memory != nullptr &&
 		    predicate.Evaluate(block.condition, condition)) {

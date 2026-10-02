@@ -28,6 +28,9 @@ using SrtReadRefusalDescriber = const char* (*)(void* userdata, uint64_t address
 // costs a cache lock and a region search; enumerating a table pays that tens of thousands of times.
 using SrtBlockReader = bool (*)(void* userdata, uint64_t address, void* data, uint64_t size);
 
+// XXH3-64 of a contiguous block, false wherever the strict reader's first read would refuse.
+using SrtBlockHasher = bool (*)(void* userdata, uint64_t address, uint64_t size, uint64_t* hash);
+
 struct SrtRuntime {
 	std::span<const uint32_t> user_data;
 	uint64_t                  shader_base                = 0;
@@ -37,6 +40,9 @@ struct SrtRuntime {
 	SrtExtentQuery            readable_extent            = nullptr;
 	SrtReadRefusalDescriber   describe_read_refusal      = nullptr;
 	SrtBlockReader            read_specialization_block  = nullptr;
+	SrtBlockHasher            hash_specialization_block  = nullptr;
+	// Reads a branch condition's memory without draining the GPU; a refusal visits both arms.
+	SrtMemoryReader           read_condition_memory      = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 };
 
@@ -233,7 +239,7 @@ public:
 	// Refreshes reachable scalar reads and active descriptor sources in one walk.
 	// With prune clear every block counts as reachable and no branch condition is read.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailure* failure = nullptr,
-	                       bool prune = true);
+	                       bool prune = true, SrtWalker* conditions = nullptr);
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);

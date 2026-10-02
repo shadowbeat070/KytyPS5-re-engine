@@ -1,10 +1,13 @@
 #include "graphics/host_gpu/renderer/cache/bindlessTranslation.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderReadCache.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
+#include <array>
 #include <bit>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <map>
 #include <limits>
 #include <memory>
@@ -734,6 +737,98 @@ void TestBindlessHeapTranslation() {
         "the second pass re-resolved cached records or missed the unsettled one");
 }
 
+void TestShaderReadCache() {
+  using Libs::Graphics::ShaderGuestReadCache;
+  constexpr uint64_t base = 0x10000;
+  std::vector<uint32_t> memory(1024);
+  for (uint32_t i = 0; i < memory.size(); i++) {
+    memory[i] = 0x1000u + i;
+  }
+  uint64_t dirty_begin = UINT64_MAX;
+  uint64_t dirty_end = UINT64_MAX;
+  bool drain = false;
+  uint32_t line_reads = 0;
+  uint32_t word_reads = 0;
+  const auto inside = [&](uint64_t address, uint64_t size) {
+    return address >= base && address + size <= base + memory.size() * 4u;
+  };
+  const auto clean = [&](uint64_t address, uint64_t size) {
+    return inside(address, size) &&
+           (address + size <= dirty_begin || address >= dirty_end);
+  };
+  const auto copy = [&](uint64_t address, void *data, uint64_t size) {
+    std::memcpy(data,
+                reinterpret_cast<const uint8_t *>(memory.data()) +
+                    (address - base),
+                size);
+  };
+  const auto clean_line = [&](uint64_t address, void *data, uint64_t size) {
+    line_reads++;
+    if (!clean(address, size)) {
+      return false;
+    }
+    copy(address, data, size);
+    return true;
+  };
+  const auto reader = [&](uint64_t address, std::span<uint32_t> words,
+                          bool &drained) {
+    word_reads++;
+    if (words.empty() || !inside(address, words.size_bytes())) {
+      return false;
+    }
+    drained = drain && !clean(address, words.size_bytes());
+    copy(address, words.data(), words.size_bytes());
+    return true;
+  };
+  ShaderGuestReadCache cache;
+  cache.Reset();
+  uint32_t word = 0;
+  const auto read = [&](uint64_t address) {
+    return cache.Read(address, {&word, 1}, clean_line, reader);
+  };
+
+  bool served = true;
+  for (uint32_t i = 0; i < 64; i++) {
+    served = served && read(base + i * 4u) && word == 0x1000u + i;
+  }
+  Check(served && line_reads == 1 && word_reads == 0,
+        "a clean line was not read once for every word in it");
+  std::array<uint32_t, 8> descriptor{};
+  Check(cache.Read(base + 256 + 32, descriptor, clean_line, reader) &&
+            descriptor[0] == 0x1000u + 72 && descriptor[7] == 0x1000u + 79 &&
+            line_reads == 2 && word_reads == 0,
+        "a descriptor inside one line was not served from it");
+  std::array<uint32_t, 2> straddle{};
+  Check(cache.Read(base + 252, straddle, clean_line, reader) &&
+            straddle[0] == 0x1000u + 63 && straddle[1] == 0x1000u + 64 &&
+            word_reads == 1 && line_reads == 2,
+        "a read across two lines did not go to the reader");
+
+  memory[0] = 0xdeadu;
+  Check(read(base) && word == 0x1000u && line_reads == 2,
+        "a walk did not see the line it had already read");
+  cache.Reset();
+  Check(read(base) && word == 0xdeadu && line_reads == 3,
+        "a reset cache served a line read before it");
+
+  dirty_begin = base + 512 + 8;
+  dirty_end = dirty_begin + 4;
+  const auto words_before = word_reads;
+  served = true;
+  for (uint32_t i = 0; i < 4; i++) {
+    served = served && read(base + 512 + i * 4u) && word == 0x1000u + 128 + i;
+  }
+  Check(served && word_reads == words_before + 4 && line_reads == 4,
+        "a line with one dirty word was not read word by word, or was "
+        "re-checked per word");
+
+  drain = true;
+  Check(read(base + 512 + 8) && read(base) && line_reads == 5,
+        "the cache kept its lines across a reader that may have drained");
+  Check(!read(base - 4) && !cache.Read(base, {}, clean_line, reader),
+        "the cache accepted a read the reader refuses");
+}
+
 } // namespace
 
 namespace Common {
@@ -764,6 +859,7 @@ int main() {
   TestBindlessRecordCount();
   TestBindlessSlotAllocation();
   TestBindlessHeapTranslation();
+  TestShaderReadCache();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

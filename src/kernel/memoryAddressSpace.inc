@@ -187,6 +187,16 @@ public:
 		    });
 	}
 
+	bool TryVisitBacking(uint64_t vaddr, uint64_t size, BackingVisitor visit, void* context) {
+		if (visit == nullptr) {
+			return false;
+		}
+		return TryTransferBacking(vaddr, size,
+		                          [visit, context](uint8_t* backing, uint64_t, size_t bytes) {
+			                          visit(context, backing, bytes);
+		                          });
+	}
+
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
 		if (!IsAvailable() || data == nullptr || size == 0 || UINT64_MAX - vaddr < size) {
 			return false;
@@ -787,6 +797,10 @@ public:
 
 	bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 		return m_backing->TryReadBacking(vaddr, data, size);
+	}
+
+	bool TryVisitBacking(uint64_t vaddr, uint64_t size, BackingVisitor visit, void* context) {
+		return m_backing->TryVisitBacking(vaddr, size, visit, context);
 	}
 
 	bool TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size) {
