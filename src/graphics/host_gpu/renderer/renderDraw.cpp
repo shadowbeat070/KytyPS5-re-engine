@@ -383,7 +383,9 @@ static void SetGraphicsDynamicParams(const CommandBuffer& buffer, vk::CommandBuf
 #if !defined(__APPLE__)
 	vk_buffer.setDepthBoundsTestEnable(depth.depth_bounds_test_enable ? VK_TRUE : VK_FALSE);
 	if (depth.depth_bounds_test_enable) {
-		vk_buffer.setDepthBounds(ctx.GetDepthBoundsMin(), ctx.GetDepthBoundsMax());
+		// Without VK_EXT_depth_range_unrestricted the bounds must lie in [0, 1].
+		vk_buffer.setDepthBounds(std::clamp(ctx.GetDepthBoundsMin(), 0.0f, 1.0f),
+		                         std::clamp(ctx.GetDepthBoundsMax(), 0.0f, 1.0f));
 	}
 #endif
 
