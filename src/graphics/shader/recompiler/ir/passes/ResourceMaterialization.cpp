@@ -12,6 +12,7 @@
 #include <array>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <functional>
@@ -1078,7 +1079,9 @@ bool MaterializeIndirectImage(const ResourcePlan& program,
 
 // These numbers decide whether a runtime descriptor selection is needed at all, so they are
 // reported once per shader whether the table is accepted or refused.
-void ReportIndirectBuffer(uint64_t shader_hash, const std::string& message) {
+template <typename... Args>
+void ReportIndirectBuffer(uint64_t shader_hash, fmt::format_string<Args...> format,
+                          Args&&... args) {
 	static std::mutex                   mutex;
 	static std::unordered_set<uint64_t> reported;
 	{
@@ -1087,6 +1090,7 @@ void ReportIndirectBuffer(uint64_t shader_hash, const std::string& message) {
 			return;
 		}
 	}
+	const auto message = fmt::format(format, std::forward<Args>(args)...);
 	std::printf("shader 0x%016llx indirect buffer table: %s\n",
 	            static_cast<unsigned long long>(shader_hash), message.c_str());
 	std::fflush(stdout);
@@ -1129,22 +1133,35 @@ public:
 		return store;
 	}
 
-	[[nodiscard]] std::shared_ptr<const IndirectBuffer> Find(uint64_t signature, uint64_t content) {
+	struct Lookup {
+		bool                                  found = false;
+		std::shared_ptr<const IndirectBuffer> result;
+		std::shared_ptr<const std::string>    refusal;
+	};
+
+	[[nodiscard]] Lookup Find(uint64_t signature, uint64_t content) {
 		const std::lock_guard<std::mutex> lock(m_mutex);
 		const auto found = m_tables.find(signature);
 		if (found == m_tables.end() || found->second.content != content) {
-			return nullptr;
+			return {};
 		}
-		return found->second.result;
+		return {true, found->second.result, found->second.refusal};
 	}
 
 	void Remember(uint64_t signature, uint64_t content, std::shared_ptr<const IndirectBuffer> result) {
-		const std::lock_guard<std::mutex> lock(m_mutex);
-		// Bounded the same way the image memo is.
-		if (m_tables.size() >= MaxRememberedTables) {
-			m_tables.clear();
+		Store(signature, {content, std::move(result), nullptr});
+	}
+
+	void RememberRefusal(uint64_t signature, uint64_t content, std::string reason) {
+		static const bool off = [] {
+			const char* text = std::getenv("KYTY_NO_REFUSAL_MEMO");
+			return text != nullptr && std::strcmp(text, "0") != 0;
+		}();
+		if (off) {
+			return;
 		}
-		m_tables[signature] = {content, std::move(result)};
+		Store(signature,
+		      {content, nullptr, std::make_shared<const std::string>(std::move(reason))});
 	}
 
 private:
@@ -1152,7 +1169,17 @@ private:
 	struct Entry {
 		uint64_t                              content = 0;
 		std::shared_ptr<const IndirectBuffer> result;
+		std::shared_ptr<const std::string>    refusal;
 	};
+
+	void Store(uint64_t signature, Entry entry) {
+		const std::lock_guard<std::mutex> lock(m_mutex);
+		// Bounded the same way the image memo is.
+		if (m_tables.size() >= MaxRememberedTables) {
+			m_tables.clear();
+		}
+		m_tables[signature] = std::move(entry);
+	}
 	static constexpr size_t MaxRememberedTables = 256;
 
 	std::mutex                          m_mutex;
@@ -1202,28 +1229,40 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 	const auto declared = static_cast<uint32_t>(heap.Stride());
 	const auto records  = heap.NumRecords();
 	if (declared != indirect.selector_stride && declared != 0u) {
-		ReportIndirectBuffer(
-		    shader_hash,
-		    fmt::format("refused: table stride {} does not match the selector stride {} "
-		                "(records {}, record offset {})",
-		                declared, indirect.selector_stride, records, indirect.record_offset));
+		ReportIndirectBuffer(shader_hash,
+		                     "refused: table stride {} does not match the selector stride {} "
+		                     "(records {}, record offset {})",
+		                     declared, indirect.selector_stride, records, indirect.record_offset);
 		return false;
 	}
 	const auto size        = heap.GetSize();
 	const auto probe_count = size / indirect.selector_stride;
 	if (probe_count > MaxIndirectBufferProbes) {
-		ReportIndirectBuffer(
-		    shader_hash,
-		    fmt::format("refused: {} probes exceed the {} probe budget (table stride {}, "
-		                "selector stride {}, records {}, record offset {})",
-		                probe_count, MaxIndirectBufferProbes, declared, indirect.selector_stride,
-		                records, indirect.record_offset));
+		ReportIndirectBuffer(shader_hash,
+		                     "refused: {} probes exceed the {} probe budget (table stride {}, "
+		                     "selector stride {}, records {}, record offset {})",
+		                     probe_count, MaxIndirectBufferProbes, declared,
+		                     indirect.selector_stride, records, indirect.record_offset);
 		return false;
 	}
 
+	const auto word_count = static_cast<size_t>(size / sizeof(uint32_t));
+	const auto signature  = IndirectBufferSignature(indirect, heap_value);
+	const auto Remembered = [&](uint64_t content, bool& accepted) {
+		auto cached = EnumeratedIndirectBuffers::Instance().Find(signature, content);
+		if (!cached.found) {
+			return false;
+		}
+		accepted = cached.refusal == nullptr;
+		if (!accepted && !cached.refusal->empty()) {
+			ReportIndirectBuffer(shader_hash, "{}", *cached.refusal);
+		}
+		result = std::move(cached.result);
+		return true;
+	};
+
 	// One read of the whole table, not four per record. A successful read writes every word.
 	static thread_local std::vector<uint32_t> table_words;
-	const auto word_count = static_cast<size_t>(size / sizeof(uint32_t));
 	table_words.resize(word_count);
 	{
 		KYTY_PROFILER_BLOCK("MaterializeIndirectBuffer read");
@@ -1238,10 +1277,8 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		KYTY_PROFILER_BLOCK("MaterializeIndirectBuffer hash");
 		content = XXH3_64bits(table_words.data(), table_words.size() * sizeof(uint32_t));
 	}
-	const auto signature = IndirectBufferSignature(indirect, heap_value);
-	if (auto cached = EnumeratedIndirectBuffers::Instance().Find(signature, content)) {
-		result = std::move(cached);
-		return true;
+	if (bool accepted = false; Remembered(content, accepted)) {
+		return accepted;
 	}
 	const auto word_at = [&](uint64_t byte_offset, uint32_t& word) {
 		const auto index = byte_offset / sizeof(uint32_t);
@@ -1269,6 +1306,7 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		for (uint32_t dword = 0; dword < candidate.dword_count; dword++) {
 			if (!word_at(dynamic + indirect.record_offset + dword * sizeof(uint32_t),
 			             candidate.dwords[dword])) {
+				EnumeratedIndirectBuffers::Instance().RememberRefusal(signature, content, {});
 				return false;
 			}
 		}
@@ -1284,13 +1322,14 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 			// MaxBuffers is how many buffers a shader may track; the candidates a table expands
 			// into are budgeted by MaxDenseBuffers, as the image twin of this loop uses MaxImages.
 			if (next.descriptors.size() >= ShaderInfo::MaxDenseBuffers) {
-				ReportIndirectBuffer(
-				    shader_hash,
-				    fmt::format("refused: distinct descriptors exceed the {} buffer limit over "
-				                "{} probes (table stride {}, selector stride {}, records {}, "
-				                "record offset {})",
-				                ShaderInfo::MaxDenseBuffers, probe_count, declared,
-				                indirect.selector_stride, records, indirect.record_offset));
+				auto reason = fmt::format(
+				    "refused: distinct descriptors exceed the {} buffer limit over {} probes "
+				    "(table stride {}, selector stride {}, records {}, record offset {})",
+				    ShaderInfo::MaxDenseBuffers, probe_count, declared, indirect.selector_stride,
+				    records, indirect.record_offset);
+				ReportIndirectBuffer(shader_hash, "{}", reason);
+				EnumeratedIndirectBuffers::Instance().RememberRefusal(signature, content,
+				                                                      std::move(reason));
 				return false;
 			}
 			next.descriptors.push_back(candidate);
@@ -1305,12 +1344,11 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		next.descriptors.push_back(null_descriptor);
 		next.candidates.push_back(0u);
 	}
-	ReportIndirectBuffer(
-	    shader_hash,
-	    fmt::format("probes {}, distinct descriptors {}, table stride {}, selector stride {}, "
-	                "records {}, record offset {}",
-	                probe_count, next.descriptors.size(), declared, indirect.selector_stride,
-	                records, indirect.record_offset));
+	ReportIndirectBuffer(shader_hash,
+	                     "probes {}, distinct descriptors {}, table stride {}, selector stride {}, "
+	                     "records {}, record offset {}",
+	                     probe_count, next.descriptors.size(), declared, indirect.selector_stride,
+	                     records, indirect.record_offset);
 	DeriveIndirectBufferMapping(next);
 	result = std::make_shared<const IndirectBuffer>(std::move(next));
 	EnumeratedIndirectBuffers::Instance().Remember(signature, content, result);
