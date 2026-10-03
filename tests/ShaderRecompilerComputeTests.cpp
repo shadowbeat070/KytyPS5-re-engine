@@ -33844,7 +33844,7 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
 
   std::vector<u32> code;
   AppendVMovU32(&code, 20,
-                1); // Non-constant +1 X offset is not a SPIR-V ConstOffset.
+                1); // +1 X offset; in A16 the offset dword stays 32-bit.
   AppendVMovLiteral(&code, 21, 0x36003900u); // x=0.625, y=0.375 packed as f16.
   AppendVMovU32(&code, 22, 0);
   code.push_back(EncodeMimg0(0x30, 0xf));
@@ -33854,19 +33854,56 @@ TestCase ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu() {
   }
   AppendEnd(&code);
 
+  // The offset must move the fetch from texel (2,1) to (3,1).
   auto image = MakeRgbaImage(4, 4);
   SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
                0x40800000u);
+  SetRgbaPixel(&image, 4, 3, 1, 0x40a00000u, 0x40c00000u, 0x40e00000u,
+               0x41000000u);
 
   TestCase test;
   test.name = "ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu";
   test.code = code;
-  test.expected = {0x3f800000u, 0x40000000u, 0x40400000u, 0x40800000u};
+  test.expected = {0x40a00000u, 0x40c00000u, 0x40e00000u, 0x41000000u};
   test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
                   O::S_ENDPGM};
   test.sampled_image_rgba = image;
-  test.required_spirv = {"UnpackHalf2x16"};
-  test.forbidden_spirv = {"OpBitFieldSExtract"};
+  test.required_spirv = {"UnpackHalf2x16", "OpBitFieldSExtract",
+                         "OpImageQuerySizeLod"};
+  return test;
+}
+
+TestCase ImageSampleLevelZeroOffsetShiftsBothAxesOnGpu() {
+  using O = ShaderOpcode;
+
+  // 6-bit offset lanes are sign extended, so 0x3f is -1.
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, 0x0000013fu);
+  AppendVMovLiteral(&code, 21, 0x3f200000u); // x=0.625
+  AppendVMovLiteral(&code, 22, 0x3ec00000u); // y=0.375
+  code.push_back(EncodeMimg0(0x37, 0xf));
+  code.push_back(EncodeMimg1(0, 20));
+  for (u32 i = 0; i < 4u; i++) {
+    AppendStoreVgpr(&code, i, i);
+  }
+  AppendEnd(&code);
+
+  // Unshifted the sample lands on texel (2,1); the offset moves it to (1,2).
+  auto image = MakeRgbaImage(4, 4);
+  SetRgbaPixel(&image, 4, 2, 1, 0x3f800000u, 0x40000000u, 0x40400000u,
+               0x40800000u);
+  SetRgbaPixel(&image, 4, 1, 2, 0x41100000u, 0x41200000u, 0x41300000u,
+               0x41400000u);
+
+  TestCase test;
+  test.name = "ImageSampleLevelZeroOffsetShiftsBothAxesOnGpu";
+  test.code = code;
+  test.expected = {0x41100000u, 0x41200000u, 0x41300000u, 0x41400000u};
+  test.opcodes = {O::V_MOV_B32, O::IMAGE_SAMPLE, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.sampled_image_rgba = image;
+  test.required_spirv = {"OpImageSampleExplicitLod", "OpBitFieldSExtract"};
+  test.forbidden_spirv = {"ConstOffset"};
   return test;
 }
 
@@ -36390,6 +36427,7 @@ std::vector<TestCase> MakeCases() {
   AddCase(ImageSampleA16SamplerCoordsOnGpu);
   AddCase(ImageSampleOpcodeAliasUsesNormalCoords);
   AddCase(ImageSampleA16OffsetKeepsTexelOffset32BitOnGpu);
+  AddCase(ImageSampleLevelZeroOffsetShiftsBothAxesOnGpu);
   AddCase(ImageSampleA16CompareBiasRdna2AddressOrder);
   AddCase(ImageGatherCompareOpcodes);
   AddCase(ImageStoreVariants);
