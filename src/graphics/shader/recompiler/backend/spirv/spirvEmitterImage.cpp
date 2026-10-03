@@ -363,7 +363,33 @@ uint32_t PackedOffset(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR
 	return result;
 }
 
-// The dynamic Offset operand is gather-only, so a sample offset is folded into the coordinate.
+// The _L level, rounded to the nearest mip and clamped to the view; level 0 for every other form.
+uint32_t ExplicitLodLevel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
+                          const ImageSampleLayout& layout, uint32_t image) {
+	auto& state = ctx.state;
+	if (!HasFlag(mem, Decoder::ImageSampleFlagLod) || layout.lod == NoImageComponent) {
+		return ConstantU32(state, 0);
+	}
+	state.builder.RequireCapability(spv::CapabilityImageQuery);
+	const auto rounded = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeF32(state), rounded, GlslStd450(state), GLSLstd450Floor,
+	    Binary(state, spv::OpFAdd, TypeF32(state), AddressF32(ctx, mem, address, layout.lod),
+	           ConstantF32(state, 0x3f000000u)));
+	const auto positive = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeF32(state), positive, GlslStd450(state),
+	                          GLSLstd450FMax, rounded, ZeroF32(state));
+	const auto levels = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpImageQueryLevels, TypeU32(state), levels, image);
+	const auto level = state.builder.AllocateId();
+	state.builder.AddFunction(
+	    spv::OpExtInst, TypeU32(state), level, GlslStd450(state), GLSLstd450UMin,
+	    Unary(state, spv::OpConvertFToU, TypeU32(state), positive),
+	    Binary(state, spv::OpISub, TypeU32(state), levels, ConstantU32(state, 1)));
+	return level;
+}
+
+// Offset is gather-only, so a sample offset is folded into the coordinate at the sampled level.
 uint32_t OffsetCoordinate(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                           const ImageSampleLayout& layout, ImageDimension dimension, uint32_t coord,
                           uint32_t resource) {
@@ -381,7 +407,7 @@ uint32_t OffsetCoordinate(ValueEmitContext& ctx, const IR::MemoryInfo& mem, cons
 		                          image);
 	} else {
 		state.builder.AddFunction(spv::OpImageQuerySizeLod, ImageViewSizeType(state, dimension),
-		                          size, image, ConstantU32(state, 0));
+		                          size, image, ExplicitLodLevel(ctx, mem, address, layout, image));
 	}
 
 	const auto coord_components   = info.coordinate_components;
