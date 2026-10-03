@@ -704,6 +704,13 @@ struct SrtRead {
 	bool operator==(const SrtRead& other) const = default;
 };
 
+struct SrtReadWriteOrder {
+	uint64_t buffers = 0;
+	bool     unknown = true;
+
+	bool operator==(const SrtReadWriteOrder& other) const = default;
+};
+
 struct ResourceBlock {
 	// Conditional successors are ordered true, false; an empty condition follows every edge.
 	Value                 condition;
@@ -777,6 +784,8 @@ struct ResourcePlan {
 	// information, just trivial. Only the former may leave an unreadable source null.
 	bool                                control_flow_unknown = false;
 	std::vector<SrtRead>                srt_reads;
+	std::vector<SrtReadWriteOrder>      srt_read_order;
+	std::vector<uint8_t>                clean_flat_slots;
 	bool                                requires_specialization_memory = false;
 	std::vector<std::pair<uint64_t, uint64_t>> source_reads;
 	bool                                capture_specialization_reads = false;
