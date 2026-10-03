@@ -267,10 +267,74 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	return m_pipelines[slot];
 }
 
-void TileManager::Record(vk::Buffer source, uint64_t source_offset,
-                         uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
-                         uint64_t target_capacity, std::span<Dispatch> dispatches,
-                         bool clear_target) {
+TileManager::Result TileManager::StageTiled(uint64_t offset, uint64_t capacity) {
+	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
+	const uint64_t descriptor_alignment =
+	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
+	const uint64_t base = offset & (descriptor_alignment - 1);
+	const uint64_t size = Common::AlignUp(base + capacity, 4);
+	m_scratch_used_tick = m_scheduler.CurrentTick();
+	if (!m_tiled_scratch || m_tiled_scratch->Size() < size) {
+		if (m_tiled_scratch) {
+			m_scheduler.DeferOperation(
+			    [old = std::move(m_tiled_scratch)]() mutable { old.reset(); });
+		}
+		m_tiled_scratch = std::make_unique<Buffer>(
+		    m_graphics, m_scheduler, MemoryUsage::DeviceLocal, 0,
+		    vk::BufferUsageFlagBits::eStorageBuffer | vk::BufferUsageFlagBits::eTransferSrc |
+		        vk::BufferUsageFlagBits::eTransferDst,
+		    size);
+	}
+	return {m_tiled_scratch->Handle(), base, capacity};
+}
+
+void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+                         vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+                         std::span<Dispatch> dispatches, bool clear_target) {
+	const bool tile         = !clear_target;
+	const auto tiled_offset = tile ? target_offset : source_offset;
+	const auto tiled_bytes  = tile ? target_capacity : source_capacity;
+	const auto tiled_buffer = tile ? target : source;
+	const auto staged       = StageTiled(tiled_offset, tiled_bytes);
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+
+	vk::MemoryBarrier before {};
+	before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eMemoryRead |
+	                       vk::AccessFlagBits::eHostWrite;
+	before.dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	    vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0, nullptr);
+	// Tiling preserves the bytes no element covers, so the guest copy seeds the scratch too.
+	const vk::BufferCopy copy_in {tiled_offset, staged.offset, tiled_bytes};
+	command.copyBuffer(tiled_buffer, staged.buffer, 1, &copy_in);
+	if (tile) {
+		RecordPasses(source, source_offset, source_capacity, staged.buffer, staged.offset,
+		             target_capacity, dispatches, false);
+		command = m_scheduler.Current().Handle();
+		const vk::BufferCopy copy_out {staged.offset, target_offset, target_capacity};
+		command.copyBuffer(staged.buffer, target, 1, &copy_out);
+		vk::BufferMemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.buffer              = target;
+		after.offset              = target_offset;
+		after.size                = target_capacity;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, &after,
+		                        0, nullptr);
+		return;
+	}
+	RecordPasses(staged.buffer, staged.offset, source_capacity, target, target_offset,
+	             target_capacity, dispatches, true);
+}
+
+void TileManager::RecordPasses(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+                               vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+                               std::span<Dispatch> dispatches, bool clear_target) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -339,7 +403,10 @@ void TileManager::Record(vk::Buffer source, uint64_t source_offset,
 		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 		                             static_cast<uint32_t>(writes.size()), writes.data());
 		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
-		command.dispatch((dispatch.push.width + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
+		const uint32_t element_bytes = 1u << (dispatch.pipeline_slot % BytesPerElementCount);
+		const uint32_t group         = element_bytes >= 4u ? 1u : 4u / element_bytes;
+		const uint32_t columns       = (dispatch.push.width + group - 1u) / group;
+		command.dispatch((columns + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
 		                 dispatch.push.depth);
 	}
 
@@ -401,8 +468,25 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	       dispatches, false);
 }
 
+void TileManager::ReleaseScratch() {
+	constexpr uint64_t IdleSubmissions = 256;
+	if (m_scheduler.CurrentTick() - std::min(m_scheduler.CurrentTick(), m_scratch_used_tick) <
+	    IdleSubmissions) {
+		return;
+	}
+	for (auto& buffer: m_scratch) {
+		if (buffer) {
+			m_scheduler.DeferOperation([old = std::move(buffer)]() mutable { old.reset(); });
+		}
+	}
+	if (m_tiled_scratch) {
+		m_scheduler.DeferOperation([old = std::move(m_tiled_scratch)]() mutable { old.reset(); });
+	}
+}
+
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
 	EXIT_IF(size == 0);
+	m_scratch_used_tick = m_scheduler.CurrentTick();
 	size = Common::AlignUp(size, 4);
 	auto& buffer = m_scratch[m_scratch[0] && m_scratch[0]->Handle() == input ? 1 : 0];
 	if (!buffer || buffer->Size() < size) {

@@ -42,12 +42,9 @@ void copy_element(uint src, uint dst) {
 	}
 }
 
-void main() {
-	uvec3 p = gl_GlobalInvocationID;
-	if (p.x >= params.width || p.y >= params.height || p.z >= params.depth) {
-		return;
-	}
+const uint GROUP = ELEMENT_BYTES >= 4u ? 1u : 4u / ELEMENT_BYTES;
 
+void element_offsets(uvec3 p, out uint src, out uint dst) {
 	uvec3 extent = block_extent();
 	uvec3 swizzle = p;
 	uvec3 block = uvec3(0);
@@ -63,9 +60,45 @@ void main() {
 	             block_offset(uvec3(swizzle.xy, swizzle.z + params.surface_z));
 	uint linear = p.z * params.slice_bytes + p.y * params.pitch_bytes +
 	              p.x * ELEMENT_BYTES;
-	if (TILE == 0) {
-		copy_element(params.src_base + tiled, params.dst_base + linear);
-	} else {
-		copy_element(params.src_base + linear, params.dst_base + tiled);
+	src = params.src_base + (TILE == 0 ? tiled : linear);
+	dst = params.dst_base + (TILE == 0 ? linear : tiled);
+}
+
+void main() {
+	uvec3 q = gl_GlobalInvocationID;
+	uint first_x = q.x * GROUP;
+	if (first_x >= params.width || q.y >= params.height || q.z >= params.depth) {
+		return;
 	}
+	uint src[4];
+	uint dst[4];
+	uint count = min(GROUP, params.width - first_x);
+	for (uint k = 0u; k < GROUP; k++) {
+		if (k < count) {
+			element_offsets(uvec3(first_x + k, q.y, q.z), src[k], dst[k]);
+		}
+	}
+	bool whole = GROUP > 1u && count == GROUP && (dst[0] & 3u) == 0u;
+	bool packed_source = (src[0] & 3u) == 0u;
+	for (uint k = 1u; k < GROUP; k++) {
+		whole = whole && dst[k] == dst[0] + k * ELEMENT_BYTES;
+		packed_source = packed_source && src[k] == src[0] + k * ELEMENT_BYTES;
+	}
+	if (!whole) {
+		for (uint k = 0u; k < count; k++) {
+			copy_element(src[k], dst[k]);
+		}
+		return;
+	}
+	uint value = 0u;
+	if (packed_source) {
+		value = input_buffer.data[src[0] >> 2];
+	} else {
+		uint mask = ELEMENT_BYTES == 1 ? 0xffu : 0xffffu;
+		for (uint k = 0u; k < GROUP; k++) {
+			uint element = (input_buffer.data[src[k] >> 2] >> ((src[k] & 3u) * 8u)) & mask;
+			value |= element << (k * ELEMENT_BYTES * 8u);
+		}
+	}
+	output_buffer.data[dst[0] >> 2] = value;
 }

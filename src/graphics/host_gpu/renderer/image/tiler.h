@@ -77,6 +77,7 @@ public:
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);
+	void                 ReleaseScratch();
 	void TransformColor(Result input, Result output, ColorTransform transform, bool to_host);
 
 private:
@@ -125,12 +126,18 @@ private:
 	void Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	            std::span<Dispatch> dispatches, bool clear_target);
+	void RecordPasses(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
+	                  vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
+	                  std::span<Dispatch> dispatches, bool clear_target);
+	[[nodiscard]] Result       StageTiled(uint64_t offset, uint64_t capacity);
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
 
 	GraphicContext&                         m_graphics;
 	CommandScheduler&                       m_scheduler;
 	StreamBuffer&                           m_stream_buffer;
 	std::array<std::unique_ptr<Buffer>, 2>   m_scratch;
+	std::unique_ptr<Buffer>                  m_tiled_scratch;
+	uint64_t                                 m_scratch_used_tick = 0;
 	vk::DescriptorSetLayout                 m_descriptor_layout = nullptr;
 	vk::PipelineLayout                      m_pipeline_layout   = nullptr;
 	std::array<vk::Pipeline, PipelineCount> m_pipelines {};
