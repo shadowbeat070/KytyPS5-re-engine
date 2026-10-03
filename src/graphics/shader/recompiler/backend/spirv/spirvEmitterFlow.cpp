@@ -807,12 +807,23 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
-	const auto ballot = ctx.Ballot(inst.Arg(0));
-	const auto reference = zero ? ctx.Ballot(IR::Value(true))
-	                            : ConstantU32CompositeZero(ctx.state, 4);
-	const auto compare = Binary(ctx.state, zero ? spv::OpIEqual : spv::OpINotEqual,
-	                            TypeBoolVector(ctx.state, 4), ballot, reference);
-	return Unary(ctx.state, zero ? spv::OpAll : spv::OpAny, TypeBool(ctx.state), compare);
+	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
+	                              TypeU32(ctx.state), combined, low, high);
+	uint32_t reference = 0;
+	if (zero && ctx.state.loop_exit_blocks.contains(inst.Parent())) {
+		const auto active = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(ctx.state, 4),
+		                              active, ConstantU32(ctx.state, spv::ScopeSubgroup),
+		                              ConstantBool(ctx.state, true));
+		reference = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), reference,
+		                              active, 0);
+	} else {
+		reference = ConstantU32(ctx.state, zero ? ~0u : 0u);
+	}
+	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
+	                              result, combined, reference);
+	return result;
 }
 
 uint32_t EmitBallot(ValueEmitContext& ctx, IR::Value predicate) {

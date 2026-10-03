@@ -20,6 +20,7 @@
 #include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -187,6 +188,7 @@ struct EmitterState {
 	// Latch blocks whose terminator can carry the budget, to the loop header id, so the fold knows
 	// which arm is the back edge.
 	std::unordered_map<const IR::Block*, uint32_t> loop_budget_latch;
+	std::unordered_set<const IR::Block*>           loop_exit_blocks;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   per_vertex_variable                   = 0;
 	uint32_t                   point_size_variable                   = 0;
