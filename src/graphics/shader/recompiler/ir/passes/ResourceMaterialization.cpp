@@ -1224,9 +1224,10 @@ void DeriveIndirectBufferMapping(IndirectBuffer& table) {
 
 bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
                                const DescriptorValue& heap_value, const SrtRuntime& runtime,
-                               uint64_t shader_hash,
-                               std::shared_ptr<const IndirectBuffer>& result) {
+                               uint64_t shader_hash, std::shared_ptr<const IndirectBuffer>& result,
+                               bool& refused) {
 	KYTY_PROFILER_FUNCTION();
+	refused = false;
 	ShaderBufferResource heap;
 	if (!DecodeBufferDescriptor(heap_value, heap) || indirect.selector_stride == 0u) {
 		return false;
@@ -1238,6 +1239,7 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		                     "refused: table stride {} does not match the selector stride {} "
 		                     "(records {}, record offset {})",
 		                     declared, indirect.selector_stride, records, indirect.record_offset);
+		refused = true;
 		return false;
 	}
 	const auto size        = heap.GetSize();
@@ -1248,6 +1250,7 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 		                     "selector stride {}, records {}, record offset {})",
 		                     probe_count, MaxIndirectBufferProbes, declared,
 		                     indirect.selector_stride, records, indirect.record_offset);
+		refused = true;
 		return false;
 	}
 
@@ -1259,6 +1262,7 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 			return false;
 		}
 		accepted = cached.refusal == nullptr;
+		refused  = !accepted;
 		if (!accepted && !cached.refusal->empty()) {
 			ReportIndirectBuffer(shader_hash, "{}", *cached.refusal);
 		}
@@ -1324,6 +1328,7 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 			if (!word_at(dynamic + indirect.record_offset + dword * sizeof(uint32_t),
 			             candidate.dwords[dword])) {
 				EnumeratedIndirectBuffers::Instance().RememberRefusal(signature, content, {});
+				refused = true;
 				return false;
 			}
 		}
@@ -1347,6 +1352,7 @@ bool MaterializeIndirectBuffer(const DescriptorSource::IndirectBuffer& indirect,
 				ReportIndirectBuffer(shader_hash, "{}", reason);
 				EnumeratedIndirectBuffers::Instance().RememberRefusal(signature, content,
 				                                                      std::move(reason));
+				refused = true;
 				return false;
 			}
 			next.descriptors.push_back(candidate);
@@ -2412,7 +2418,7 @@ static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan&     program,
 
 bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
                      ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
-                     bool prune = true) {
+                     std::vector<uint32_t>* refused_tables, bool prune = true) {
 	if (!program.resource_tracking_complete ||
 	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
 		MaterializeFailure() = "plan incomplete";
@@ -2477,6 +2483,7 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		value.dword_count = program.descriptor_sources[source].dword_count;
 		return true;
 	};
+	bool table_refused = false;
 	snapshot.buffers.resize(program.info.buffers.size());
 	// Sized before the loop: expanding a table appends a child to both and writes the root's slot here.
 	specialization.buffers.resize(program.info.buffers.size());
@@ -2490,9 +2497,15 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 			}
 			DescriptorValue                       table;
 			std::shared_ptr<const IndirectBuffer> resolved;
+			bool                                  refused = false;
 			if (!clean.EvaluateDescriptor(source->indirect_buffer->heap_source, table) ||
 			    !MaterializeIndirectBuffer(*source->indirect_buffer, table, runtime,
-			                               program.shader_hash, resolved)) {
+			                               program.shader_hash, resolved, refused)) {
+				if (refused && refused_tables != nullptr) {
+					refused_tables->push_back(buffer.first_use_pc);
+					table_refused = true;
+					continue;
+				}
 				MaterializeFailure() = "buffer heap descriptor";
 				return false;
 			}
@@ -2517,6 +2530,10 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 			                buffer.written ? " (written)" : "");
 			return false;
 		}
+	}
+	if (table_refused) {
+		MaterializeFailure() = "buffer heap descriptor";
+		return false;
 	}
 	snapshot.images.resize(program.info.images.size());
 	specialization.images.resize(program.info.images.size());
@@ -2639,7 +2656,8 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 // grows from empty exactly as a fresh snapshot would, so no flattened-SRT slot a shader leaves
 // unwritten can carry another shader value.
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization) {
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* refused_tables) {
 	KYTY_PROFILER_FUNCTION();
 	static thread_local ResourceSnapshot       next;
 	static thread_local ResourceSpecialization next_specialization;
@@ -2656,13 +2674,13 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		next_specialization.images.clear();
 	};
 	reset();
-	if (!MaterializeInto(program, runtime, next, next_specialization)) {
+	if (!MaterializeInto(program, runtime, next, next_specialization, refused_tables)) {
 		return false;
 	}
 	// A branch condition read from a buffer the shader writes cannot prune blocks: walk them all.
 	if (!CapturedReadsAvoidWrittenBuffers(program, next)) {
 		reset();
-		if (!MaterializeInto(program, runtime, next, next_specialization, false)) {
+		if (!MaterializeInto(program, runtime, next, next_specialization, refused_tables, false)) {
 			return false;
 		}
 		if (!CapturedReadsAvoidWrittenBuffers(program, next)) {
