@@ -67,6 +67,8 @@ struct SpirvRequirements {
 	bool compute_derivatives          = false;
 	bool image_gather_extended        = false;
 	bool function_lds                 = false;
+	uint32_t function_lds_dwords          = 0;
+	uint32_t function_lds_unbounded_pc    = UINT32_MAX;
 	bool function_scratch             = false;
 	bool pixel_valid_mask             = false;
 	bool buffer_int64_atomics         = false;
@@ -478,6 +480,7 @@ uint32_t StorageBufferElementBits(const IR::Program& program, const IR::MemoryIn
 void EmitMemoryOffsets(EmitterState& state);
 
 uint32_t LdsDwordCount(const EmitterState& state);
+bool     FunctionLdsDefaultForced();
 void EnsureLdsStorage(EmitterState& state);
 
 struct MemoryResourceAccess {

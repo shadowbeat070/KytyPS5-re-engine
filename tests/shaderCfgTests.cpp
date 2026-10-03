@@ -1418,6 +1418,103 @@ void TestNormalizedImageContracts() {
         "Vulkan image-view compatibility classes diverged from production");
 }
 
+void TestFunctionLdsIsSizedFromItsAddresses() {
+  using namespace ShaderRecompiler::IR;
+  struct Fixture {
+    Program program;
+    Block *block = nullptr;
+    explicit Fixture(uint32_t offset, ResourceKind kind = ResourceKind::Lds) {
+      program.stage = ShaderType::Pixel;
+      program.block_storage.push_back(std::make_unique<Block>());
+      block = program.block_storage.back().get();
+      program.blocks.push_back(block);
+      program.memory_info.push_back({.kind = kind, .offset = offset});
+    }
+    Inst &Add(ValueOpcode op, std::initializer_list<Value> args) {
+      return block->AppendNewInst(op, args);
+    }
+    void Access(Inst &inst, uint32_t pc) { inst.SetFlags(MemoryFlags{.index = 0, .pc = pc}); }
+    ShaderRecompiler::Spirv::Emitter::SpirvRequirements Analyze() const {
+      return ShaderRecompiler::Spirv::Emitter::AnalyzeProgramRequirements(program);
+    }
+  };
+
+  {
+    Fixture f(1024);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &address = f.Add(ValueOpcode::ShiftLeftLogical32, {Value(&lane), Value(2u)});
+    f.Access(f.Add(ValueOpcode::WriteSharedU32, {Value(&address), Value(0u), Value(true)}),
+             0x10);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds && requirements.function_lds_dwords == (1024 + 63 * 4 + 4) / 4,
+          "a lane-indexed LDS write was not sized to offset + 4 * lane");
+  }
+
+  {
+    Fixture f(0);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &active = f.Add(ValueOpcode::ULessThan32, {Value(&lane), Value(32u)});
+    auto &vertex = f.Add(ValueOpcode::GetBuiltin, {Value(0u), Value(0u)});
+    auto &index = f.Add(ValueOpcode::SelectU32, {Value(&active), Value(&lane), Value(&vertex)});
+    auto &address = f.Add(ValueOpcode::IMul32, {Value(12u), Value(&index)});
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(&active)}), 0x20);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds_dwords == (12 * 63 + 4) / 4,
+          "a select on the access's own predicate widened the LDS bound");
+
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(true)}), 0x24);
+    const auto unbounded = f.Analyze();
+    Check(unbounded.function_lds_dwords == 0 && unbounded.function_lds_unbounded_pc == 0x24,
+          "an LDS address reaching a vertex index was bounded");
+  }
+
+  {
+    Fixture f(0);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &low = f.Add(ValueOpcode::ShiftLeftLogical32, {Value(&lane), Value(2u)});
+    auto &high = f.Add(ValueOpcode::ShiftLeftLogical32, {Value(&low), Value(16u)});
+    auto &packed = f.Add(ValueOpcode::BitwiseOr32, {Value(&low), Value(&high)});
+    auto &field =
+        f.Add(ValueOpcode::BitFieldUExtract, {Value(&packed), Value(2u), Value(14u)});
+    auto &address = f.Add(ValueOpcode::IMul32, {Value(&field), Value(12u)});
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(true)}), 0x30);
+    Check(f.Analyze().function_lds_dwords == (63 * 12 + 4) / 4,
+          "a field extract of packed lane offsets was not bounded by the field it extracts");
+  }
+
+  {
+    Fixture f(0);
+    auto &loaded = f.Add(ValueOpcode::LoadSharedU32, {Value(0u), Value(true)});
+    f.Access(loaded, 0x40);
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&loaded), Value(true)}), 0x44);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds && requirements.function_lds_dwords == 0 &&
+              requirements.function_lds_unbounded_pc == 0x44,
+          "a data-dependent LDS address was bounded");
+  }
+  {
+    Fixture f(0, ResourceKind::FlatLocal);
+    f.program.scratch_dwords = 4;
+    auto &handle = f.Add(ValueOpcode::GetAddressResource, {Value(0u), Value(0u)});
+    f.Access(f.Add(ValueOpcode::LoadAddressU32,
+                   {Value(&handle), Value(0u), Value(0u), Value(true)}),
+             0x50);
+    const auto requirements = f.Analyze();
+    Check(requirements.function_lds && requirements.function_lds_dwords == 0 &&
+              requirements.function_lds_unbounded_pc == 0x50,
+          "a flat access that may address LDS was given a bound");
+  }
+
+  {
+    Fixture f(0);
+    auto &lane = f.Add(ValueOpcode::LaneId, {});
+    auto &address = f.Add(ValueOpcode::IAdd32, {Value(&lane), Value(0xfffffff0u)});
+    f.Access(f.Add(ValueOpcode::LoadSharedU32, {Value(&address), Value(true)}), 0x60);
+    Check(f.Analyze().function_lds_dwords == 0,
+          "an LDS address that can wrap past 2^32 was bounded");
+  }
+}
+
 void TestSpirvRequirementsAnalysis() {
   using namespace ShaderRecompiler::IR;
 
@@ -16004,6 +16101,7 @@ int main() {
   TestNativeShaderResourceDependencies();
   TestNormalizedImageContracts();
   TestSpirvRequirementsAnalysis();
+  TestFunctionLdsIsSizedFromItsAddresses();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
   TestCompilerStageInputOwnership();
