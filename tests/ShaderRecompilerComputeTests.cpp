@@ -174,6 +174,11 @@ struct BufferCacheTestAccess {
     return cache.SynchronizeBufferFromImage(buffer, address, size);
   }
 
+  static size_t ResidentPageTableChunks(const BufferCache &cache) {
+    return static_cast<size_t>(std::ranges::count_if(
+        cache.m_bda_table_chunks, [](VmaAllocation chunk) { return chunk != nullptr; }));
+  }
+
   static BufferId PageOwner(const BufferCache &cache, uint64_t address) {
     const auto *owner = cache.m_page_table.Find(
         address >> BufferCache::PageTable::kPageBits);
@@ -4186,6 +4191,83 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckBufferCacheFaultParser() {
+    constexpr const char *name = "BufferCacheFaultParser";
+    constexpr uintptr_t base = 0x0000000207800000ull;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t allocation_size = page * 4096;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "fault-parser direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fault-parser fixed direct-memory mapping failed");
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto fault = [&](uint64_t first_page, uint64_t pages) {
+        const uint64_t first = BufferCache::PageIndex(base + first_page * page);
+        std::vector<u32> words(static_cast<size_t>((first % 32u + pages + 31u) / 32u), 0u);
+        for (uint64_t i = 0; i < pages; i++) {
+          const uint64_t bit = first % 32u + i;
+          words[static_cast<size_t>(bit / 32u)] |= 1u << (bit % 32u);
+        }
+        scheduler.Current().Handle().updateBuffer(
+            cache.GetFaultBuffer()->Handle(), (first / 32u) * sizeof(u32),
+            words.size() * sizeof(u32), words.data());
+        vk::MemoryBarrier barrier{};
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eShaderRead | vk::AccessFlagBits::eShaderWrite;
+        scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                                     vk::PipelineStageFlagBits::eComputeShader,
+                                                     {}, 1, &barrier, 0, nullptr, 0, nullptr);
+      };
+      Require(name, "clean start", !cache.IsRegionRegistered(base + page * 3, page * 3),
+              "the faulting pages already had buffers");
+      fault(3, 3);
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+      Require(name, "faulted pages resolved", cache.IsRegionRegistered(base + page * 3, page * 3),
+              "the parser's page list did not reach the buffer cache");
+      fault(64, 2000);
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+      Require(name, "storm first pass", cache.IsRegionRegistered(base + page * 64, page * 1000),
+              "the first pass of a storm resolved nothing");
+      fault(64, 2000);
+      cache.ProcessFaultBuffer();
+      scheduler.Finish();
+      Require(name, "storm second pass", cache.IsRegionRegistered(base + page * 64, page * 2000),
+              "the pages a storm deferred were never resolved");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "fault-parser mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "fault-parser allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckBufferCacheDetachedDownload() {
     constexpr const char *name = "BufferCacheDetachedDownload";
     constexpr uintptr_t base = 0x0000000206800000ull;
@@ -5721,6 +5803,106 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "BDA-residency direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckBufferCacheSparsePageTable() {
+    constexpr const char *name = "BufferCacheSparsePageTable";
+    constexpr uintptr_t base = 0x000000020c000000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t page = BufferCache::CACHING_PAGESIZE;
+    constexpr uint64_t far_address = base + 0x40000000ull;
+
+    EnsureRuntimeContext();
+    if (!m_sparse_residency_supported) {
+      std::printf("[host]    %-32s skipped (no sparse residency buffers)\n", name);
+      return;
+    }
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "sparse-table direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "sparse-table fixed direct-memory mapping failed");
+
+    {
+      auto &cache = context.GetBufferCache();
+      context.MapMemory(base, allocation_size);
+      const auto ReadPageEntry = [&](uint64_t address) {
+        auto readback =
+            CreateHostBuffer(name, sizeof(uint64_t),
+                             vk::BufferUsageFlagBits::eTransferDst, {0, 0});
+        const vk::BufferCopy copy{
+            (address >> BufferCache::CACHING_PAGEBITS) * sizeof(uint64_t), 0,
+            sizeof(uint64_t)};
+        scheduler.Current().Handle().copyBuffer(
+            cache.GetBdaPageTableBuffer()->Handle(), readback.buffer, 1, &copy);
+        vk::BufferMemoryBarrier barrier{};
+        barrier.sType = vk::StructureType::eBufferMemoryBarrier;
+        barrier.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+        barrier.buffer = readback.buffer;
+        barrier.size = readback.size;
+        scheduler.Current().Handle().pipelineBarrier(
+            vk::PipelineStageFlagBits::eTransfer,
+            vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &barrier, 0,
+            nullptr);
+        scheduler.Finish();
+        const auto words = ReadBuffer(name, readback, 2);
+        DestroyBuffer(&readback);
+        return uint64_t{words[0]} | (uint64_t{words[1]} << 32u);
+      };
+
+      Require(name, "sparse table", cache.GetBdaPageTableBuffer()->IsSparse(),
+              "the page table was committed whole on a device with sparse residency");
+      const auto chunks_before = BufferCacheTestAccess::ResidentPageTableChunks(cache);
+      const auto owner = cache.FindBuffer(base, 4 * page);
+      Require(name, "owner", static_cast<bool>(owner), "buffer registration failed");
+      const auto chunks_after = BufferCacheTestAccess::ResidentPageTableChunks(cache);
+      Require(name, "binds what it writes", chunks_after == chunks_before + 1 && chunks_after <= 2,
+              "registering one 64 KiB buffer did not back exactly one table chunk");
+      const auto &buffer = cache.GetBuffer(owner);
+      for (uint64_t index = 0; index < 4; index++) {
+        const auto entry = ReadPageEntry(base + index * page);
+        Require(name, "resident entry",
+                (entry & ~BufferCache::BDA_STORE_TRACKED_BIT) ==
+                    buffer.BufferDeviceAddress() + index * page,
+                "a registered page's entry does not hold its device address");
+      }
+      Require(name, "unbound entry reads zero", ReadPageEntry(far_address) == 0,
+              "an entry in an unbacked table chunk did not read as zero");
+      Require(name, "neighbour reads zero", ReadPageEntry(base + 8 * page) == 0,
+              "an unregistered entry in a backed chunk was not zeroed before binding");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "sparse-table direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "sparse-table direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
   }
 
@@ -11871,6 +12053,10 @@ public:
         FillCase{0x40404040u, {0, 0x3c000000u}, true},
         FillCase{0, {0x804020ffu, 0}, false, true},
         FillCase{0x40404040u, {0, 0x3c000000u}, false, false, true},
+        // R32_UINT, cleared through the DCC register key: the draw must write integer bits.
+        FillCase{.fill = 0x20202020u, .texel = {0xfedcba98u, 0},
+                 .layout = Prospero::ChannelLayout::k32,
+                 .type = Prospero::ChannelType::kUInt, .clear_word = 0xfedcba98u},
         FillCase{.fill = 0x20202020u, .texel = {0x7bff7bffu},
                  .layout = Prospero::ChannelLayout::k16, .clear_word = 0x7bff7bffu},
         FillCase{.fill = 0x20202020u, .texel = {0xbc003c00u},
@@ -11881,10 +12067,6 @@ public:
         FillCase{.fill = 0x20202020u, .texel = {0x0000ffffu},
                  .layout = Prospero::ChannelLayout::k16_16,
                  .type = Prospero::ChannelType::kUNorm, .clear_word = 0x0000ffffu},
-        // R32_UINT, cleared through the DCC register key: the draw must write integer bits.
-        FillCase{.fill = 0x20202020u, .texel = {0xfedcba98u, 0},
-                 .layout = Prospero::ChannelLayout::k32,
-                 .type = Prospero::ChannelType::kUInt, .clear_word = 0xfedcba98u},
     };
     EnsureRuntimeContext();
     // Astro's generic metadata fill, through S_ENDPGM; trailing debug data is omitted.
@@ -20407,6 +20589,7 @@ public:
 private:
   bool m_rasterization_supported = true;
   bool m_draw_indirect_supported = false;
+  bool m_sparse_residency_supported = false;
   u32   m_skipped_cases          = 0;
 
   RenderContext &Renderer() {
@@ -20446,6 +20629,7 @@ private:
     m_runtime_context.draw_indirect_first_instance_enabled = m_draw_indirect_supported;
     m_runtime_context.multi_draw_indirect_enabled = m_draw_indirect_supported;
     m_runtime_context.draw_indirect_count_enabled = m_draw_indirect_supported;
+    m_runtime_context.sparse_residency_buffer_enabled = m_sparse_residency_supported;
     const vk::PhysicalDeviceImageFormatInfo2 block_texel_view_info{
         .format = vk::Format::eBc1RgbaUnormBlock,
         .type = vk::ImageType::e2D,
@@ -20720,6 +20904,22 @@ private:
     device_features.tessellationShader = m_rasterization_supported;
     device_features.drawIndirectFirstInstance = m_draw_indirect_supported;
     device_features.multiDrawIndirect = m_draw_indirect_supported;
+    {
+      vk::PhysicalDeviceProperties properties{};
+      m_physical_device.getProperties(&properties);
+      uint32_t family_count = 0;
+      m_physical_device.getQueueFamilyProperties(&family_count, nullptr);
+      std::vector<vk::QueueFamilyProperties> families(family_count);
+      m_physical_device.getQueueFamilyProperties(&family_count, families.data());
+      m_sparse_residency_supported =
+          available_features.sparseBinding == VK_TRUE &&
+          available_features.sparseResidencyBuffer == VK_TRUE &&
+          properties.sparseProperties.residencyNonResidentStrict == VK_TRUE &&
+          static_cast<bool>(families[m_queue_family].queueFlags &
+                            vk::QueueFlagBits::eSparseBinding);
+      device_features.sparseBinding = m_sparse_residency_supported;
+      device_features.sparseResidencyBuffer = m_sparse_residency_supported;
+    }
     device_features.depthBounds = m_rasterization_supported;
     device_info.pEnabledFeatures = &device_features;
     std::vector<const char *> device_extensions{
@@ -47261,6 +47461,8 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheBdaStoreOwnership();
     vulkan.CheckBufferCacheBdaResidency();
+    vulkan.CheckBufferCacheSparsePageTable();
+    vulkan.CheckBufferCacheFaultParser();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampled-depth-resource-only") == 0) {
@@ -47504,6 +47706,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBufferCacheDetachedDownload();
     vulkan.CheckBufferCacheBdaStoreOwnership();
     vulkan.CheckBufferCacheBdaResidency();
+    vulkan.CheckBufferCacheSparsePageTable();
 #endif
   } else {
     skipped_device_checks = true;
