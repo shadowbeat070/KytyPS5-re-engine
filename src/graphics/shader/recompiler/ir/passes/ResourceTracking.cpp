@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <algorithm>
+#include <atomic>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
@@ -16,6 +17,19 @@
 #include <utility>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
+
+namespace {
+std::atomic<int> g_bindless_override {-1};
+} // namespace
+
+bool BindlessImageHeapsEnabled() {
+	return g_bindless_override.load(std::memory_order_relaxed) != 0;
+}
+
+void OverrideBindlessImageHeaps(int enabled) {
+	g_bindless_override.store(enabled < 0 ? -1 : (enabled != 0 ? 1 : 0), std::memory_order_relaxed);
+}
+
 namespace {
 
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
@@ -335,8 +349,11 @@ public:
 				plan.handle->SetArg(dword, plan.key);
 			}
 			if (plan.reads[0] != nullptr) {
-				for (const auto index: plan.memory)
-					m_program.memory_info[index].planning_only = true;
+				for (uint32_t dword = 0; dword < plan.memory.size(); dword++) {
+					if (!plan.kept[dword]) {
+						m_program.memory_info[plan.memory[dword]].planning_only = true;
+					}
+				}
 			}
 		}
 		// Only the tables this pass actually bound. A DWORD x2/x3/x4 access over the same shape
@@ -381,6 +398,7 @@ private:
 		std::array<Value, 8>       roots {};
 		std::array<uint32_t, 8>    memory {};
 		std::array<const Inst*, 8> reads {};
+		std::array<bool, 8>        kept {};
 	};
 
 	// GetBufferResource is emitted once per access, so one recognized table usually owns several
@@ -902,6 +920,9 @@ private:
 				// Every scalar of the description has to match, not only the ones that used to
 				// vary: two plans differing just in where the record sits describe different
 				// tables, and interning them together hands one the other's layout.
+				if (a.bindless != b.bindless) {
+					continue;
+				}
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride || a.selector_offset != b.selector_offset ||
 				    a.selector_shift != b.selector_shift || a.selector_bits != b.selector_bits ||
@@ -1934,10 +1955,13 @@ private:
 		// One record may feed several handles: RE9 samples the same bindless texture more than
 		// once. Every reader must be a sibling that plans identically, or the record is not dead
 		// after the rewrite.
-		for (const auto* heap_read: plan.reads) {
-			if (heap_read == nullptr || !ReadIsPrivateToSiblings(*heap_read, plan.reads)) {
+		bool kept_reads = false;
+		for (uint32_t dword = 0; dword < plan.reads.size(); dword++) {
+			if (plan.reads[dword] == nullptr) {
 				return false;
 			}
+			plan.kept[dword] = !ReadIsPrivateToSiblings(*plan.reads[dword], plan.reads);
+			kept_reads |= plan.kept[dword];
 		}
 
 		DescriptorSource table_source;
@@ -1972,30 +1996,6 @@ private:
 			if (heap_stride != DescriptorBytes || (table_offset & 3u) != 0u ||
 			    (bitscan && table_offset > UINT32_MAX - (32u * 32u - 1u))) return false;
 		} else {
-			auto* material_read = key.Resolve().TryInstruction();
-			// RE Engine packs one material word: the low bits name the heap record and the rest are
-			// unrelated fields, so the shader masks before indexing. Read through the mask to reach
-			// the material word, and record it - the host must narrow the key the same way or it
-			// probes the heap at a packed word times the record stride, far out of bounds. `key`
-			// itself stays the masked value, which is what the emitted search compares.
-			if (material_read != nullptr &&
-			    material_read->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
-			    material_read->NumArgs() == 2u) {
-				uint32_t mask = 0;
-				Value    masked;
-				if (ImmediateU32(material_read->Arg(0), mask)) {
-					masked = material_read->Arg(1).Resolve();
-				} else if (ImmediateU32(material_read->Arg(1), mask)) {
-					masked = material_read->Arg(0).Resolve();
-				}
-				if (mask != 0u && masked.TryInstruction() != nullptr) {
-					indirect.key_mask = mask;
-					material_read     = masked.TryInstruction();
-				}
-			}
-			uint32_t material_memory_index = 0;
-			const auto* memory = material_read != nullptr
-			                         ? ScalarReadMemory(*material_read, material_memory_index) : nullptr;
 			// The descriptor has to sit inside the record the stride steps over: a heap of plain
 			// T# strides by 32 at offset 0, and an engine that keeps a T# inside a larger record
 			// strides by the record and offsets into it. Anything looser would let consecutive
@@ -2004,40 +2004,88 @@ private:
 			if (heap_stride < DescriptorBytes || table_offset > heap_stride - DescriptorBytes) {
 				return false;
 			}
-			if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
-			    memory->offset > INT32_MAX || !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
-				return false;
+			const auto match_material = [&] {
+				// RE Engine packs one material word: the low bits name the heap record and the rest
+				// are unrelated fields, so the shader masks before indexing. Read through the mask
+				// to reach the material word, and record it - the host must narrow the key the same
+				// way or it probes the heap at a packed word times the record stride, far out of
+				// bounds. `key` itself stays the masked value, which is what the emitted search
+				// compares.
+				if (material_read != nullptr &&
+				    material_read->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+				    material_read->NumArgs() == 2u) {
+					uint32_t mask = 0;
+					Value    masked;
+					if (ImmediateU32(material_read->Arg(0), mask)) {
+						masked = material_read->Arg(1).Resolve();
+					} else if (ImmediateU32(material_read->Arg(1), mask)) {
+						masked = material_read->Arg(0).Resolve();
+					}
+					if (mask != 0u && masked.TryInstruction() != nullptr) {
+						indirect.key_mask = mask;
+						material_read     = masked.TryInstruction();
+					}
+				}
+				uint32_t    material_memory_index = 0;
+				const auto* memory = material_read != nullptr
+				                         ? ScalarReadMemory(*material_read, material_memory_index)
+				                         : nullptr;
+				if (memory == nullptr || memory->kind != ResourceKind::ScalarBuffer ||
+				    memory->offset > INT32_MAX ||
+				    !MemoryIndexBelongsTo(material_memory_index, *material_read)) {
+					return false;
+				}
+				// The material word need not sit at the start of its record. The enumeration
+				// reaches it through selector_offset, which folds this immediate in below the way
+				// the hardware aligns it; the raw value is kept to tell apart tables that differ
+				// only here.
+				indirect.material_offset = memory->offset;
+				Value                          selector;
+				DescriptorSource::SelectorKind selector_kind =
+				    DescriptorSource::SelectorKind::Stride;
+				uint32_t selector_mask = 0;
+				if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_kind,
+				                         indirect.selector_stride, indirect.selector_offset,
+				                         selector_mask, false, true) ||
+				    selector_kind != DescriptorSource::SelectorKind::Stride) {
+					return false;
+				}
+				const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
+				indirect.selector_offset =
+				    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) +
+				    (memory->offset & ~3u);
+				// Only the heap reads are marked planning-only, so the material read stays emitted
+				// and its other readers keep working: RE Engine also compares the key against a -1
+				// sentinel.
+				const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
+				if (!UsedOnlyByReadsAndArithmetic(*shift, plan.reads)) {
+					return false;
+				}
+				const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
+				if (material_handle == nullptr ||
+				    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
+				    !MakeRuntimeTableSource(*material_read, material_source)) {
+					return false;
+				}
+				indirect.material_source = InternSource(material_source);
+				indirect.bindless        = BindlessImageHeapsEnabled();
+				return true;
+			};
+			if (!match_material()) {
+				const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
+				if (!BindlessImageHeapsEnabled() || shift == nullptr ||
+				    !UsedOnlyByReadsAndArithmetic(*shift, plan.reads)) {
+					return false;
+				}
+				indirect              = {};
+				indirect.table_offset = table_offset;
+				indirect.heap_stride  = heap_stride;
+				indirect.bindless     = true;
+				material_source       = {};
 			}
-			// The material word need not sit at the start of its record. The enumeration reaches it
-			// through selector_offset, which folds this immediate in below the way the hardware
-			// aligns it; the raw value is kept to tell apart tables that differ only here.
-			indirect.material_offset = memory->offset;
-			Value                          selector;
-			DescriptorSource::SelectorKind selector_kind = DescriptorSource::SelectorKind::Stride;
-			uint32_t                       selector_mask = 0;
-			if (!MatchMaterialOffset(material_read->Arg(1), selector, selector_kind,
-			                         indirect.selector_stride, indirect.selector_offset,
-			                         selector_mask, false, true) ||
-			    selector_kind != DescriptorSource::SelectorKind::Stride) {
-				return false;
-			}
-			const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
-			indirect.selector_offset =
-			    (static_cast<uint32_t>(indirect.selector_offset % step) & ~3u) + (memory->offset & ~3u);
-			// Only the heap reads are marked planning-only, so the material read stays emitted and
-			// its other readers keep working: RE Engine also compares the key against a -1
-			// sentinel.
-			const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
-			if (!UsedOnlyByReadsAndArithmetic(*shift, plan.reads)) {
-				return false;
-			}
-			const auto* material_handle = material_read->Arg(0).Resolve().TryInstruction();
-			if (material_handle == nullptr ||
-			    material_handle->GetOpcode() != ValueOpcode::GetBufferResource ||
-			    !MakeRuntimeTableSource(*material_read, material_source)) {
-				return false;
-			}
-			indirect.material_source = InternSource(material_source);
+		}
+		if (kept_reads && !indirect.bindless) {
+			return false;
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
@@ -2247,11 +2295,17 @@ private:
 	}
 
 	bool IsIndirectPlanningMemory(uint32_t index) const {
-		return std::any_of(m_indirect_descriptors.begin(), m_indirect_descriptors.end(),
-		                   [&](const IndirectDescriptorPlan& plan) {
-			return plan.reads[0] != nullptr &&
-			       std::ranges::find(plan.memory, index) != plan.memory.end();
-		});
+		for (const auto& plan: m_indirect_descriptors) {
+			if (plan.reads[0] == nullptr) {
+				continue;
+			}
+			for (uint32_t dword = 0; dword < plan.memory.size(); dword++) {
+				if (plan.memory[dword] == index && !plan.kept[dword]) {
+					return true;
+				}
+			}
+		}
+		return false;
 	}
 
 	void PlanIndirectDescriptors() {

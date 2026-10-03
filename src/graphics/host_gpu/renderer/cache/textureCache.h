@@ -120,6 +120,9 @@ public:
 	// Called once per presented frame. Image staleness is judged against this rather than against
 	// the queue submission counter, which this title advances dozens of times inside one frame.
 	void AdvanceFrame() noexcept { m_frame_index.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t FrameIndex() const noexcept {
+		return m_frame_index.load(std::memory_order_relaxed);
+	}
 
 	[[nodiscard]] bool ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
 	                                        uint32_t packed_clear);
@@ -288,6 +291,7 @@ private:
 	Common::SlotVector<Image>                         m_slot_images;
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
+	std::unordered_map<vk::Format, ImageId>           m_null_volume_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	// Evicted images held registered until their download reaches guest memory. The priority runner
@@ -308,6 +312,7 @@ private:
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;
 	friend class RenderExecutor;
+	friend class BindlessImageHeap;
 };
 
 } // namespace Libs::Graphics

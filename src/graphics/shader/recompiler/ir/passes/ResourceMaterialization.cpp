@@ -400,6 +400,17 @@ size_t IndirectBufferMappingSlot(const ResourcePlan& program, uint32_t buffer_in
 	       (program.info.images.size() + static_cast<size_t>(buffer_index)) *
 	           IndirectDirectoryStride;
 }
+
+bool ServedBindless(const ResourcePlan& program, uint32_t image_index) {
+	const auto& image  = program.info.images[image_index];
+	const auto* source = Source(program, image.source);
+	if (source == nullptr || !source->indirect_descriptor.has_value() ||
+	    !source->indirect_descriptor->bindless) {
+		return false;
+	}
+	return image.resource_class == ImageResourceClass::Sampled && !image.written && !image.atomic &&
+	       !image.depth_compare && !image.r128 && BindlessShapeFor(image.dimension).has_value();
+}
 // Why an indirect image table could not be enumerated. Every clause below refuses for a different
 // reason with a different fix - a handle the host cannot decode, a probe budget the table outgrows,
 // an image budget its materials outgrow - and the caller reported all of them as the same line. The
@@ -904,7 +915,7 @@ bool WriteIndirectImageSlots(const ResourcePlan& program, ResourceSnapshot& snap
 	const auto  roots  = program.info.images.size();
 	bool        tables = false;
 	for (uint32_t index = 0; index < roots && !tables; index++) {
-		tables = images[index].indirect_root == index;
+		tables = images[index].indirect_root == index && !images[index].bindless;
 	}
 	if (!tables) {
 		return true;
@@ -933,7 +944,7 @@ bool WriteIndirectImageSlots(const ResourcePlan& program, ResourceSnapshot& snap
 		element += base.mip_mode == ImageMipMode::Dynamic ? image.mip_count : 1u;
 	}
 	for (uint32_t root = 0; root < roots; root++) {
-		if (images[root].indirect_root != root) {
+		if (images[root].indirect_root != root || images[root].bindless) {
 			continue;
 		}
 		const auto mapping = static_cast<size_t>(snapshot.flattened_srt[images[root].indirect_mapping_offset]);
@@ -1674,6 +1685,15 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    (base.atomic && base.resource_class != ImageResourceClass::Storage)) {
 			return SpecializationFail(fmt::format("image resource {} has an invalid class", i));
 		}
+		if (image.bindless) {
+			image.numeric_class     = Prospero::TextureNumericClass::Float;
+			image.dimension         = base.dimension;
+			image.cube              = base.cube;
+			image.mip_count         = 1;
+			image.conversion_format = Prospero::BufferFormat::kInvalid;
+			image.shader_swizzle    = ShaderImageIdentitySwizzle;
+			continue;
+		}
 		image.mip_count = ImageMipCount(base, descriptor);
 		if (image.mip_count == 0u) {
 			return SpecializationFail(
@@ -1751,7 +1771,7 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	}
 	for (uint32_t root_index = 0; root_index < specialization.images.size(); root_index++) {
 		auto& root = specialization.images[root_index];
-		if (root.indirect_root != root_index) {
+		if (root.indirect_root != root_index || root.bindless) {
 			continue;
 		}
 		// The specialization names a directory slot; the mapping it points at is what has to be
@@ -2422,6 +2442,37 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 			MaterializeFailure() = "image source missing";
 			return false;
 		}
+		if (ServedBindless(program, i)) {
+			snapshot.images[i]                = {.dword_count = 8u};
+			const auto slot                   = IndirectMappingSlot(program, i);
+			auto&      root                   = specialization.images[i];
+			root.bindless                     = true;
+			root.indirect_root                = i;
+			root.indirect_mapping_offset      = static_cast<uint32_t>(slot);
+			root.indirect_search_iterations   = 0;
+			snapshot.flattened_srt[slot]      = 0;
+			snapshot.flattened_srt[slot + 1u] = 0;
+			if (!active.empty() && !active[image.source]) {
+				continue;
+			}
+			const auto&     indirect = *source->indirect_descriptor;
+			DescriptorValue table;
+			if (!clean.EvaluateDescriptor(indirect.table_source, table) ||
+			    table.dword_count != 4u) {
+				MaterializeFailure() =
+				    fmt::format("bindless image table at pc 0x{:08x}: its heap descriptor is not "
+				                "host-evaluable",
+				                image.first_use_pc);
+				return false;
+			}
+			BindlessImageTable entry;
+			entry.srt_offset    = static_cast<uint32_t>(slot);
+			entry.stride        = indirect.heap_stride;
+			entry.record_offset = indirect.table_offset + indirect.record_offset;
+			std::copy_n(table.dwords.begin(), 4u, entry.heap.begin());
+			snapshot.bindless_tables.push_back(entry);
+			continue;
+		}
 		if (source->indirect_descriptor.has_value()) {
 			snapshot.images[i] = {.dword_count = 8u};
 			if (!active.empty() && !active[image.source]) {
@@ -2503,6 +2554,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		next.flattened_srt.clear();
 		next.user_data.clear();
 		next.key_feedback.clear();
+		next.bindless_tables.clear();
 		next.uniform_fill = {};
 		next_specialization.buffers.clear();
 		next_specialization.images.clear();
@@ -2585,6 +2637,9 @@ const char* FirstSpecializationDifference(const ResourceSpecialization& before,
 		if (a.cube != b.cube || a.fmask != b.fmask || a.shape_padding != b.shape_padding) {
 			return "image kind";
 		}
+		if (a.bindless != b.bindless) {
+			return "image bindless";
+		}
 		if (a.indirect_root != b.indirect_root) {
 			return "image table root";
 		}
@@ -2613,6 +2668,20 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	if (program.info.buffers.size() > specialization.buffers.size() ||
 	    program.info.images.size() > specialization.images.size()) {
 		return false;
+	}
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
+			    inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
+				continue;
+			}
+			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index < program.memory_info.size() &&
+			    program.memory_info[index].resource < specialization.images.size() &&
+			    specialization.images[program.memory_info[index].resource].bindless) {
+				return false;
+			}
+		}
 	}
 
 	// Buffers grow the same way images do: one child per record the expanded table can select.
@@ -2665,6 +2734,7 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		image.indirect_mapping_offset    = source.indirect_mapping_offset;
 		image.indirect_search_iterations = source.indirect_search_iterations;
 		image.cube                       = source.cube;
+		image.bindless                   = source.bindless;
 		image.indirect_resources.clear();
 	}
 	for (uint32_t index = 0; index < images.size(); index++) {

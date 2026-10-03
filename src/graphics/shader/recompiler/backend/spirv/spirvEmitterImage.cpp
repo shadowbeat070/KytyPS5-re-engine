@@ -392,7 +392,7 @@ uint32_t ExplicitLodLevel(ValueEmitContext& ctx, const IR::MemoryInfo& mem, cons
 // Offset is gather-only, so a sample offset is folded into the coordinate at the sampled level.
 uint32_t OffsetCoordinate(ValueEmitContext& ctx, const IR::MemoryInfo& mem, const IR::Inst& address,
                           const ImageSampleLayout& layout, ImageDimension dimension, uint32_t coord,
-                          uint32_t resource) {
+                          uint32_t resource, uint32_t loaded_image = 0) {
 	if (ctx.state.program.info.images.at(mem.resource).cube) return coord;
 	uint32_t offsets[3] {};
 	if (!SpatialOffsets(ctx, mem, address, layout, dimension, offsets)) return coord;
@@ -400,7 +400,8 @@ uint32_t OffsetCoordinate(ValueEmitContext& ctx, const IR::MemoryInfo& mem, cons
 	auto&       state = ctx.state;
 	const auto& info  = ImageDimensionInfoFor(dimension);
 	state.builder.RequireCapability(spv::CapabilityImageQuery);
-	const auto image = LoadImageDescriptor(state, resource);
+	const auto image =
+	    loaded_image != 0 ? loaded_image : LoadImageDescriptor(state, resource);
 	const auto size  = state.builder.AllocateId();
 	if (info.multisampled != 0u) {
 		state.builder.AddFunction(spv::OpImageQuerySize, ImageViewSizeType(state, dimension), size,
@@ -906,15 +907,13 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
-		const auto EmitSample = [&](uint32_t resource) {
-			const auto& candidate = state.program.info.images[resource];
-			const auto coord =
-			    CoordF32(ctx, mem, *address, layout.coord,
-			             ImageDimensionInfoFor(candidate.dimension).coordinate_components,
-			             candidate.cube);
-			const auto sampled = MakeSampledImage(state, resource, sampler_id);
-			const auto shifted =
-			    OffsetCoordinate(ctx, mem, *address, layout, candidate.dimension, coord, resource);
+		const auto EmitSampleOf = [&](ImageDimension candidate_dimension, bool candidate_cube,
+		                              uint32_t sampled, uint32_t resource, uint32_t loaded_image) {
+			const auto coord = CoordF32(
+			    ctx, mem, *address, layout.coord,
+			    ImageDimensionInfoFor(candidate_dimension).coordinate_components, candidate_cube);
+			const auto shifted = OffsetCoordinate(ctx, mem, *address, layout, candidate_dimension,
+			                                      coord, resource, loaded_image);
 			const auto            sample = state.builder.AllocateId();
 			std::vector<uint32_t> sample_operands {result_type, sample, sampled, shifted};
 
@@ -928,6 +927,108 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
 		};
+		const auto EmitSample = [&](uint32_t resource) {
+			const auto& candidate = state.program.info.images[resource];
+			return EmitSampleOf(candidate.dimension, candidate.cube,
+			                    MakeSampledImage(state, resource, sampler_id), resource, 0);
+		};
+		if (image.bindless && image.indirect_root == mem.resource) {
+			const auto* handle = image_arg.ResolveInstruction();
+			if (handle == nullptr || handle->NumArgs() == 0u || dref ||
+			    state.bindless_arena_variable == 0 || state.flattened_srt_variable == 0) {
+				ctx.Fail(inst, "has no bindless image runtime mapping");
+				return;
+			}
+			const auto key         = ctx.Def(handle->Arg(0));
+			const auto LoadSrtWord = [&](uint32_t index) {
+				const auto pointer = state.builder.AllocateId();
+				state.builder.AddFunction(
+				    spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer,
+				    state.flattened_srt_variable, ConstantU32(state, 0), index);
+				const auto word = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpLoad, TypeU32(state), word, pointer);
+				return word;
+			};
+			const auto base  = LoadSrtWord(ConstantU32(state, image.indirect_mapping_offset));
+			const auto count = LoadSrtWord(ConstantU32(state, image.indirect_mapping_offset + 1u));
+			const auto in_range = Binary(state, spv::OpULessThan, TypeBool(state), key, count);
+			const auto zero_u32 = ConstantU32(state, 0);
+			const auto record   = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), record, in_range,
+			                          Binary(state, spv::OpIAdd, TypeU32(state), base, key),
+			                          zero_u32);
+			const auto word_pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          word_pointer, state.bindless_arena_variable, zero_u32,
+			                          record);
+			const auto loaded = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), loaded, word_pointer);
+			const auto word = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), word, in_range, loaded,
+			                          zero_u32);
+			const auto shape = Binary(state, spv::OpShiftRightLogical, TypeU32(state), word,
+			                          ConstantU32(state, 16u));
+			const auto element =
+			    Binary(state, spv::OpBitwiseAnd, TypeU32(state), word, ConstantU32(state, 0xffffu));
+			struct Arm {
+				uint32_t          shape;
+				IR::BindlessShape array;
+				ImageDimension    dimension;
+				bool              cube;
+			};
+			std::vector<Arm> arms;
+			if (dimension == ImageDimension::Dim3D) {
+				arms.push_back({IR::IndirectImageShape(ImageDimension::Dim3D, false),
+				                IR::BindlessShape::Image3D, ImageDimension::Dim3D, false});
+			} else {
+				arms.push_back({IR::IndirectImageShape(ImageDimension::Dim2D, false),
+				                IR::BindlessShape::Image2D, ImageDimension::Dim2D, false});
+				arms.push_back({IR::IndirectImageShape(ImageDimension::Dim2DArray, false),
+				                IR::BindlessShape::Image2DArray, ImageDimension::Dim2DArray,
+				                false});
+				arms.push_back({IR::IndirectImageShape(ImageDimension::Dim2DArray, true),
+				                IR::BindlessShape::Image2DArray, ImageDimension::Dim2DArray, true});
+			}
+			state.builder.RequireExtension("SPV_EXT_descriptor_indexing");
+			state.builder.RequireCapability(spv::CapabilityShaderNonUniform);
+			state.builder.RequireCapability(spv::CapabilitySampledImageArrayNonUniformIndexing);
+			const auto zero_f32   = ZeroF32(state);
+			const auto zero_texel = state.builder.Constant(
+			    spv::OpConstantComposite, result_type,
+			    std::vector<uint32_t> {zero_f32, zero_f32, zero_f32, zero_f32});
+			const auto            merge_label   = state.builder.AllocateId();
+			const auto            default_label = state.builder.AllocateId();
+			std::vector<uint32_t> labels(arms.size());
+			std::vector<uint32_t> switch_words {spv::OpSwitch, shape, default_label};
+			for (uint32_t arm = 0; arm < arms.size(); arm++) {
+				labels[arm] = state.builder.AllocateId();
+				switch_words.push_back(arms[arm].shape);
+				switch_words.push_back(labels[arm]);
+			}
+			state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
+			                          spv::SelectionControlMaskNone);
+			state.builder.AddFunction(switch_words);
+			std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
+			for (uint32_t arm = 0; arm < arms.size(); arm++) {
+				EmitLabel(state, labels[arm]);
+				const auto loaded_image = LoadBindlessImage(state, arms[arm].array, element);
+				const auto sampled =
+				    MakeBindlessSampledImage(state, arms[arm].array, loaded_image, mem.sampler);
+				phi_words.push_back(EmitSampleOf(arms[arm].dimension, arms[arm].cube, sampled,
+				                                 mem.resource, loaded_image));
+				phi_words.push_back(state.current_label);
+				state.builder.AddFunction(spv::OpBranch, merge_label);
+			}
+			EmitLabel(state, default_label);
+			phi_words.push_back(zero_texel);
+			phi_words.push_back(state.current_label);
+			state.builder.AddFunction(spv::OpBranch, merge_label);
+			EmitLabel(state, merge_label);
+			state.builder.AddFunction(phi_words);
+			ctx.Define(inst, ResultVector(ctx, UnpackImageTexel(ctx, mem, phi_words[2]),
+			                              numeric_class, false, mem));
+			return;
+		}
 		if (image.indirect_root != mem.resource) {
 			const auto sample = EmitSample(mem.resource);
 			auto       result = sample;

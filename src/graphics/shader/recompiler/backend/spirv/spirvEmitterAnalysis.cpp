@@ -220,6 +220,41 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 	return sampled_image;
 }
 
+IR::ImageResource BindlessImageResource(IR::BindlessShape shape) {
+	IR::ImageResource image;
+	image.resource_class = IR::ImageResourceClass::Sampled;
+	image.numeric_class  = Prospero::TextureNumericClass::Float;
+	image.dimension      = IR::BindlessShapeDimension(shape);
+	image.read           = true;
+	return image;
+}
+
+uint32_t LoadBindlessImage(EmitterState& state, IR::BindlessShape shape, uint32_t element) {
+	const auto variable = state.bindless_image_variables[static_cast<size_t>(shape)];
+	EXIT_IF(variable == 0);
+	const auto image_type = ImageType(state, BindlessImageResource(shape));
+	const auto pointer_type =
+	    state.builder.Type(spv::OpTypePointer, spv::StorageClassUniformConstant, image_type);
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable, element);
+	state.builder.AddAnnotation(spv::OpDecorate, pointer, spv::DecorationNonUniform);
+	const auto image = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, image_type, image, pointer);
+	state.builder.AddAnnotation(spv::OpDecorate, image, spv::DecorationNonUniform);
+	return image;
+}
+
+uint32_t MakeBindlessSampledImage(EmitterState& state, IR::BindlessShape shape, uint32_t image,
+                                  uint32_t sampler) {
+	const auto sampler_id = LoadSamplerDescriptor(state, sampler);
+	const auto sampled_type =
+	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, BindlessImageResource(shape)));
+	const auto sampled = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled, image, sampler_id);
+	state.builder.AddAnnotation(spv::OpDecorate, sampled, spv::DecorationNonUniform);
+	return sampled;
+}
+
 uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip) {
 	const auto& image = state.program.info.images.at(resource);
 	EXIT_IF(mip >= image.mip_count);

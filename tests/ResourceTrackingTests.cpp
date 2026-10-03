@@ -8,6 +8,7 @@
 #include "graphics/shader/recompiler/ir/passes/ShaderInfoCollection.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <algorithm>
 #include <array>
 #include <bit>
 #include <cstring>
@@ -4043,6 +4044,177 @@ void TestStridedIndirectImageTable() {
         "strided indirect image table did not materialize its records");
 }
 
+void TestBindlessHeapTable() {
+  OverrideBindlessImageHeaps(1);
+  auto fixture = MakeIndirectImageFixture(false, 4u, false, 0u, 224u, 48u, 16u);
+  fixture->PlanAndTrack();
+  OverrideBindlessImageHeaps(0);
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  EliminateDeadCode(fixture->program.blocks);
+  ValidateProgram(fixture->program, true);
+  Check(fixture->program.info.images.size() == 1, "bindless heap table was not one image");
+  const auto source = fixture->program.info.images[0].source;
+  const auto &indirect = fixture->program.descriptor_sources[source].indirect_descriptor;
+  Check(indirect.has_value() && indirect->bindless && indirect->heap_stride == 48u &&
+            indirect->table_offset == 16u,
+        "a buffer-V# heap table was not marked for the bindless set");
+
+  std::array<uint32_t, 9> user_data{0x1000u,    16u << 16u, 2u * 1024u * 1024u, 0u, 0x2000u,
+                                    48u << 16u, 8u,         0u,                 7u};
+  LinearTestMemory memory;
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "bindless heap table did not materialize");
+  Check(specialization.images.size() == 1 && specialization.images[0].bindless &&
+            specialization.images[0].indirect_root == 0u &&
+            specialization.images[0].indirect_search_iterations == 0u &&
+            specialization.images[0].numeric_class ==
+                Libs::Graphics::Prospero::TextureNumericClass::Float,
+        "bindless heap table expanded into candidates");
+  Check(std::ranges::all_of(snapshot.images[0].dwords, [](uint32_t word) { return word == 0u; }),
+        "bindless heap table bound a descriptor of its own");
+  Check(snapshot.bindless_tables.size() == 1, "bindless heap was not handed to the host");
+  const auto &table = snapshot.bindless_tables[0];
+  Check(table.heap[0] == 0x2000u && table.heap[1] == (48u << 16u) && table.heap[2] == 8u &&
+            table.stride == 48u && table.record_offset == 16u &&
+            table.srt_offset == specialization.images[0].indirect_mapping_offset &&
+            table.srt_offset + 1u < snapshot.flattened_srt.size() &&
+            snapshot.flattened_srt[table.srt_offset] == 0u &&
+            snapshot.flattened_srt[table.srt_offset + 1u] == 0u,
+        "bindless heap table described its heap or its directory slot wrongly");
+
+  user_data[4] = 0x3000u;
+  user_data[6] = 4096u;
+  ResourceSnapshot moved;
+  ResourceSpecialization moved_specialization;
+  Check(MaterializeResources(resource_plan, runtime, moved, moved_specialization) &&
+            moved_specialization == specialization && moved.bindless_tables.size() == 1 &&
+            moved.bindless_tables[0].heap[0] == 0x3000u &&
+            moved.bindless_tables[0].heap[2] == 4096u,
+        "moving the heap changed the bindless specialization");
+
+  Check(ApplyResourceSpecialization(fixture->program, specialization) &&
+            fixture->program.info.images[0].bindless &&
+            fixture->program.info.images[0].indirect_resources ==
+                std::vector<uint32_t>{0u},
+        "the applied specialization lost the bindless table");
+}
+
+enum class RuntimeKey { PerLane, Lds };
+
+struct RuntimeKeyHeap {
+  std::unique_ptr<Fixture> fixture = std::make_unique<Fixture>();
+  std::array<uint32_t, 8> heap_memory {};
+};
+
+RuntimeKeyHeap MakeRuntimeKeyHeapFixture(RuntimeKey source, bool extra_reader) {
+  RuntimeKeyHeap result;
+  auto &fixture = *result.fixture;
+  std::array<Value, 4> key_words;
+  std::array<Value, 4> heap_words;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    key_words[dword] = fixture.UserData(dword);
+    heap_words[dword] = fixture.UserData(dword + 4u);
+  }
+  const auto lane = fixture.Emit(
+      ValueOpcode::GetBuiltin,
+      {Value(static_cast<uint32_t>(StageInputKind::LocalInvocationId)), Value(0u)});
+  Value per_lane;
+  if (source == RuntimeKey::PerLane) {
+    const auto keys = fixture.Buffer(key_words, 0x0200);
+    MemoryInfo load;
+    load.kind = ResourceKind::Buffer;
+    per_lane = fixture.Emit(ValueOpcode::LoadBufferU32,
+                            {keys, lane, Value(0u), Value(0u), Value(true)},
+                            fixture.AddMemory(load, 0x0200));
+  } else {
+    MemoryInfo shared;
+    shared.kind = ResourceKind::Lds;
+    per_lane = fixture.Emit(ValueOpcode::LoadSharedU32, {lane, Value(true)},
+                            fixture.AddMemory(shared, 0x0200));
+  }
+  const auto key = fixture.Emit(ValueOpcode::ReadFirstLane, {per_lane, Value(true)});
+  const auto heap = fixture.Buffer(heap_words, 0x0220);
+  const auto heap_offset = fixture.Emit(ValueOpcode::IMul32, {key, Value(48u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t dword = 0; dword < image_words.size(); dword++) {
+    MemoryInfo component;
+    component.kind = ResourceKind::ScalarBuffer;
+    component.offset = 16u + dword * sizeof(uint32_t);
+    image_words[dword] = fixture.Emit(ValueOpcode::ReadConstBuffer, {heap, heap_offset},
+                                      fixture.AddMemory(component, 0x0228));
+  }
+  if (extra_reader) {
+    fixture.Emit(ValueOpcode::ReferenceU32, {image_words[2]});
+  }
+  const auto image = fixture.Image(image_words, 0x0240);
+  const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x0240);
+  MemoryInfo sample;
+  sample.kind = ResourceKind::Image;
+  sample.image_dimension = Decoder::ImageDimension::Dim2D;
+  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
+                                    {image, sampler, fixture.ImageAddress()},
+                                    fixture.AddMemory(sample, 0x0240));
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
+  return result;
+}
+
+void TestRuntimeKeyBindlessHeap(RuntimeKey source, bool extra_reader) {
+  OverrideBindlessImageHeaps(0);
+  auto refused = MakeRuntimeKeyHeapFixture(source, extra_reader);
+  Check(!refused.fixture->TryPlanAndTrack().ok,
+        "a runtime heap key was accepted without the bindless set");
+
+  OverrideBindlessImageHeaps(1);
+  auto heap = MakeRuntimeKeyHeapFixture(source, extra_reader);
+  const auto status = heap.fixture->TryPlanAndTrack();
+  OverrideBindlessImageHeaps(0);
+  Check(status.ok, "a runtime heap key was refused with the bindless set");
+  auto &program = heap.fixture->program;
+  Check(program.info.images.size() == 1, "the runtime-key heap was not tracked as one image");
+  const auto &indirect = program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+  Check(indirect.has_value() && indirect->bindless &&
+            indirect->material_source == DescriptorSource::IndirectDescriptor::NoMaterialTable &&
+            indirect->heap_stride == 48u && indirect->table_offset == 16u,
+        "the runtime-key heap did not become a bindless table");
+  uint32_t planned = 0;
+  uint32_t kept = 0;
+  for (const auto &memory : program.memory_info) {
+    if (memory.kind != ResourceKind::ScalarBuffer || memory.offset < 16u) {
+      continue;
+    }
+    if (memory.planning_only) {
+      planned++;
+    } else {
+      kept++;
+      Check(memory.resource < program.info.buffers.size(),
+            "a record dword read elsewhere did not stay an ordinary heap read");
+    }
+  }
+  Check(planned == (extra_reader ? 7u : 8u) && kept == (extra_reader ? 1u : 0u),
+        "the record reads were not planned exactly as their readers allow");
+
+  auto resource_plan = ExtractResourcePlan(program);
+  std::array<uint32_t, 9> user_data{0x1000u, 0u, 256u, 0u, 0x2000u, 48u << 16u, 64u, 0u, 7u};
+  LinearTestMemory memory;
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(resource_plan, runtime, snapshot, specialization) &&
+            specialization.images.size() == 1 && specialization.images[0].bindless &&
+            snapshot.bindless_tables.size() == 1 &&
+            snapshot.bindless_tables[0].heap[0] == 0x2000u &&
+            snapshot.bindless_tables[0].record_offset == 16u,
+        "the runtime-key heap did not materialize as a bindless table");
+}
+
 // Enumeration decides residency safely; it decides *selection* only if every key the shader can
 // produce is in the mapping AND lands on its own descriptor - and if a key that is not in the
 // mapping lands on nothing. The second half had no test, and had been wrong: the emitted search
@@ -4938,6 +5110,7 @@ void TestUniformDwordX4DescriptorLoad() {
 } // namespace
 
 int main() {
+  OverrideBindlessImageHeaps(0);
   try {
     const auto Run = [](const char *name, auto test) {
       try {
@@ -4988,6 +5161,11 @@ int main() {
     Run("guarded scalar descriptor reads", TestGuardedScalarDescriptorReads);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("strided indirect image table", TestStridedIndirectImageTable);
+    Run("bindless heap table", TestBindlessHeapTable);
+    Run("bindless per-lane key", [] { TestRuntimeKeyBindlessHeap(RuntimeKey::PerLane, false); });
+    Run("bindless LDS key", [] { TestRuntimeKeyBindlessHeap(RuntimeKey::Lds, false); });
+    Run("bindless key with a shared record",
+        [] { TestRuntimeKeyBindlessHeap(RuntimeKey::PerLane, true); });
     Run("indirect image selection", TestIndirectImageSelectionResolvesEveryKey);
     Run("indirect image refusal reporting", TestIndirectImageRefusalNamesItselfAndIsMemoed);
     Run("large indirect tables read in spans", TestLargeIndirectTablesReadInSpans);

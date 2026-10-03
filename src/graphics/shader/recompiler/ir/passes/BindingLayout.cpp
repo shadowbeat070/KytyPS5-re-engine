@@ -109,6 +109,10 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 }
 
 bool UsesFlattenedSrt(const Program& program) {
+	if (std::ranges::any_of(program.info.images,
+	                        [](const ImageResource& image) { return image.bindless; })) {
+		return true;
+	}
 	return std::ranges::any_of(program.blocks, [](const Block* block) {
 		return std::ranges::any_of(*block, [](const Inst& inst) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
@@ -153,6 +157,10 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 
 	std::array<std::vector<uint32_t>, ImageBindingCount> image_groups;
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
+		if (program.info.images[i].bindless) {
+			next.uses_bindless = true;
+			continue;
+		}
 		const auto kind = DescriptorBindingForImage(program.info.images[i]);
 		if (!kind.has_value()) {
 			EXIT("shader binding layout failed: image %u has an invalid binding class", i);

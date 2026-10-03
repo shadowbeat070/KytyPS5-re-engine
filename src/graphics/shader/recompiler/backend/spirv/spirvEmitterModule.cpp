@@ -331,6 +331,31 @@ void DefineDescriptors(EmitterState& state) {
 			}
 		}
 	}
+	if (state.program.bindings.uses_bindless) {
+		const auto Define = [&](uint32_t type, const char* name, spv::StorageClass storage,
+		                        uint32_t binding) {
+			const auto variable =
+			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
+			state.builder.AddName(variable, name);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
+			                            IR::BindlessDescriptorSet);
+			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+			return variable;
+		};
+		state.bindless_arena_variable =
+		    Define(StorageBufferType(state), "bindless_arena", spv::StorageClassStorageBuffer,
+		           IR::BindlessArenaBinding);
+		constexpr std::array names {"bindless_2d", "bindless_2d_array", "bindless_3d"};
+		for (uint32_t shape = 0; shape < static_cast<uint32_t>(IR::BindlessShape::Count); shape++) {
+			const auto kind = static_cast<IR::BindlessShape>(shape);
+			const auto array =
+			    state.builder.Type(spv::OpTypeArray, ImageType(state, BindlessImageResource(kind)),
+			                       ConstantU32(state, IR::BindlessImageSlots));
+			state.bindless_image_variables[shape] =
+			    Define(array, names[shape], spv::StorageClassUniformConstant,
+			           IR::BindlessImageBinding(kind));
+		}
+	}
 }
 
 } // namespace

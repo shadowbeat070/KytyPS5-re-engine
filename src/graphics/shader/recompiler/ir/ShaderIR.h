@@ -167,6 +167,7 @@ struct ImageResource {
 	uint32_t                      indirect_feedback_offset  = NoIndirectFeedback;
 	uint32_t                      indirect_feedback_keys    = 0;
 	std::vector<uint32_t>         indirect_resources;
+	bool                          bindless = false;
 
 	bool operator==(const ImageResource& other) const = default;
 };
@@ -327,6 +328,35 @@ inline constexpr uint32_t IndirectSearchIterations = 33u;
 [[nodiscard]] constexpr uint32_t IndirectImageSlot(uint32_t shape, uint32_t element) {
 	return (shape << 16u) | element;
 }
+
+inline constexpr uint32_t BindlessDescriptorSet     = 2u;
+inline constexpr uint32_t BindlessArenaBinding      = 0u;
+inline constexpr uint32_t BindlessFirstImageBinding = 1u;
+inline constexpr uint32_t BindlessImageSlots        = 4096u;
+
+enum class BindlessShape : uint32_t { Image2D, Image2DArray, Image3D, Count };
+
+// Cube samples go through the 2D-array element of their view; only the coordinates differ.
+[[nodiscard]] constexpr std::optional<BindlessShape>
+BindlessShapeFor(Decoder::ImageDimension dimension) {
+	switch (dimension) {
+		case Decoder::ImageDimension::Dim2D: return BindlessShape::Image2D;
+		case Decoder::ImageDimension::Dim2DArray: return BindlessShape::Image2DArray;
+		case Decoder::ImageDimension::Dim3D: return BindlessShape::Image3D;
+		default: return std::nullopt;
+	}
+}
+[[nodiscard]] constexpr Decoder::ImageDimension BindlessShapeDimension(BindlessShape shape) {
+	switch (shape) {
+		case BindlessShape::Image2D: return Decoder::ImageDimension::Dim2D;
+		case BindlessShape::Image2DArray: return Decoder::ImageDimension::Dim2DArray;
+		default: return Decoder::ImageDimension::Dim3D;
+	}
+}
+[[nodiscard]] constexpr uint32_t BindlessImageBinding(BindlessShape shape) {
+	return BindlessFirstImageBinding + static_cast<uint32_t>(shape);
+}
+static_assert(BindlessImageSlots <= 0x10000u);
 
 enum class DescriptorBindingKind : uint32_t {
 	Buffers  = 0u,
@@ -498,6 +528,7 @@ struct BindingLayout {
 	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
+	bool                           uses_bindless = false;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;
@@ -618,6 +649,7 @@ struct DescriptorSource {
 		// `heap_stride` is then only what the shader scaled the index by - usually 1 - and the
 		// byte step is that times the V#'s stride, which is not known until the descriptor is read.
 		bool indexed_heap = false;
+		bool bindless     = false;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
 	};
