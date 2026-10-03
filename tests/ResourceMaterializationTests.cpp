@@ -592,8 +592,25 @@ void TestBindlessRecordClassification() {
   Check(!Shape(Bindless::TSharp{}), "the null T# was served");
   Check(!Shape(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor2D)),
         "an integer T# was served from a float array");
-  Check(!Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor1D)),
-        "a 1D T# was served though no array holds 1D views");
+  const auto line = Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor1D));
+  Check(line && line->array == BindlessShape::Image1D &&
+            line->dimension == ImageDimension::Dim1D && !line->cube &&
+            line->Code() == Libs::Graphics::ShaderRecompiler::IR::IndirectImageShape(
+                                ImageDimension::Dim1D, false),
+        "a 1D T# was not served from the 1D array");
+  const auto lines =
+      Shape(TestTSharp(0x100, BufferFormat::k16_16_16_16Float, ImageType::kColor1DArray, 3u));
+  Check(lines && lines->array == BindlessShape::Image1D &&
+            lines->dimension == ImageDimension::Dim1D,
+        "a 1D array T# was not served as a 1D view");
+  Check(!Shape(TestTSharp(0x100, BufferFormat::k16_16_16_16Float, ImageType::kColor1DArray,
+                          (5u << 16u) | 3u)),
+        "a 1D array T# whose base layer passes its last layer was served");
+  Check(line->Code() != plain->Code() && line->Code() != array->Code() &&
+            line->Code() != cube->Code() && line->Code() != volume->Code(),
+        "the 1D shape code collides with another shape");
+  Check(!Shape(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor1D)),
+        "an integer 1D T# was served from a float array");
   Check(!Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2DMsaa)),
         "an MSAA T# was served");
   auto reserved = TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D);

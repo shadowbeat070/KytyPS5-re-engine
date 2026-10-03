@@ -414,8 +414,14 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			break;
 	}
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
-	const bool volume = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D;
-	desc.info.type    = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+	using ShaderRecompiler::Decoder::ImageDimension;
+	const bool volume = resource.dimension == ImageDimension::Dim3D;
+	// A 1D descriptor needs a 1D view, and Vulkan only gives one over a 1D image.
+	const bool line           = resource.dimension == ImageDimension::Dim1D ||
+	                            resource.dimension == ImageDimension::Dim1DArray;
+	desc.info.type            = volume ? Prospero::ImageType::kColor3D
+	                            : line ? Prospero::ImageType::kColor1D
+	                                   : Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = Prospero::NumBytesPerElement(desc.info.guest_format);
@@ -424,10 +430,11 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
 	// An indirect table's null candidate can sit in a 2D-array binding, cube shapes included.
 	desc.view_info.type =
-	    volume ? vk::ImageViewType::e3D
-	    : resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
-	        ? vk::ImageViewType::e2DArray
-	        : vk::ImageViewType::e2D;
+	    volume                                             ? vk::ImageViewType::e3D
+	    : resource.dimension == ImageDimension::Dim2DArray ? vk::ImageViewType::e2DArray
+	    : resource.dimension == ImageDimension::Dim1D      ? vk::ImageViewType::e1D
+	    : resource.dimension == ImageDimension::Dim1DArray ? vk::ImageViewType::e1DArray
+	                                                       : vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
 	desc.view_info.usage      = binding == TextureCache::BindingType::Storage
 	                                ? vk::ImageUsageFlagBits::eStorage

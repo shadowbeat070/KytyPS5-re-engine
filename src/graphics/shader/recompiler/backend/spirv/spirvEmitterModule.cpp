@@ -345,9 +345,21 @@ void DefineDescriptors(EmitterState& state) {
 		state.bindless_arena_variable =
 		    Define(StorageBufferType(state), "bindless_arena", spv::StorageClassStorageBuffer,
 		           IR::BindlessArenaBinding);
-		constexpr std::array names {"bindless_2d", "bindless_2d_array", "bindless_3d"};
+		constexpr std::array names {"bindless_2d", "bindless_2d_array", "bindless_3d",
+		                            "bindless_1d"};
+		static_assert(names.size() == static_cast<size_t>(IR::BindlessShape::Count));
+		const bool samples_1d =
+		    std::ranges::any_of(state.program.info.images, [](const IR::ImageResource& image) {
+			    return image.bindless && image.dimension == ImageDimension::Dim1D;
+		    });
 		for (uint32_t shape = 0; shape < static_cast<uint32_t>(IR::BindlessShape::Count); shape++) {
 			const auto kind = static_cast<IR::BindlessShape>(shape);
+			if (kind == IR::BindlessShape::Image1D) {
+				if (!samples_1d) {
+					continue;
+				}
+				state.builder.RequireCapability(spv::CapabilitySampled1D);
+			}
 			const auto array =
 			    state.builder.Type(spv::OpTypeArray, ImageType(state, BindlessImageResource(kind)),
 			                       ConstantU32(state, IR::BindlessImageSlots));

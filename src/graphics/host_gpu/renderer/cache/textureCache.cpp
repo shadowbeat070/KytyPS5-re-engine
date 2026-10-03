@@ -696,14 +696,18 @@ TextureCache::ImageIds TextureCache::FindImagesInRegion(uint64_t address, uint64
 ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	const auto format = desc.info.pixel_format;
 	const bool volume = desc.info.IsVolume();
-	auto&      images = volume ? m_null_volume_images : m_null_images;
+	const bool line   = desc.info.type == Prospero::ImageType::kColor1D ||
+	                    desc.info.type == Prospero::ImageType::kColor1DArray;
+	auto&      images = volume ? m_null_volume_images : line ? m_null_1d_images : m_null_images;
 	if (const auto found = images.find(format); found != images.end()) {
 		return found->second;
 	}
 	ImageInfo info {};
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
-	info.type            = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
+	info.type            = volume ? Prospero::ImageType::kColor3D
+	                       : line ? Prospero::ImageType::kColor1D
+	                              : Prospero::ImageType::kColor2D;
 	info.extent          = {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;

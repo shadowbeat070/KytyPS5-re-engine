@@ -334,7 +334,7 @@ inline constexpr uint32_t BindlessArenaBinding      = 0u;
 inline constexpr uint32_t BindlessFirstImageBinding = 1u;
 inline constexpr uint32_t BindlessImageSlots        = 4096u;
 
-enum class BindlessShape : uint32_t { Image2D, Image2DArray, Image3D, Count };
+enum class BindlessShape : uint32_t { Image2D, Image2DArray, Image3D, Image1D, Count };
 
 // Cube samples go through the 2D-array element of their view; only the coordinates differ.
 [[nodiscard]] constexpr std::optional<BindlessShape>
@@ -343,6 +343,7 @@ BindlessShapeFor(Decoder::ImageDimension dimension) {
 		case Decoder::ImageDimension::Dim2D: return BindlessShape::Image2D;
 		case Decoder::ImageDimension::Dim2DArray: return BindlessShape::Image2DArray;
 		case Decoder::ImageDimension::Dim3D: return BindlessShape::Image3D;
+		case Decoder::ImageDimension::Dim1D: return BindlessShape::Image1D;
 		default: return std::nullopt;
 	}
 }
@@ -350,6 +351,7 @@ BindlessShapeFor(Decoder::ImageDimension dimension) {
 	switch (shape) {
 		case BindlessShape::Image2D: return Decoder::ImageDimension::Dim2D;
 		case BindlessShape::Image2DArray: return Decoder::ImageDimension::Dim2DArray;
+		case BindlessShape::Image1D: return Decoder::ImageDimension::Dim1D;
 		default: return Decoder::ImageDimension::Dim3D;
 	}
 }

@@ -44,9 +44,15 @@ std::optional<RecordShape> ClassifyRecord(const TSharp& words) {
 		case Prospero::ImageType::kColor3D:
 			shape = {ImageDimension::Dim3D, false, BindlessShape::Image3D};
 			break;
+		case Prospero::ImageType::kColor1D:
+		case Prospero::ImageType::kColor1DArray:
+			shape = {ImageDimension::Dim1D, false, BindlessShape::Image1D};
+			break;
 		default: return std::nullopt;
 	}
-	if (shape.array == BindlessShape::Image2DArray &&
+	const auto type = static_cast<Prospero::ImageType>((words[3] >> 28u) & 0xfu);
+	if ((shape.array == BindlessShape::Image2DArray ||
+	     type == Prospero::ImageType::kColor1DArray) &&
 	    ((words[4] >> 16u) & 0x1fffu) > (words[4] & 0x1fffu)) {
 		return std::nullopt;
 	}

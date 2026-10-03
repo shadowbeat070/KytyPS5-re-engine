@@ -292,6 +292,7 @@ private:
 	ImagePageTable                                    m_image_page_table;
 	std::unordered_map<vk::Format, ImageId>           m_null_images;
 	std::unordered_map<vk::Format, ImageId>           m_null_volume_images;
+	std::unordered_map<vk::Format, ImageId>           m_null_1d_images;
 	Common::LeastRecentlyUsedCache<ImageId, uint64_t> m_lru_cache;
 	std::unordered_set<ImageId>                       m_download_images;
 	// Evicted images held registered until their download reaches guest memory. The priority runner

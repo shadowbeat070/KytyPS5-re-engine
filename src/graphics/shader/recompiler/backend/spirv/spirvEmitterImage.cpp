@@ -980,6 +980,9 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			if (dimension == ImageDimension::Dim3D) {
 				arms.push_back({IR::IndirectImageShape(ImageDimension::Dim3D, false),
 				                IR::BindlessShape::Image3D, ImageDimension::Dim3D, false});
+			} else if (dimension == ImageDimension::Dim1D) {
+				arms.push_back({IR::IndirectImageShape(ImageDimension::Dim1D, false),
+				                IR::BindlessShape::Image1D, ImageDimension::Dim1D, false});
 			} else {
 				arms.push_back({IR::IndirectImageShape(ImageDimension::Dim2D, false),
 				                IR::BindlessShape::Image2D, ImageDimension::Dim2D, false});
