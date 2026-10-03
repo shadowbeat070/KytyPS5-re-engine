@@ -1367,7 +1367,7 @@ Headroom::CollectorImageFacts TextureCache::CollectorFacts(const Image& image,
 	facts.registered       = image.registered;
 	facts.depth_associated = static_cast<bool>(image.depth_id);
 	facts.video_out        = image.usage.video_out;
-	facts.gpu_modified     = image.IsGpuModified();
+	facts.gpu_modified     = image.IsGpuModified() && !image.IsSuperseded();
 	facts.tiled            = image.info.IsTiled();
 	facts.stencil_plane = image.info.HasStencil() && image.GpuWriteSerial() != 0;
 	if (!facts.gpu_modified) {
@@ -2508,7 +2508,7 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	std::scoped_lock lock {m_texture_cache.m_lock};
 	auto& image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
-	if (!image.SafeToDownload()) {
+	if (!image.SafeToDownload() || image.IsSuperseded()) {
 		return false;
 	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
@@ -2659,10 +2659,30 @@ bool TextureCache::DownloadImageBatch(Image& image, ImageDownload& transfer,
 	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
 	                                               1, &barrier, 0, nullptr);
+	std::vector<std::pair<uint64_t, uint64_t>> kept;
+	uint64_t                                   cursor = range.address;
+	for (const auto& [begin, end]: image.SupersededRanges()) {
+		const auto first = std::max(begin, range.address);
+		const auto last  = std::min(end, range.address + range.size);
+		if (first >= last) {
+			continue;
+		}
+		if (first > cursor) {
+			kept.emplace_back(cursor, first);
+		}
+		cursor = std::max(cursor, last);
+	}
+	if (cursor < range.address + range.size) {
+		kept.emplace_back(cursor, range.address + range.size);
+	}
 	m_scheduler.DeferPriorityOperation(
-	    [&download, range, mapped, offset] {
+	    [&download, range, mapped, offset, kept = std::move(kept)] {
 		    download.Invalidate(offset, range.size);
-		    LibKernel::Memory::WriteBacking(range.address, mapped, range.size);
+		    for (const auto& [begin, end]: kept) {
+			    LibKernel::Memory::WriteBacking(
+			        begin, static_cast<const uint8_t*>(mapped) + (begin - range.address),
+			        end - begin);
+		    }
 	    },
 	    range.address, range.size);
 	return true;
@@ -2675,7 +2695,11 @@ void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_lock};
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
-		if (image.info.data.address != address) {
+		if (!image.Overlaps(address, size)) {
+			continue;
+		}
+		if (image.info.data.address != address && image.IsGpuModified() &&
+		    !image.Supersede(address, size)) {
 			continue;
 		}
 		if (image.IsGpuModified()) {

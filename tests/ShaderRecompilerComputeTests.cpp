@@ -293,6 +293,16 @@ struct TextureCacheTestAccess {
     }
   }
 
+  static bool Download(TextureCache &cache, ImageId id) {
+    auto lock = Lock(cache);
+    return cache.DownloadImageMemory(id);
+  }
+
+  static Headroom::CollectorImageFacts Facts(TextureCache &cache, ImageId id) {
+    auto lock = Lock(cache);
+    return cache.CollectorFacts(cache.m_slot_images[id], false);
+  }
+
   static bool Contains(const TextureCache &cache, ImageId id) {
     const auto owner = cache.m_slot_images.try_get(id);
     return owner != nullptr && owner->registered;
@@ -7921,6 +7931,45 @@ public:
                                                            : buffer_alias_image_value),
                 exact_base ? "exact-base buffer write did not refresh the native image"
                            : "overlapping buffer write replaced untouched GPU image texels");
+      }
+      {
+        auto &superseded = texture_cache.GetImage(buffer_alias_image);
+        Require(name, "superseded alias bytes",
+                superseded.IsGpuModified() && superseded.IsSuperseded() &&
+                    !TextureCacheTestAccess::Facts(texture_cache, buffer_alias_image)
+                         .gpu_modified,
+                "a GPU-only image under a newer buffer write would be evicted by download");
+        const auto alias_address = buffer_alias_desc.info.data.address;
+        uint32_t backing_before = 0;
+        Require(name, "superseded alias backing",
+                Libs::LibKernel::Memory::TryReadBacking(alias_address + 12, &backing_before,
+                                                  sizeof(backing_before)),
+                "failed to read the alias backing");
+        Require(name, "superseded alias download",
+                TextureCacheTestAccess::Download(texture_cache, buffer_alias_image),
+                "the partially superseded image refused its download");
+        scheduler.Finish();
+        scheduler.DrainPriorityOperations();
+        uint32_t written_back[4] = {};
+        Require(name, "superseded bytes not written back",
+                Libs::LibKernel::Memory::TryReadBacking(alias_address, written_back,
+                                                  sizeof(written_back)) &&
+                    written_back[0] == buffer_alias_image_value &&
+                    written_back[2] == buffer_alias_image_value &&
+                    written_back[3] == backing_before,
+                "an image download overwrote bytes a newer buffer write owns");
+        texture_cache.InvalidateMemoryFromGPU(alias_address + 4, 4);
+        texture_cache.InvalidateMemoryFromGPU(alias_address + 8, 4);
+        texture_cache.InvalidateMemoryFromGPU(alias_address - 4, 6);
+        Require(name, "partly superseded image keeps its texels",
+                texture_cache.GetImage(buffer_alias_image).IsGpuModified(),
+                "a byte gap in the superseded range released the image");
+        texture_cache.InvalidateMemoryFromGPU(alias_address + 2, 2);
+        const auto &released = texture_cache.GetImage(buffer_alias_image);
+        Require(name, "fully superseded image released",
+                !released.IsGpuModified() && released.IsBufferModified() &&
+                    !released.IsSuperseded(),
+                "buffer writes covering the whole image left it GPU-only");
       }
 
       constexpr uint64_t exact_buffer_offset = 0x90000;

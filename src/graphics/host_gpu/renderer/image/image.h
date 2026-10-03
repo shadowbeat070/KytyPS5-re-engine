@@ -138,6 +138,13 @@ public:
 	void               MarkBufferModified() noexcept {
 		m_buffer_modified    = true;
 		m_buffer_write_epoch = NextImageWriteEpoch();
+		m_superseded.clear();
+	}
+	// Guest bytes a later GPU buffer write replaced; never written back from this image.
+	bool               Supersede(uint64_t address, uint64_t size);
+	[[nodiscard]] bool IsSuperseded() const noexcept { return !m_superseded.empty(); }
+	[[nodiscard]] std::span<const std::pair<uint64_t, uint64_t>> SupersededRanges() const noexcept {
+		return m_superseded;
 	}
 	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
 
@@ -206,6 +213,7 @@ private:
 	uint64_t          m_gpu_write_serial = 0;
 	uint64_t          m_gpu_write_epoch    = 0;
 	uint64_t          m_buffer_write_epoch = 0;
+	std::vector<std::pair<uint64_t, uint64_t>> m_superseded;
 	bool              m_gpu_modified     = false;
 	bool              m_buffer_modified  = false;
 	bool              m_backing_failed   = false;
