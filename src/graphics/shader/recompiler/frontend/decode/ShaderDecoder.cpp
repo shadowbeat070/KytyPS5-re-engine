@@ -123,9 +123,14 @@ std::string ImageSampleFlagsToString(uint32_t flags) {
 }
 
 std::string FormatMimg(const Instruction& inst) {
-	const char* mimg_name = inst.opcode == Opcode::IMAGE_SAMPLE
-	                            ? MimgSampleOpcodeName(inst.opcode_id)
-	                            : MimgGatherOpcodeName(inst.opcode_id);
+	// The three encoding spaces are disjoint, so a plain first-hit lookup is unambiguous.
+	const char* mimg_name = MimgSampleOpcodeName(inst.opcode_id);
+	if (mimg_name == nullptr) {
+		mimg_name = MimgGatherOpcodeName(inst.opcode_id);
+	}
+	if (mimg_name == nullptr) {
+		mimg_name = MimgBvhOpcodeName(inst.opcode_id);
+	}
 	const std::string_view name =
 	    mimg_name != nullptr ? mimg_name : magic_enum::enum_name(inst.opcode);
 	std::string text =
@@ -142,6 +147,7 @@ std::string FormatMimg(const Instruction& inst) {
 	switch (inst.opcode) {
 		case Opcode::IMAGE_SAMPLE:
 		case Opcode::IMAGE_GATHER4:
+		case Opcode::IMAGE_BVH_INTERSECT_RAY:
 			text += fmt::format(" sample_flags={} addr_components={}",
 			                    ImageSampleFlagsToString(inst.image_sample_flags).c_str(),
 			                    inst.image_address_components);
