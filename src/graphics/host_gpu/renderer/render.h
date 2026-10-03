@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <memory>
 #include <optional>
 #include <span>
 #include <vector>
@@ -33,6 +34,7 @@ struct DrawIndexBufferSource;
 struct DrawRenderState;
 class RenderContext;
 class CommandScheduler;
+class BindlessImageHeap;
 struct RenderExecutorTestAccess;
 
 enum class CommandBufferDebugOp : uint32_t {
@@ -182,7 +184,8 @@ private:
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context);
+	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
 	void DispatchDirect(uint64_t submit_id, CommandBuffer& buffer, uint32_t thread_group_x,
@@ -199,6 +202,7 @@ public:
 	bool                           ResolveStageImages(PreparedBindings& bindings);
 	void                           AcquireStageImageViews(PreparedBindings& bindings);
 	bool                           ResolveColorTargets(std::span<RenderColorInfo> colors);
+	void                           PrepareBindlessTables(std::span<PreparedBindings* const> stages);
 	void CommitBindings(CommandBuffer& buffer, vk::PipelineBindPoint pipeline_bind_point,
 	                    const PipelineCache::Pipeline&     pipeline,
 	                    std::span<PreparedBindings* const> bindings);
@@ -259,8 +263,11 @@ private:
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
+	std::vector<uint32_t>                 m_image_occurrences;
+	std::unique_ptr<BindlessImageHeap>    m_bindless;
 
 	friend class CommandProcessor;
+	friend class BindlessImageHeap;
 	friend struct RenderExecutorTestAccess;
 };
 

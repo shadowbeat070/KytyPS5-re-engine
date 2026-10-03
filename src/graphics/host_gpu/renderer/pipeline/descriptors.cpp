@@ -21,6 +21,7 @@
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/pipeline/bindlessImageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/refusalReport.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -412,7 +413,8 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 			break;
 	}
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
-	desc.info.type            = Prospero::ImageType::kColor2D;
+	const bool volume = resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D;
+	desc.info.type    = volume ? Prospero::ImageType::kColor3D : Prospero::ImageType::kColor2D;
 	desc.info.extent          = {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = Prospero::NumBytesPerElement(desc.info.guest_format);
@@ -421,7 +423,8 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	desc.view_info.format     = resource.atomic64 ? vk::Format::eR64Uint : desc.info.pixel_format;
 	// An indirect table's null candidate can sit in a 2D-array binding, cube shapes included.
 	desc.view_info.type =
-	    resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+	    volume ? vk::ImageViewType::e3D
+	    : resource.dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
 	        ? vk::ImageViewType::e2DArray
 	        : vk::ImageViewType::e2D;
 	desc.view_info.aspect     = vk::ImageAspectFlagBits::eColor;
@@ -901,6 +904,10 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
+
+RenderExecutor::~RenderExecutor() = default;
+
 void RenderExecutor::BindImage(ImageId id, bool storage) {
 	auto& image = m_context.GetTextureCache().GetImage(id);
 	if (image.info.data.Empty()) {
@@ -943,6 +950,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.images.resize(program.info.images.size());
 	prepared.samplers.clear();
 	prepared.shader_data.clear();
+	prepared.bindless_patches.clear();
 	for (uint32_t i = 0; i < program.info.images.size(); i++) {
 		auto binding = ResolveTexture(program.info.images[i], snapshot.images[i]);
 		BindImage(binding.image_id, binding.desc.type == TextureCache::BindingType::Storage);
@@ -1044,8 +1052,20 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		                                              resource, buffer_offset);
 		pack_memory_offset(index, buffer_offset);
 	}
-	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+	if (ShaderRecompiler::IR::FindBinding(
+	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
+		if (prepared.bindless_patches.empty()) {
+			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		} else {
+			static thread_local std::vector<uint32_t> patched;
+			patched.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
+			for (const auto& [offset, base, count]: prepared.bindless_patches) {
+				EXIT_IF(static_cast<size_t>(offset) + 1u >= patched.size());
+				patched[offset]      = base;
+				patched[offset + 1u] = count;
+			}
+			prepared.flattened_srt = NativeUpload(m_context, patched);
+		}
 		for (const auto& feedback: snapshot.key_feedback) {
 			m_context.GetIndirectKeyFeedback().Queue(
 			    feedback.signature, prepared.flattened_srt.buffer,
@@ -1167,6 +1187,31 @@ bool RenderExecutor::ResolveColorTargets(std::span<RenderColorInfo> colors) {
 	return resolved;
 }
 
+void RenderExecutor::PrepareBindlessTables(std::span<PreparedBindings* const> stages) {
+	bool any = false;
+	for (const auto* stage: stages) {
+		any |= !stage->runtime->resources->bindless_tables.empty();
+	}
+	if (!any) {
+		return;
+	}
+	if (m_bindless == nullptr) {
+		m_bindless = std::make_unique<BindlessImageHeap>(m_context, *this);
+	}
+	for (const auto* stage: stages) {
+		for (const auto& table: stage->runtime->resources->bindless_tables) {
+			m_bindless->Prepare(table);
+		}
+	}
+	for (auto* stage: stages) {
+		stage->bindless_patches.clear();
+		for (const auto& table: stage->runtime->resources->bindless_tables) {
+			const auto region = m_bindless->Lookup(table);
+			stage->bindless_patches.push_back({table.srt_offset, region.base, region.count});
+		}
+	}
+}
+
 void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> stages,
                                              std::span<RenderColorInfo> colors) {
 	bool uses_dma   = false;
@@ -1180,6 +1225,7 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 		m_context.PrepareBda(writes_dma);
 
 	}
+	PrepareBindlessTables(stages);
 	for (uint32_t pass = 0; pass < IMAGE_RESOLVE_PASSES; pass++) {
 		bool resolved = false;
 		for (auto* stage: stages) {
@@ -1413,16 +1459,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 			m_descriptor_writes.push_back(write);
 		}
-		for (uint32_t i = 0; i < program.info.images.size(); ++i) {
-			const auto& resource = program.info.images[i];
-			const auto& texture = descriptors.images[i];
-			EXIT_IF(resource.mip_count != (texture.mip_views.empty() ? 1u : texture.mip_views.size()));
-			const auto kind = *ShaderRecompiler::IR::DescriptorBindingForImage(resource);
-			const auto start = image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] +
-			                   resource.descriptor_index;
-			for (uint32_t mip = 0; mip < resource.mip_count; ++mip) {
-				m_descriptor_images[start + mip] = MakeImageInfo(texture, mip);
-			}
+		for (uint32_t i = 0; i < descriptors.images.size(); i++) {
+			const auto expected =
+			    program.info.images[i].bindless ? 0u
+			    : descriptors.images[i].mip_views.empty()
+			        ? 1u
+			        : static_cast<uint32_t>(descriptors.images[i].mip_views.size());
+			EXIT_IF(m_image_occurrences[i] != expected);
 		}
 
 		const auto shader_data_dwords = program.bindings.ShaderDataDwords();
@@ -1437,6 +1480,16 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
+	}
+
+	vk::DescriptorSet bindless_set = nullptr;
+	if (std::ranges::any_of(prepared_bindings, [](const PreparedBindings* prepared) {
+		    return prepared->runtime->program->bindings.uses_bindless;
+	    })) {
+		if (m_bindless == nullptr) {
+			m_bindless = std::make_unique<BindlessImageHeap>(m_context, *this);
+		}
+		bindless_set = m_bindless->Commit(vk_buffer);
 	}
 
 	if (!m_descriptor_writes.empty()) {
@@ -1487,6 +1540,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set,
 			                             0, nullptr);
 		}
+	}
+	if (bindless_set != nullptr) {
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+		                             ShaderRecompiler::IR::BindlessDescriptorSet, 1, &bindless_set,
+		                             0, nullptr);
 	}
 }
 
