@@ -611,6 +611,9 @@ struct PipelineCache::ProgramCache {
 			case ShaderType::Mesh: return "ms";
 			case ShaderType::Pixel: return "ps";
 			case ShaderType::Compute: return "cs";
+			case ShaderType::Local: return "ls";
+			case ShaderType::TessellationControl: return "hs";
+			case ShaderType::TessellationEvaluation: return "ds";
 			default: return "unknown";
 		}
 	}
@@ -1424,8 +1427,16 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 		    mesh.max_vertices > limits.maxMeshOutputVertices ||
 		    mesh.max_primitives > limits.maxMeshOutputPrimitives ||
 		    mesh.lds_size_dwords * sizeof(uint32_t) > limits.maxMeshSharedMemorySize) {
-			EXIT("mesh shader exceeds host limits: threads=%u vertices=%u primitives=%u LDS=%u\n",
-			     host_threads, mesh.max_vertices, mesh.max_primitives, mesh.lds_size_dwords);
+			static std::mutex                   mutex;
+			static std::unordered_set<uint64_t> reported;
+			const std::lock_guard<std::mutex>   lock(mutex);
+			if (reported.insert(vertex_params[0].hash).second) {
+				PipelineCacheLog("mesh shader exceeds host limits, skipping draws: hash=0x{:016x} "
+				                 "threads={} vertices={} primitives={} LDS={}",
+				                 vertex_params[0].hash, host_threads, mesh.max_vertices,
+				                 mesh.max_primitives, mesh.lds_size_dwords);
+			}
+			return {};
 		}
 	}
 	ShaderParams pixel_params;

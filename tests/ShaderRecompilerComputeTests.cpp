@@ -981,6 +981,17 @@ void AppendStoreSgprPair(std::vector<u32> *code, u32 value_sgpr,
 
 void AppendEnd(std::vector<u32> *code) { code->push_back(0xbf810000u); }
 
+// FP64 arithmetic translates, but the backend only expresses it under float mode 0xc0.
+std::vector<u32> Float64ConversionCode() {
+  std::vector<u32> code;
+  AppendVMovLiteral(&code, 7, 63u);
+  code.push_back(0x7e060907u); // V_CVT_F64_I32 v[3:4], v7
+  code.push_back(0x7e041f03u); // V_CVT_F32_F64 v2, v[3:4]
+  AppendStoreVgpr(&code, 2, 0);
+  AppendEnd(&code);
+  return code;
+}
+
 std::string Hex(u32 value) {
   char buffer[32] = {};
   std::snprintf(buffer, sizeof(buffer), "0x%08" PRIx32, value);
@@ -5369,6 +5380,67 @@ public:
                 direct_offset, allocation_size) == 0,
             "BDA-store direct-memory allocation release failed");
     std::printf("[host]    %-32s ok\n", name);
+  }
+
+  // A refused program drops its dispatch, stays dropped, and leaves the cache working.
+  void CheckRefusedShaderSkipsDispatch() {
+    constexpr const char *name = "RefusedShaderSkipsDispatch";
+    EnsureRuntimeContext();
+    // The CS registers leave float mode at 0, which FP64 cannot be emitted under.
+    static const auto refused = Float64ConversionCode();
+    static const auto accepted = [] {
+      std::vector<u32> code;
+      AppendEnd(&code);
+      return code;
+    }();
+    for (const auto *code : {&refused, &accepted}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+    static std::array<u32, 8> memory{};
+    const auto base = reinterpret_cast<uint64_t>(memory.data());
+    const std::array<u32, 4> descriptor{static_cast<u32>(base),
+                                        static_cast<u32>(base >> 32u) & 0xffffu,
+                                        static_cast<u32>(sizeof(memory)), 3u << 28u};
+
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    const auto select = [&](const std::vector<u32> &code) {
+      shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(code.data()),
+                           .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                           .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+      for (uint32_t i = 0; i < descriptor.size(); i++) {
+        shaders.SetCsUserSgpr(i, descriptor[i], HW::UserSgprType::Unknown);
+      }
+    };
+    const auto lookup = [&](ShaderComputeInputInfo &input) {
+      return context.GetPipelineCache().GetComputeProgram(
+          shaders.GetCs(), registers.GetShaderRegisters(), input);
+    };
+
+    select(refused);
+    for (const char *attempt : {"first lookup", "skip-set lookup"}) {
+      ShaderComputeInputInfo input{};
+      const auto program = lookup(input);
+      Require(name, attempt, !program && !input.stage,
+              "a program the backend refused was handed to a dispatch");
+    }
+    context.GetRenderExecutor().DispatchDirect(0, scheduler.Current(), 1, 1, 1, 0x41u);
+    Require(name, "dispatch dropped", memory == std::array<u32, 8>{},
+            "the refused dispatch reached guest memory");
+
+    select(accepted);
+    ShaderComputeInputInfo input{};
+    const auto program = lookup(input);
+    Require(name, "cache still compiles", program && input.stage,
+            "a refusal disabled the program cache for other shaders");
+    scheduler.Finish();
+    std::printf("[gpu]     %-32s ok\n", name);
   }
 
   void CheckComputeMetaClearClassification() {
@@ -45003,16 +45075,10 @@ int main(int argc, char **argv) {
     }
     return 0;
   }
-  if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
+  if (argc == 2 && std::strcmp(argv[1], "--shader-refusal-only") == 0) {
+    CheckEmissionRefusalIsSoft();
     VulkanHarness vulkan;
-    RunCase(&vulkan, GlobalLoadShortD16Captured(32));
-    RunCase(&vulkan, GlobalLoadShortD16Captured(64));
-    RunCase(&vulkan, FlatLoadShortD16AddressSegments());
-    RunCase(&vulkan, FlatSubdwordLoadsApplyByteOffset());
-    RunCase(&vulkan, FlatVirtualAddressRebasesGuestAllocation());
-    RunCase(&vulkan, GlobalSignedImmediateRebasesBeforeSaddr());
-    RunCase(&vulkan, FlatSegmentIgnoresSaddrAndMasksOffsetMsb());
-    RunCase(&vulkan, ScratchIsPrivatePerInvocation());
+    vulkan.CheckRefusedShaderSkipsDispatch();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--flat-d16-only") == 0) {
@@ -45712,7 +45778,9 @@ int main(int argc, char **argv) {
   CheckIndirectImageModuleStability();
   CheckDispatcherModuleDeterminism();
   CheckIndirectBufferKeySwitch();
+  CheckIndirectBufferTableModuleSize();
   CheckGlcBufferAccessIsCoherent();
+  CheckEmissionRefusalIsSoft();
   CheckPs5GameExampleImageClearRuntimeShape();
   vulkan.CheckSchedulerTimeline();
   vulkan.CheckHostImageAllocation();
@@ -45722,6 +45790,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
   CheckComputeLdsLimit(vulkan);
+  vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckMetaSliceClears();
   vulkan.CheckUnifiedImageViewCache();

@@ -413,6 +413,9 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 	EmitLabel(ctx.state, ctx.Label(block));
 	bool emitted_non_phi = false;
 	for (const auto& inst: *block) {
+		if (ctx.state.Refused()) {
+			return;
+		}
 		if (inst.GetOpcode() == IR::ValueOpcode::Phi) {
 			if (emitted_non_phi) {
 				ctx.Fail(inst, "appears after a non-Phi instruction");
@@ -536,6 +539,9 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
 		});
+		if (ctx.state.Refused()) {
+			return;
+		}
 		if (charge_sites.contains(block)) {
 			EmitLoopCharge(ctx);
 		}
@@ -552,6 +558,9 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	EmitBlock(ctx, entry, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 		EmitDispatcherInstruction(lane, dispatcher, inst);
 	});
+	if (state.Refused()) {
+		return;
+	}
 	const auto initial_pc =
 	    EmitDispatcherNextPc(ctx, dispatcher, entry, state.program.block_info.front());
 	const auto initial_parent = state.current_label;
@@ -587,6 +596,9 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		          [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			          EmitDispatcherInstruction(lane, dispatcher, inst);
 		          });
+		if (state.Refused()) {
+			return;
+		}
 		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
 		                                           state.program.block_info[index]);
 		next_pc_words.push_back(selected);
@@ -813,6 +825,11 @@ uint32_t ValueEmitContext::Label(const IR::Block* block) const {
 	std::abort();
 }
 
+uint32_t ValueEmitContext::Refuse(const IR::Inst& inst, const char* reason) const {
+	state.Refuse(reason, &inst);
+	return 0;
+}
+
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	ValueEmitContext ctx(state);
@@ -830,7 +847,7 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Pixel && state.input_info.pixel != nullptr &&
 	    state.input_info.pixel->ps_stencil_bit_pass != 0) {
 		if (state.input_info.pixel->ps_stencil_bit_pass > 8 || state.lane_count != 1) {
-			EXIT("stencil replay variant needs a bit index and one lane per invocation\n");
+			state.Refuse("stencil replay variant needs a bit index and one lane per invocation");
 		} else {
 			state.stencil_bit_pass_variable = state.builder.AllocateId();
 			state.builder.AddName(state.stencil_bit_pass_variable, "stencil_bit_pass_keep");
@@ -1013,6 +1030,9 @@ void EmitProgram(EmitterState& state) {
 		EmitDispatcherFunction(ctx, *dispatcher);
 	} else {
 		EmitStructuredFunction(ctx);
+	}
+	if (state.Refused()) {
+		return;
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	if (state.program.stage == ShaderType::Mesh) {

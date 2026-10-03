@@ -76,6 +76,9 @@ struct SpirvRequirements {
 	// A genuine glc buffer load or store is present, so the Coherent alias is declared.
 	bool coherent_buffers             = false;
 	bool float64                      = false;
+	// The first guest feature the backend cannot express; the program is refused, not emitted.
+	const char*     refusal      = nullptr;
+	const IR::Inst* refused_inst = nullptr;
 };
 
 SpirvRequirements AnalyzeProgramRequirements(const IR::Program& program);
@@ -192,6 +195,17 @@ struct EmitterState {
 	std::vector<OutputBinding> outputs;
 	std::vector<uint32_t>      interface_variables;
 	std::unordered_map<const IR::Block*, uint32_t> labels;
+	// The first construct the backend cannot express; not an emitter invariant.
+	const char*                refusal      = nullptr;
+	const IR::Inst*            refused_inst = nullptr;
+
+	void Refuse(const char* reason, const IR::Inst* inst = nullptr) {
+		if (refusal == nullptr) {
+			refusal      = reason;
+			refused_inst = inst;
+		}
+	}
+	[[nodiscard]] bool Refused() const { return refusal != nullptr; }
 };
 
 uint32_t TypeVoid(EmitterState& state);
@@ -292,6 +306,7 @@ struct ValueEmitContext {
 	uint32_t              Label(const IR::Block* block) const;
 	[[noreturn]] void     Fail(const char* reason) const;
 	[[noreturn]] void     Fail(const IR::Inst& inst, const char* reason) const;
+	uint32_t              Refuse(const IR::Inst& inst, const char* reason) const;
 
 	EmitterState&                                                      state;
 	std::unordered_map<const IR::Inst*, uint32_t>                      definitions;

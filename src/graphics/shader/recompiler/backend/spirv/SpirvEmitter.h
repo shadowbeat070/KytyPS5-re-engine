@@ -10,8 +10,9 @@
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv {
 
-std::vector<uint32_t> EmitProgram(const IR::Program& program,
-                                  ShaderStageInputInfo input_info);
+// Unexpressible programs yield no words and name why in `refusal`; without one, fatal.
+std::vector<uint32_t> EmitProgram(const IR::Program& program, ShaderStageInputInfo input_info,
+                                  std::string* refusal = nullptr);
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv
 

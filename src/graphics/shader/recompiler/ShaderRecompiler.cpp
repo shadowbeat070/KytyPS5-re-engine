@@ -1455,7 +1455,18 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info);
+	std::string refusal;
+	auto        spirv = Spirv::EmitProgram(ir, options.input_info, &refusal);
+	if (!refusal.empty()) {
+		LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram refused: %s\n",
+		     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash, refusal.c_str());
+		CompileResult refused;
+		refused.status.ok     = false;
+		refused.status.pc     = 0;
+		refused.status.reason = std::move(refusal);
+		refused.program       = std::move(ir);
+		return refused;
+	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",
 	     GetDumpLabel(options), StageName(ir.stage), ir.shader_hash,
