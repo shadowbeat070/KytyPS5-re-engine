@@ -195,6 +195,34 @@ bool FoldCompositeExtract(Inst& inst, ValueOpcode construct, size_t components) 
 	return false;
 }
 
+Value WithoutThreadRange(Block& block, Block::iterator at, Value condition, uint32_t depth = 0) {
+	condition        = condition.Resolve();
+	const auto* inst = condition.TryInstruction();
+	if (inst == nullptr || depth > 8) {
+		return condition;
+	}
+	if (inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
+		return Value(true);
+	}
+	if (inst->GetOpcode() != ValueOpcode::LogicalAnd) {
+		return condition;
+	}
+	const auto lhs   = inst->Arg(0).Resolve();
+	const auto rhs   = inst->Arg(1).Resolve();
+	const auto left  = WithoutThreadRange(block, at, lhs, depth + 1);
+	const auto right = WithoutThreadRange(block, at, rhs, depth + 1);
+	if (left == lhs && right == rhs) {
+		return condition;
+	}
+	if (left == Value(true)) {
+		return right;
+	}
+	if (right == Value(true)) {
+		return left;
+	}
+	return Value(&*block.PrependNewInst(at, ValueOpcode::LogicalAnd, {left, right}));
+}
+
 void FoldInstruction(Block& block, Block::iterator instruction,
                       std::unordered_set<Inst*>& lowered_ancillary) {
 	auto& inst = *instruction;
@@ -214,7 +242,15 @@ void FoldInstruction(Block& block, Block::iterator instruction,
 			}
 			return;
 		case ValueOpcode::SelectU32:
-		case ValueOpcode::SelectF32: FoldSelect(inst); return;
+		case ValueOpcode::SelectF32: {
+			const auto condition = Arg(inst, 0);
+			const auto live      = WithoutThreadRange(block, instruction, condition);
+			if (live != condition) {
+				inst.SetArg(0, live);
+			}
+			FoldSelect(inst);
+			return;
+		}
 		case ValueOpcode::BitFieldInsert: {
 			const auto base   = Arg(inst, 0);
 			const auto insert = Arg(inst, 1);

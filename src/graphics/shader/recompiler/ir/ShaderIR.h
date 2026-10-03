@@ -378,6 +378,7 @@ static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 56u);
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;
 	static constexpr uint32_t MeshDrawDwordCount = 6;
+	static constexpr uint32_t DispatchLimitDwordCount = 2;
 	static constexpr uint32_t NoStart    = UINT32_MAX;
 	std::array<uint32_t, DwordCount> dwords {};
 
@@ -525,7 +526,6 @@ struct DescriptorBinding {
 
 struct BindingLayout {
 	uint32_t                       push_data_start_dword = PushData::NoStart;
-	uint32_t                       dispatch_thread_dword = PushData::NoStart;
 	uint32_t                       memory_offset_dword = 0;
 	uint32_t                       memory_offset_count = 0;
 	std::vector<uint32_t>          user_data_registers;
