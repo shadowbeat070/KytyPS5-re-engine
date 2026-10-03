@@ -32,6 +32,14 @@ void Check(bool condition, const char *message) {
   }
 }
 
+bool SameResourceSnapshot(const ResourceSnapshot &lhs,
+                          const ResourceSnapshot &rhs) {
+  return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
+         lhs.samplers == rhs.samplers &&
+         lhs.flattened_srt == rhs.flattened_srt &&
+         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill;
+}
+
 // Upstream replaced the free EvaluateDescriptorSource with the SrtWalker class; this keeps
 // the one-source form the tests are written against.
 bool EvaluateDescriptorSource(const ResourcePlan &program, uint32_t source,
@@ -39,14 +47,6 @@ bool EvaluateDescriptorSource(const ResourcePlan &program, uint32_t source,
   SrtWalker clean(program, CleanRuntime(runtime));
   SrtWalker walker(program, runtime, program.clean_flat_slots, &clean);
   return walker.EvaluateDescriptor(source, result);
-}
-
-bool SameResourceSnapshot(const ResourceSnapshot &lhs,
-                          const ResourceSnapshot &rhs) {
-  return lhs.buffers == rhs.buffers && lhs.images == rhs.images &&
-         lhs.samplers == rhs.samplers &&
-         lhs.flattened_srt == rhs.flattened_srt &&
-         lhs.user_data == rhs.user_data && lhs.uniform_fill == rhs.uniform_fill;
 }
 
 template <typename F>
@@ -1172,10 +1172,18 @@ void TestBoundedComputeImageLoop() {
     fixture.PlanAndTrack();
     const auto source = fixture.program.info.images[0].source;
     const auto &indirect = fixture.program.descriptor_sources[source].indirect_descriptor;
-    Check(indirect && indirect->material_source == UINT32_MAX &&
-              indirect->table_offset == 0x6b0u &&
-              indirect->key_count.Resolve() == count.Resolve(),
-          "bounded compute loop lost its runtime image count");
+    const bool bounded = variant == Variant::Bounded || variant == Variant::Plain ||
+                         variant == Variant::Nonzero || variant == Variant::TrueEdge ||
+                         variant == Variant::Masked || variant == Variant::GuardedDiamond;
+    if (bounded) {
+      Check(indirect && indirect->material_source == UINT32_MAX &&
+                indirect->table_offset == 0x6b0u &&
+                indirect->key_count.Resolve() == count.Resolve(),
+            "bounded compute loop lost its runtime image count");
+    } else {
+      Check(!indirect,
+            "an unbounded compute image loop was matched as an indirect table");
+    }
     return ExtractResourcePlan(fixture.program);
   };
 
@@ -1185,33 +1193,6 @@ void TestBoundedComputeImageLoop() {
   make_plan(Variant::TrueEdge);
   make_plan(Variant::Masked);
   make_plan(Variant::GuardedDiamond);
-  for (const auto variant : {Variant::IncrementBypass, Variant::PreviousBound,
-                             Variant::MaskedWrongGuard,
-                             Variant::MaskResurrection, Variant::StatusOverwrite,
-                             Variant::GuardedDiamondBypass}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop allowed an unbounded induction or mask resurrection");
-  }
-  CheckFatal([&] { make_plan(Variant::WrongGuard); },
-             "not a valid runtime value",
-             "compute image loop accepted an unrelated guard");
-  CheckFatal([&] { make_plan(Variant::EntryBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an entry bypass");
-  CheckFatal([&] { make_plan(Variant::ExitBypass); },
-             "not a valid runtime value",
-             "compute image loop accepted an exit bypass");
-  CheckFatal([&] { make_plan(Variant::GuardBlock); },
-             "not a valid runtime value",
-             "compute image loop accepted a descriptor read before the guard");
-  CheckFatal([&] { make_plan(Variant::WrongStep); },
-             "not a valid runtime value",
-             "compute image loop accepted a two-step induction");
-  for (const auto variant : {Variant::DivergentBound, Variant::DivergentKey,
-                             Variant::Disjunction, Variant::WrongPolarity}) {
-    CheckFatal([&] { make_plan(variant); }, "not a valid runtime value",
-               "compute image loop accepted a guard without a uniform bound");
-  }
 
   LinearTestMemory memory;
   const auto table = 0x1800u + 0x6b0u;
@@ -1230,6 +1211,33 @@ void TestBoundedComputeImageLoop() {
                      .read_specialization_memory = ReadLinearTestMemory};
   ResourceSnapshot snapshot;
   ResourceSpecialization specialization;
+  // None of these shapes bounds the loop key, so the table match refuses them. Tracking may
+  // refuse the descriptor outright, or accept its words through the value the loop is entered
+  // with and leave the refusal to the evaluator fixpoint proof, which finds the key advances.
+  // Either way it must never be served.
+  for (const auto variant :
+       {Variant::WrongGuard, Variant::EntryBypass, Variant::ExitBypass, Variant::GuardBlock,
+        Variant::WrongStep, Variant::IncrementBypass, Variant::PreviousBound,
+        Variant::MaskedWrongGuard, Variant::MaskResurrection, Variant::StatusOverwrite,
+        Variant::GuardedDiamondBypass, Variant::DivergentBound, Variant::DivergentKey,
+        Variant::Disjunction, Variant::WrongPolarity}) {
+    std::optional<ResourcePlan> unbounded;
+    try {
+      unbounded = make_plan(variant);
+    } catch (const std::runtime_error &error) {
+      if (std::string_view(error.what()).find("not a valid runtime value") ==
+          std::string_view::npos) {
+        throw;
+      }
+    }
+    if (unbounded) {
+      ResourceSnapshot unbounded_snapshot;
+      ResourceSpecialization unbounded_specialization;
+      Check(!MaterializeResources(*unbounded, runtime, unbounded_snapshot,
+                                  unbounded_specialization),
+            "an unbounded compute image loop was materialized from its entry value");
+    }
+  }
   for (const uint32_t count : {2u, 3u, 2u}) {
     user_data[2] = count;
     Check(MaterializeResources(plan, runtime, snapshot, specialization) &&

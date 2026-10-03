@@ -816,6 +816,9 @@ bool SrtWalker::EvaluateInst(const Inst& inst, uint64_t& result) {
 				SrtWalker active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
 				                 inst.Arg(1));
 				active.m_lane = &scope;
+				// A select resolves its predicate through the clean evaluator, so the lane has to be
+				// the same there: it is a property of the walk, not of the memory being read.
+				clean_active.m_lane = &scope;
 				// A lane walk resolves selects on its own mask; outer assumptions need not hold.
 				active.m_barred = m_barred;
 				for (const auto& assumed: m_assumed) {

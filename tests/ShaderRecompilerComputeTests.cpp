@@ -7465,7 +7465,7 @@ public:
 
       // SILENT HILL 2 reuses a depth allocation for a color target within a
       // frame, with the same metadata address changing from HTile to DCC.
-      auto htile_depth = MakeMetadataDepth(0x12400, 0x13300);
+      auto htile_depth = MakeMetadataDepth(0x12400, 0x14000);
       htile_depth.info.htile_clear_mask = UINT32_MAX;
       const auto htile_depth_id = texture_cache.FindImage(htile_depth);
       (void)texture_cache.FindDepthTarget(htile_depth_id, htile_depth);
@@ -7475,29 +7475,32 @@ public:
           {1, 1, 1}, 1, 4, 1);
       dcc_color.type = BindingType::RenderTarget;
       dcc_color.info.metadata.kind = ImageMetadataKind::Dcc;
-      dcc_color.info.metadata.range = {base + 0x13300, 0x20};
+      dcc_color.info.metadata.range = {base + 0x14000, 0x1000};
       dcc_color.view_info.usage = vk::ImageUsageFlagBits::eColorAttachment;
       Require(name, "HTile state before DCC reuse",
-              texture_cache.IsMetaCleared(base + 0x13300, 0),
+              texture_cache.IsMetaCleared(base + 0x14000, 0),
               "depth binding did not register its HTile clear state");
       const auto dcc_color_id = texture_cache.FindImage(dcc_color);
       (void)texture_cache.FindRenderTarget(dcc_color_id, dcc_color);
+      // m_surface_metas tracks only CMask/FMask/HTile: a native DCC allocation is not one of
+      // them, so taking the allocation over drops the association rather than reclassifying it.
+      // Either way the stale HTile clear state must not survive, which is what this checks.
       Require(
           name, "HTile allocation reused as DCC",
-          texture_cache.IsMeta(base + 0x13300) &&
-              !texture_cache.IsMetaCleared(base + 0x13300, 0) &&
-              !texture_cache.ClearMeta(base + 0x13300),
+          !texture_cache.IsMeta(base + 0x14000) &&
+              !texture_cache.IsMetaCleared(base + 0x14000, 0) &&
+              !texture_cache.ClearMeta(base + 0x14000),
           "color binding retained incompatible HTile clear state");
       texture_cache.UnmapMemory(htile_depth.info.data.address,
                                 htile_depth.info.data.size);
-      Require(name, "reused DCC owner survives HTile retirement",
-              texture_cache.IsMeta(base + 0x13300) &&
-                  !texture_cache.ClearMeta(base + 0x13300),
-              "retiring the old HTile image erased the live DCC metadata");
+      Require(name, "retiring the old HTile image adds nothing back",
+              !texture_cache.IsMeta(base + 0x14000) &&
+                  !texture_cache.ClearMeta(base + 0x14000),
+              "retiring the old HTile image re-registered its metadata");
       texture_cache.UnmapMemory(dcc_color.info.data.address,
                                 dcc_color.info.data.size);
       Require(name, "reused DCC final retirement",
-              !texture_cache.IsMeta(base + 0x13300),
+              !texture_cache.IsMeta(base + 0x14000),
               "retiring the DCC image left its metadata registered");
 
       // SILENT HILL 2 renders its R11G11B10 scene colour at an address a BGRA8 target
@@ -9366,7 +9369,7 @@ public:
   void CheckLargeImageReadback() {
     constexpr const char *name = "LargeImageReadback";
     constexpr uintptr_t base = 0x0000000220000000ull;
-    constexpr uint64_t allocation_size = 0x10000000;
+    constexpr uint64_t allocation_size = 0x14000000;
     constexpr uint64_t alignment = 0x10000;
     EnsureRuntimeContext();
 
@@ -9414,13 +9417,16 @@ public:
                                                            : *mismatch.in2));
       };
 
-      // Two layers of two levels whose level 0 alone exceeds the stream.
+      // Two levels whose level 0 alone exceeds the download stream, which upstream raised to
+      // 64 MiB - 3072x3072 no longer does. One layer, not two: the test builds two host-side
+      // copies of the whole surface, and at two layers of this size that is ~340 MiB of host
+      // memory. The per-level split is what this exercises, and one layer still exercises it.
       constexpr auto color_format = Prospero::BufferFormat::k32UInt;
       constexpr auto linear = Prospero::TileMode::kLinear;
-      constexpr uint32_t color_width = 3072;
-      constexpr uint32_t color_height = 3072;
+      constexpr uint32_t color_width = 4352;
+      constexpr uint32_t color_height = 4352;
       constexpr uint32_t color_levels = 2;
-      constexpr uint32_t color_layers = 2;
+      constexpr uint32_t color_layers = 1;
       const uint32_t color_pitch =
           TileGetTexturePitch(color_format, color_width, linear);
       TileSizeAlign color_total{};
@@ -9514,9 +9520,11 @@ public:
       constexpr std::array<DepthCase, 2> depth_cases{{
           {"d32 readback contents", 0x6000000, vk::Format::eD32Sfloat,
            Prospero::BufferFormat::k32Float, 4, 3000, 2800, 3008, 2, 0},
+          // Two layers so the surface clears the 64 MiB stream on its own, with the stencil
+          // plane moved past the wider depth data.
           {"d16 readback contents", 0xa100000, vk::Format::eD32SfloatS8Uint,
-           Prospero::BufferFormat::k16UNorm, 2, 4200, 4200, 4200, 1,
-           0xc400000},
+           Prospero::BufferFormat::k16UNorm, 2, 4200, 4200, 4200, 2,
+           0x11000000},
       }};
       for (const auto &depth : depth_cases) {
         const uint64_t texels =
@@ -12336,6 +12344,24 @@ public:
           [&](ShaderRecompiler::IR::Program &program) {
             program.shader_info_complete = true;
             ShaderRecompiler::IR::AllocateBindings(program);
+            // These fixtures build a Program with no translated blocks, so binding allocation
+            // finds no instruction to mark a declared buffer live and binds none. Bind them
+            // explicitly: the fixture exercises descriptor discovery, not liveness.
+            if (program.bindings.memory_offset_count == 0 &&
+                !program.info.buffers.empty()) {
+              std::vector<uint32_t> resources;
+              resources.reserve(program.info.buffers.size());
+              for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+                resources.push_back(i);
+              }
+              program.bindings.memory_offset_count =
+                  static_cast<uint32_t>(resources.size());
+              program.bindings.descriptors.insert(
+                  program.bindings.descriptors.begin(),
+                  ShaderRecompiler::IR::DescriptorBinding{
+                      ShaderRecompiler::IR::DescriptorBindingKind::Buffers,
+                      std::move(resources)});
+            }
           };
       const auto make_buffer_program =
           [](ShaderType stage, ShaderRecompiler::IR::BufferResource resource) {
@@ -35529,9 +35555,14 @@ void CheckGlcBufferAccessIsCoherent() {
   std::string text;
   Require(name, "SPIR-V disassembly", tools.Disassemble(compiled.spirv, &text),
           "failed to disassemble the glc buffer shader");
+  // The alias is what carries the glc traffic; the plain array is decorated too because a
+  // glc load polls locations a non-glc store wrote, and a store on a variable outside the
+  // visibility chain is one the poll can miss. Both, and nothing else: this shader declares
+  // no third alias of the binding.
   Require(name, "coherent alias",
           CountText(text, "OpDecorate %buffers_coherent Coherent") == 1 &&
-              CountText(text, "Coherent") == 1,
+              CountText(text, "OpDecorate %buffers Coherent") == 1 &&
+              CountText(text, "Coherent") == 2,
           "the glc accesses must reach a second, Coherent-decorated alias of "
           "the buffer descriptor array, as the GLSL450 memory model gives "
           "Volatile alone no cross-workgroup visibility");

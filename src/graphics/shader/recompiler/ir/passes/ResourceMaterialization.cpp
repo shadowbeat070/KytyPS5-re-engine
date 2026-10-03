@@ -1093,6 +1093,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		auto& target          = plan.descriptor_sources.emplace_back();
 		target.dword_count    = source.dword_count;
 		target.indirect_descriptor = source.indirect_descriptor;
+		// Plain indices and offsets, so it needs no cloning - but it does need carrying, or the
+		// plan binds the heap V# in place of the record the table selects.
+		target.indirect_buffer = source.indirect_buffer;
 		if (target.indirect_descriptor.has_value()) {
 			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
 			target.indirect_descriptor->selector_first =

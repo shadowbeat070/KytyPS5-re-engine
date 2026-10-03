@@ -889,7 +889,12 @@ private:
 		for (uint32_t candidate = 0; candidate < m_sources.size(); candidate++) {
 			const auto& current = m_sources[candidate];
 			if (current.dword_count != descriptor.dword_count ||
-			    current.indirect_descriptor.has_value() != descriptor.indirect_descriptor.has_value()) {
+			    current.indirect_descriptor.has_value() !=
+			        descriptor.indirect_descriptor.has_value() ||
+			    current.indirect_buffer != descriptor.indirect_buffer) {
+				// A table source carries the heap V# in its dwords, so without the indirect
+				// description it is indistinguishable from the heap binding itself and the two
+				// collapse into one resource that describes neither.
 				continue;
 			}
 			if (current.indirect_descriptor.has_value()) {
@@ -2489,22 +2494,48 @@ private:
 
 		if (buffer != BufferAccess::None) {
 			handle = inst.Arg(0).Resolve().TryInstruction();
+			// 4. A scalar, DWORD x1 or formatted X load the others refused decodes its V# itself.
+			const auto take_indirect_load = [&]() {
+				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
+				                                                        : ResourceKind::Buffer) ||
+				    !memory.SupportsIndirectBufferLoad(op)) {
+					return false;
+				}
+				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+				m_info.uses_dma                         = true;
+				return true;
+			};
 			const auto* indirect = handle == nullptr ? nullptr : FindIndirectDescriptor(*handle);
 			if (indirect != nullptr) {
 				source = indirect->source;
 			} else if (!GetHandle(inst.Arg(0), ValueOpcode::GetBufferResource, 4, flags.pc,
 			               memory.resource * 4u, handle, source)) {
-				if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
-				                                                        : ResourceKind::Buffer) ||
-				    !memory.SupportsIndirectBufferLoad(op)) {
-					Fail(flags.pc,
-					     "buffer descriptor is not a valid runtime value; GPU-selected access "
-					     "requires a scalar, raw DWORD x1/x2/x3/x4, or formatted X load");
+				// Two mechanisms, layered narrow-first. Decoding the V# in the shader over a raw
+				// device pointer needs no host-visible descriptor but only serves an unformatted,
+				// untyped DWORD x2/x3/x4 load, so it goes first. Resolving the table on the host into
+				// real, deduped bindings covers what that cannot express, so it picks up the rest
+				// rather than competing for the same accesses.
+				const bool raw_multi_dword = op == ValueOpcode::LoadBufferU32x2 ||
+				                             op == ValueOpcode::LoadBufferU32x3 ||
+				                             op == ValueOpcode::LoadBufferU32x4;
+				if (memory.kind == ResourceKind::Buffer && !memory.formatted && raw_multi_dword &&
+				    memory.SupportsIndirectBufferLoad(op)) {
+					m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
+					m_info.uses_dma                         = true;
+					return true;
 				}
-				m_program.memory_info[flags.index].kind = ResourceKind::IndirectBuffer;
-				m_info.uses_dma                         = true;
-				return true;
-
+				auto*       root     = inst.Arg(0).Resolve().TryInstruction();
+				const auto* indirect = root != nullptr ? FindIndirectBuffer(*root) : nullptr;
+				if (indirect == nullptr) {
+					if (indirect == nullptr && take_indirect_load()) {
+						return true;
+					}
+					return Reject(flags.pc,
+					              "buffer descriptor is not a valid runtime value; GPU-selected access "
+					              "requires a raw DWORD x2/x3/x4 load or a recognisable table");
+				}
+				handle = root;
+				source = indirect->source;
 			}
 			resource = AddBuffer(source, memory, op, flags.pc);
 			if (resource == UINT32_MAX) {
@@ -2544,6 +2575,9 @@ private:
 			ValidateAddressHandle(inst.Arg(0), flags.pc);
 			if (address_info.access == AddressAccess::Write) {
 				m_program.has_address_writes = true;
+				// The store goes through the page table, so the emitter needs its own store-pointer
+				// helper and the context has to publish a writable BDA set for the draw.
+				m_info.writes_dma            = true;
 			}
 			m_info.uses_dma = true;
 			return true;
