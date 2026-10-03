@@ -42488,6 +42488,23 @@ void CheckEmbeddedFetchVertexOffset() {
   std::printf("[host]    %-32s ok\n", "EmbeddedFetchVertexOffset");
 }
 
+void CheckIndirectFastLaunchOffsets() {
+  ShaderVertexInputInfo vertex;
+  Require("IndirectRecordOffsets", "vertex shader",
+          ResolveIndirectDrawOffsets(5, 3, vertex) == std::pair<u32, u32>{5u, 3u},
+          "an indirect record no longer offsets the vertex and instance IDs of a vertex shader");
+  vertex.mesh.fast_launch = true;
+  const std::array<u32, 4> record{1u, 1u, 1u, 0u};
+  const std::array<u32, 2> clusters{0x153u, 0x1u};
+  const auto [first_vertex, first_instance] =
+      ResolveIndirectDrawOffsets(record[2], record[3], vertex);
+  Require("IndirectRecordOffsets", "fast launch",
+          first_vertex == 0u && first_instance == 0u &&
+              clusters[first_vertex + 0u] == 0x153u,
+          "a fast-launch subgroup index was offset by its indirect record's start vertex");
+  std::printf("[host]    %-32s ok\n", "IndirectRecordOffsets");
+}
+
 [[noreturn]] void RunReverseRenderTargetDeathCase() {
   (void)TextureGetRenderTargetFormat(Prospero::ChannelLayout::k16_16_16_16,
                                      Prospero::ChannelType::kSrgb,
@@ -47746,6 +47763,7 @@ int main(int argc, char **argv) {
   }
   if (argc == 2 && std::strcmp(argv[1], "--draw-offset-only") == 0) {
     CheckEmbeddedFetchVertexOffset();
+    CheckIndirectFastLaunchOffsets();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--depth-feedback-only") == 0) {
@@ -48034,6 +48052,7 @@ int main(int argc, char **argv) {
   CheckPm4RewindResume(vulkan.RuntimeRenderer());
   CheckPm4CeCompletion(vulkan.RuntimeRenderer());
   CheckEmbeddedFetchVertexOffset();
+  CheckIndirectFastLaunchOffsets();
   CheckEmbeddedFetchLaneSpill();
   CheckTessellationPrograms();
   CheckPixelParameterAliases();

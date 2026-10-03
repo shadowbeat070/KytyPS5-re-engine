@@ -79,6 +79,16 @@ std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
 	return {vertex_offset, instance_offset};
 }
 
+// The CP writes an indirect record's start vertex and instance only to user SGPRs.
+std::pair<uint32_t, uint32_t>
+ResolveIndirectDrawOffsets(uint32_t first_vertex, uint32_t first_instance,
+                           const ShaderVertexInputInfo& vs_input_info) {
+	if (vs_input_info.mesh.fast_launch) {
+		return {0, 0};
+	}
+	return {first_vertex, first_instance};
+}
+
 static std::atomic<uint32_t> g_draw_state_log_count   = 0;
 static std::atomic<uint32_t> g_draw_input_log_count   = 0;
 static std::atomic<uint32_t> g_mrt_state_log_count    = 0;
@@ -1608,13 +1618,20 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	LogDrawStateIfNeeded(buffer, draw, state, 0, nullptr);
 
-	const bool indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
-	const auto [vertex_offset, instance_offset] =
-	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
-	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
+	const bool   indirect = args.offset_source == DrawOffsetSource::IndirectArgs;
 	DrawEmitInfo emit {};
-	emit.first_vertex = static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
-	emit.first_instance = instance_offset;
+	if (indirect) {
+		const auto [first_vertex, first_instance] = ResolveIndirectDrawOffsets(
+		    args.first_vertex, args.first_instance, state.vertex_info[0]);
+		emit.first_vertex   = first_vertex;
+		emit.first_instance = first_instance;
+	} else {
+		const auto [vertex_offset, instance_offset] =
+		    ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
+		emit.first_vertex =
+		    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
+		emit.first_instance = instance_offset;
+	}
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
