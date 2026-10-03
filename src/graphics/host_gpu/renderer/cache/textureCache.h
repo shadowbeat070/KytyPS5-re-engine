@@ -17,6 +17,7 @@
 #include <atomic>
 #include <map>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string>
 #include <type_traits>
@@ -91,6 +92,8 @@ private:
 class TextureCache {
 public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
+
+	static void OverrideStencilPlaneRedirect(std::optional<bool> enabled);
 
 	struct ImageDesc {
 		ImageInfo     info;
@@ -226,6 +229,7 @@ private:
 	// Caller holds m_lock; it also serializes the per-image query epoch.
 	[[nodiscard]] ImageIds      FindImagesInRegion(uint64_t address, uint64_t size,
 	                                               bool page_overlap) const;
+	[[nodiscard]] ImageId       StencilPlaneOwner(const ImageDesc& desc) const;
 	[[nodiscard]] OverlapResult ResolveOverlap(const ImageInfo& requested, BindingType binding,
 	                                           ImageId cached, ImageId merged);
 	// An overlap the lookup cannot resolve into one surface has to displace the cached image, or
@@ -302,6 +306,7 @@ private:
 	std::mutex                                        m_evict_published_lock;
 	std::vector<ImageId>                              m_evict_published;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;
+	std::unordered_map<uint64_t, ImageId>             m_stencil_planes;
 	uint64_t                                          m_total_used_memory  = 0;
 	uint64_t                                          m_trigger_gc_memory  = 0;
 	uint64_t                                          m_pressure_gc_memory = 1536ull * 1024 * 1024;

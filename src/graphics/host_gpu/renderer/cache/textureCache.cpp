@@ -22,9 +22,11 @@
 #include <bit>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <tuple>
@@ -483,6 +485,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 
 void TextureCache::DeleteImage(ImageId id) {
 	m_evict_pending.erase(id);
+	std::erase_if(m_stencil_planes, [id](const auto& entry) { return entry.second == id; });
 	auto* image = m_slot_images.try_get(id);
 	if (image == nullptr || !image->registered) {
 		return;
@@ -1762,6 +1765,48 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	return association;
 }
 
+namespace {
+
+std::atomic<int> g_stencil_plane_redirect_override {-1};
+
+[[nodiscard]] bool EnvFlag(const char* name) {
+	const char* value = std::getenv(name);
+	return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+[[nodiscard]] bool StencilPlaneRedirectEnabled() {
+	const int forced = g_stencil_plane_redirect_override.load(std::memory_order_relaxed);
+	if (forced >= 0) {
+		return forced != 0;
+	}
+	static const bool enabled = !EnvFlag("KYTY_NO_STENCIL_PLANE_REDIRECT");
+	return enabled;
+}
+
+} // namespace
+
+void TextureCache::OverrideStencilPlaneRedirect(std::optional<bool> enabled) {
+	g_stencil_plane_redirect_override.store(enabled ? (*enabled ? 1 : 0) : -1,
+	                                        std::memory_order_relaxed);
+}
+
+ImageId TextureCache::StencilPlaneOwner(const ImageDesc& desc) const {
+	const auto found = m_stencil_planes.find(desc.info.data.address);
+	if (found == m_stencil_planes.end()) {
+		return {};
+	}
+	const auto* depth = m_slot_images.try_get(found->second);
+	if (depth == nullptr || !depth->registered || depth->dormant || depth->depth_id ||
+	    !depth->info.IsDepth() || !depth->info.HasStencil() ||
+	    depth->info.stencil.address != desc.info.data.address ||
+	    depth->info.extent.width != desc.info.extent.width ||
+	    depth->info.extent.height != desc.info.extent.height || !depth->IsGpuModified() ||
+	    depth->backing.image == nullptr) {
+		return {};
+	}
+	return found->second;
+}
+
 ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 	KYTY_PROFILER_FUNCTION();
 	auto& command = m_scheduler.Current();
@@ -1795,6 +1840,28 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			    image->info.extent == desc.info.extent) {
 				result = id;
 				break;
+			}
+		}
+		ImageId stencil_owner {};
+		if (stencil_plane_read && !result && StencilPlaneRedirectEnabled()) {
+			stencil_owner = StencilPlaneOwner(desc);
+			if (stencil_owner && !m_slot_images[stencil_owner].binding.is_target) {
+				const auto owner_epoch = m_slot_images[stencil_owner].GpuWriteEpoch();
+				bool       newer_alias = false;
+				for (const auto id: candidates) {
+					const auto image = m_slot_images.try_get(id);
+					if (image == nullptr || image->depth_id ||
+					    image->info.data.address != desc.info.data.address) {
+						continue;
+					}
+					newer_alias |=
+					    (image->IsGpuModified() && image->GpuWriteEpoch() > owner_epoch) ||
+					    (image->IsBufferModified() && image->BufferWriteEpoch() > owner_epoch);
+				}
+				if (!newer_alias) {
+					result =
+					    AssociateStencil(stencil_owner, m_slot_images[stencil_owner].info.stencil);
+				}
 			}
 		}
 		const bool stencil_plane_found = static_cast<bool>(result);
@@ -2047,6 +2114,9 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		                             desc.info.resources.layers};
 	}
 	image.info.stencil = desc.info.stencil;
+	if (desc.info.HasStencil()) {
+		m_stencil_planes[desc.info.stencil.address] = id;
+	}
 	image.info.metadata = desc.info.metadata;
 	if (desc.info.HasMetadata()) {
 		const auto [entry, inserted] = m_surface_metas.emplace(

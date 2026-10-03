@@ -13674,6 +13674,148 @@ public:
     std::printf("[host]    %-32s ok\n", name);
   }
 
+  void CheckStencilPlaneEqualFootprint(std::optional<bool> force) {
+    constexpr const char *name = "StencilPlaneEqualFootprint";
+    TextureCache::OverrideStencilPlaneRedirect(force);
+    constexpr uintptr_t base = 0x0000000209400000ull;
+    constexpr uint64_t allocation_size = 0x400000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint64_t plane_size = 0x10000;
+    constexpr vk::Extent3D extent{64, 64, 1};
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "stencil plane direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "stencil plane fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      context.MapMemory(base, allocation_size);
+      auto &texture_cache = context.GetTextureCache();
+
+      const auto make_desc = [&](uint64_t address, uint64_t size, vk::Format format,
+                                 Prospero::BufferFormat guest_format,
+                                 uint32_t bytes_per_block) {
+        TextureCache::ImageDesc desc{};
+        desc.type = TextureCache::BindingType::Texture;
+        desc.info.data = {address, size};
+        desc.info.pixel_format = format;
+        desc.info.guest_format = guest_format;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = extent;
+        desc.info.resources = {1, 1};
+        desc.info.pitch = extent.width;
+        desc.info.bytes_per_block = bytes_per_block;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kLinear;
+        desc.info.mip_layout[0] = {0, size, extent.width, extent.height};
+        desc.view_info.format = format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.layer_count = 1;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        return desc;
+      };
+      const auto render_depth = [&](uint64_t depth_address, uint64_t stencil_address) {
+        auto depth = make_desc(depth_address, plane_size * 4, vk::Format::eD32SfloatS8Uint,
+                               Prospero::BufferFormat::k32Float, 4);
+        depth.type = TextureCache::BindingType::DepthTarget;
+        depth.info.stencil = {stencil_address, plane_size};
+        depth.view_info.aspect =
+            vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+        depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+        const auto depth_image = texture_cache.FindImage(depth);
+        Require(name, "depth acquisition",
+                texture_cache.FindDepthTarget(depth_image, depth) != nullptr,
+                "the depth target produced no view");
+        return depth_image;
+      };
+      const auto plane = [&](uint64_t stencil_address) {
+        return make_desc(stencil_address, plane_size, vk::Format::eR8Uint,
+                         Prospero::BufferFormat::k8UInt, 1);
+      };
+
+      const auto env_flag = [](const char *flag) {
+        const char *value = std::getenv(flag);
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+      };
+      const bool redirect_disabled =
+          force ? !*force : env_flag("KYTY_NO_STENCIL_PLANE_REDIRECT");
+
+      const auto depth_image = render_depth(base, base + 0x100000);
+      auto first_read = plane(base + 0x100000);
+      const auto first = texture_cache.FindImage(first_read);
+      if (redirect_disabled) {
+        Require(name, "ordinary lookup with the redirect off",
+                !texture_cache.GetImage(first).depth_id,
+                "the stencil read was redirected although the redirect was turned off");
+        context.UnmapMemory(base, allocation_size);
+        scheduler.Finish();
+        context.ShutdownGpu();
+      } else {
+      Require(name, "first equal-footprint stencil read",
+              texture_cache.GetImage(first).depth_id == depth_image,
+              "an equal-footprint stencil sample created an R8 image from guest bytes instead "
+              "of reading the rendered depth target");
+
+      const auto attached_depth = render_depth(base + 0x180000, base + 0x1c0000);
+      texture_cache.GetImage(attached_depth).binding.is_target = true;
+      auto attached_read = plane(base + 0x1c0000);
+      const auto attached = texture_cache.FindImage(attached_read);
+      Require(name, "attached depth keeps the ordinary lookup",
+              !texture_cache.GetImage(attached).depth_id,
+              "a stencil sample in a draw that has the depth target attached was redirected "
+              "into a feedback loop");
+      texture_cache.GetImage(attached_depth).binding = {};
+
+      const auto later_depth = render_depth(base + 0x200000, base + 0x300000);
+      auto storage = plane(base + 0x300000);
+      storage.type = TextureCache::BindingType::Storage;
+      storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+      const auto storage_image = texture_cache.FindImage(storage);
+      (void)texture_cache.FindTexture(storage_image, storage);
+      texture_cache.MarkGpuWritten(storage_image);
+      auto later_read = plane(base + 0x300000);
+      const auto later = texture_cache.FindImage(later_read);
+      Require(name, "newer colour write kept",
+              later == storage_image && !texture_cache.GetImage(later).depth_id &&
+                  later_depth != storage_image,
+              "an R8 surface written after the depth target lost its read to the depth "
+              "owner");
+
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+      }
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "stencil plane direct mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(
+                direct_offset, allocation_size) == 0,
+            "stencil plane direct-memory allocation release failed");
+    TextureCache::OverrideStencilPlaneRedirect(std::nullopt);
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckRenderExecutorStencilBindingDiscovery() {
     constexpr const char *name = "RenderExecutorStencilBindingDiscovery";
     constexpr uintptr_t base = 0x0000000203600000ull;
@@ -46971,6 +47113,16 @@ int main(int argc, char **argv) {
     CheckWave64ExecZeroLoopExit(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStencilPlaneEqualFootprint(true);
+    return 0;
+  }
+  if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-default-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckStencilPlaneEqualFootprint(std::nullopt);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--null-1d-image-only") == 0) {
     VulkanHarness vulkan;
     CheckNull1DImageBindings(&vulkan);
@@ -47925,6 +48077,7 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColorStandardTileDiscovery();
     vulkan.CheckRenderExecutorColorDepthTileDiscovery();
     vulkan.CheckRenderExecutorStencilBindingDiscovery();
+    vulkan.CheckStencilPlaneEqualFootprint(true);
     vulkan.CheckBindlessNullImages();
     vulkan.CheckBindlessHeap1DRecords();
     vulkan.CheckRenderExecutorStencilAliasRediscovery();
