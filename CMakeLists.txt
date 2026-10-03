@@ -476,6 +476,7 @@ add_executable(resource_tracking_tests EXCLUDE_FROM_ALL
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ResourceMaterialization.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/ShaderInfoCollection.cpp"
 	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/BindingLayout.cpp"
+	"${KYTY_SOURCE_DIR}/graphics/shader/recompiler/ir/passes/IndexRangeFold.cpp"
 )
 target_link_libraries(resource_tracking_tests fmt::fmt xxhash Tracy::TracyClient)
 target_include_directories(resource_tracking_tests PRIVATE ${inc_headers})
