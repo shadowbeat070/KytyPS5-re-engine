@@ -180,6 +180,7 @@ struct ShaderPixelInputInfo {
 	uint32_t                                       ps_perspective_sample_vgpr   = UINT32_MAX;
 	uint8_t                                        target_output_mode[8]        = {};
 	std::array<Prospero::ColorComponentMapping, 8> target_export_mapping        = {};
+	std::array<uint8_t, 8>                         target_slot = {0, 1, 2, 3, 4, 5, 6, 7};
 	uint32_t                                       scratch_size_dwords          = 0;
 	bool                                           ps_pos_x                     = false;
 	bool                                           ps_pos_y                     = false;
@@ -206,6 +207,25 @@ struct ShaderPixelInputInfo {
 
 	bool HasPositionInput() const { return ps_pos_x || ps_pos_y || ps_pos_z || ps_pos_w; }
 };
+
+inline constexpr uint8_t NoColorExportSlot = 0xffu;
+
+[[nodiscard]] constexpr std::array<uint8_t, 8> ColorExportSlots(uint32_t cb_shader_mask) {
+	std::array<uint8_t, 8> slots {};
+	if (cb_shader_mask == 0) {
+		return {0, 1, 2, 3, 4, 5, 6, 7};
+	}
+	uint32_t export_index = 0;
+	for (uint32_t slot = 0; slot < 8u; slot++) {
+		if (((cb_shader_mask >> (slot * 4u)) & 0xfu) != 0u) {
+			slots[export_index++] = static_cast<uint8_t>(slot);
+		}
+	}
+	for (; export_index < 8u; export_index++) {
+		slots[export_index] = NoColorExportSlot;
+	}
+	return slots;
+}
 
 // SPI_PS_IN_CONTROL.PS_W32_EN runs the pixel stage as 32-lane waves, which leaves the upper
 // halves of EXEC and VCC free for the shader to use as ordinary scalar registers.

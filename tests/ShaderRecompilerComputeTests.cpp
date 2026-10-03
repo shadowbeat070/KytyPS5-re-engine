@@ -1513,6 +1513,11 @@ struct GraphicsCase {
   uint8_t pixel_stencil_bit_pass = 0;
   u32 pixel_perspective_centroid_vgpr = UINT32_MAX;
   u32 pixel_custom_interpolation_mask = 0;
+  std::array<uint8_t, 8> target_output_mode{};
+  u32 cb_shader_mask = 0;
+  vk::Format target_format = vk::Format::eR32G32B32A32Sfloat;
+  u32 target_dwords_per_pixel = 4;
+  u32 target_location = 0;
 };
 
 struct CompiledShader {
@@ -1948,6 +1953,11 @@ CompiledShader CompileFragmentCase(const GraphicsCase &test) {
   pixel_info.ps_system_input_base = 2;
   pixel_info.ps_perspective_centroid_vgpr = test.pixel_perspective_centroid_vgpr;
   pixel_info.custom_interpolation_mask = test.pixel_custom_interpolation_mask;
+  std::copy(test.target_output_mode.begin(), test.target_output_mode.end(),
+            std::begin(pixel_info.target_output_mode));
+  if (test.cb_shader_mask != 0) {
+    pixel_info.target_slot = ColorExportSlots(test.cb_shader_mask);
+  }
   for (u32 i = 0; i < std::size(pixel_info.interpolator_settings); i++) {
     pixel_info.interpolator_settings[i] = i;
   }
@@ -18700,11 +18710,10 @@ public:
         registers.SetTargetOutputMode(slot, 4);
       }
 
-      // With MRT0 still bound, an MRT3-only export must retain location3 in
-      // rendering attachments, pipeline formats, blend masks and dynamic write enables.
+      registers.SetTargetOutputMode(1, 4);
       static const auto sparse_pixel = [] {
         auto code = native_pixel;
-        *std::ranges::find(code, EncodeExp0(0x00, 0xf)) = EncodeExp0(0x03, 0xf);
+        *std::ranges::find(code, EncodeExp0(0x00, 0xf)) = EncodeExp0(0x01, 0xf);
         return code;
       }();
       const auto sparse_address = reinterpret_cast<uint64_t>(sparse_pixel.data());
@@ -18724,7 +18733,7 @@ public:
       for (size_t component = 0; component < sparse_pixels.size(); component++) {
         const auto expected = component % 4 == 3 ? 0x3f800000u : 0x3e800000u;
         Require(name, "sparse MRT3 output", sparse_pixels[component] == expected,
-                "MRT3 was compacted to a different slot or clipped by unused MRT0");
+                "export 1 did not land in colour buffer 3 or was clipped by unused MRT0");
       }
 
       // A fourth VS invocation reads beyond the descriptor instead of reconstructing the corner.
@@ -18752,7 +18761,7 @@ public:
         }
         AppendVMovU32(&code, 22, 0);
         AppendVMovLiteral(&code, 23, 0x3f800000u);
-        code.insert(code.end(), {EncodeExp0(0x03, 0xf), EncodeExp1(20, 21, 22, 23)});
+        code.insert(code.end(), {EncodeExp0(0x01, 0xf), EncodeExp1(20, 21, 22, 23)});
         AppendEnd(&code);
         return code;
       }();
@@ -19045,8 +19054,8 @@ public:
     ValidateSpirv(test.name, vertex_spirv);
 
     Image target =
-        CreateImageMips(test.name, 1, 1, vk::Format::eR32G32B32A32Sfloat,
-                      vk::ImageUsageFlagBits::eColorAttachment, {}, 4,
+        CreateImageMips(test.name, 1, 1, test.target_format,
+                      vk::ImageUsageFlagBits::eColorAttachment, {}, test.target_dwords_per_pixel,
                       vk::ImageLayout::eGeneral, vk::ImageType::e2D,
                       test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
                       test.layers, 0, 0, test.samples);
@@ -19054,7 +19063,7 @@ public:
     if (test.samples != vk::SampleCountFlagBits::e1) {
       resolved = CreateImageMips(
           test.name, 1, 1, target.format, vk::ImageUsageFlagBits::eColorAttachment,
-          {}, 4, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
+          {}, test.target_dwords_per_pixel, vk::ImageLayout::eGeneral, vk::ImageType::e2D,
           test.layers > 1 ? vk::ImageViewType::e2DArray : vk::ImageViewType::e2D,
           test.layers);
     }
@@ -19162,21 +19171,23 @@ public:
     multisample.sType = vk::StructureType::ePipelineMultisampleStateCreateInfo;
     multisample.rasterizationSamples = test.samples;
 
-    vk::PipelineColorBlendAttachmentState color_attachment{};
-    color_attachment.colorWriteMask =
+    const u32 attachment_count = test.target_location + 1;
+    std::vector<vk::PipelineColorBlendAttachmentState> color_attachments(attachment_count);
+    color_attachments[test.target_location].colorWriteMask =
         vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG |
         vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA;
     vk::PipelineColorBlendStateCreateInfo color_blend{};
     color_blend.sType = vk::StructureType::ePipelineColorBlendStateCreateInfo;
-    color_blend.attachmentCount = 1;
-    color_blend.pAttachments = &color_attachment;
+    color_blend.attachmentCount = attachment_count;
+    color_blend.pAttachments = color_attachments.data();
 
     vk::GraphicsPipelineCreateInfo pipeline_info{};
-    const vk::Format color_format = vk::Format::eR32G32B32A32Sfloat;
+    std::vector<vk::Format> color_formats(attachment_count, vk::Format::eUndefined);
+    color_formats[test.target_location] = test.target_format;
     vk::PipelineRenderingCreateInfo rendering_pipeline{};
     rendering_pipeline.sType = vk::StructureType::ePipelineRenderingCreateInfo;
-    rendering_pipeline.colorAttachmentCount = 1;
-    rendering_pipeline.pColorAttachmentFormats = &color_format;
+    rendering_pipeline.colorAttachmentCount = attachment_count;
+    rendering_pipeline.pColorAttachmentFormats = color_formats.data();
     pipeline_info.sType = vk::StructureType::eGraphicsPipelineCreateInfo;
     pipeline_info.pNext = &rendering_pipeline;
     pipeline_info.stageCount = 2;
@@ -19195,8 +19206,11 @@ public:
               "vkCreateGraphicsPipelines");
 
     vk::CommandBuffer cmd = BeginCommands(test.name, "graphics");
-    vk::RenderingAttachmentInfo color{};
-    color.sType = vk::StructureType::eRenderingAttachmentInfo;
+    std::vector<vk::RenderingAttachmentInfo> colors(attachment_count);
+    for (auto &unbound : colors) {
+      unbound.sType = vk::StructureType::eRenderingAttachmentInfo;
+    }
+    auto &color = colors[test.target_location];
     color.imageView = target.view;
     color.imageLayout = vk::ImageLayout::eGeneral;
     color.loadOp = vk::AttachmentLoadOp::eClear;
@@ -19210,8 +19224,8 @@ public:
     rendering.sType = vk::StructureType::eRenderingInfo;
     rendering.renderArea.extent = {1, 1};
     rendering.layerCount = test.layers;
-    rendering.colorAttachmentCount = 1;
-    rendering.pColorAttachments = &color;
+    rendering.colorAttachmentCount = attachment_count;
+    rendering.pColorAttachments = colors.data();
     cmd.beginRendering(rendering);
     cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline);
     if (push_constant_range.size != 0) {
@@ -19229,7 +19243,7 @@ public:
     target.layout = vk::ImageLayout::eGeneral;
 
     auto pixel = ReadImage(test.name, resolved.image != nullptr ? &resolved : &target);
-    pixel.resize(4 * test.layers);
+    pixel.resize(static_cast<size_t>(test.target_dwords_per_pixel) * test.layers);
 
     m_device.destroyPipeline(pipeline, nullptr);
     m_device.destroyPipelineLayout(pipeline_layout, nullptr);
@@ -21731,6 +21745,143 @@ void RunGraphicsCase(VulkanHarness *vulkan, const GraphicsCase &test) {
   auto actual = vulkan->RenderFragment(test, compiled);
   CompareGraphicsWords(test, actual);
   std::printf("[graphics] %-31s ok\n", test.name);
+}
+
+enum class ExportPacking { Literal, Pkrtz, PknormI16, PknormU16 };
+
+void AppendPackedPair(std::vector<u32> *code, ExportPacking packing, u32 dst, u32 lo) {
+  switch (packing) {
+  case ExportPacking::Pkrtz: code->push_back(EncodeVop2(0x2f, dst, Vgpr(lo), lo + 1)); break;
+  case ExportPacking::PknormI16: AppendVop3(code, 0x368, dst, Vgpr(lo), Vgpr(lo + 1)); break;
+  case ExportPacking::PknormU16: AppendVop3(code, 0x369, dst, Vgpr(lo), Vgpr(lo + 1)); break;
+  case ExportPacking::Literal: break;
+  }
+}
+
+void CheckCompressedExportCase(VulkanHarness *vulkan, const char *name, uint8_t mode,
+                               ExportPacking packing, const std::array<u32, 4> &inputs,
+                               vk::Format format, u32 dwords_per_pixel,
+                               std::vector<u32> expected) {
+  GraphicsCase test{};
+  test.name = name;
+  test.target_output_mode[0] = mode;
+  test.target_format = format;
+  test.target_dwords_per_pixel = dwords_per_pixel;
+  test.expected_pixel = std::move(expected);
+  if (packing == ExportPacking::Literal) {
+    AppendVMovLiteral(&test.fragment_code, 4, inputs[0]);
+    AppendVMovLiteral(&test.fragment_code, 5, inputs[1]);
+  } else {
+    for (u32 i = 0; i < 4; i++) {
+      AppendVMovLiteral(&test.fragment_code, i, inputs[i]);
+    }
+    AppendPackedPair(&test.fragment_code, packing, 4, 0);
+    AppendPackedPair(&test.fragment_code, packing, 5, 2);
+  }
+  test.fragment_code.push_back(EncodeExp0(0, 0xf, true, true, true));
+  test.fragment_code.push_back(EncodeExp1(4, 5, 0, 0));
+  AppendEnd(&test.fragment_code);
+  RunGraphicsCase(vulkan, test);
+}
+
+constexpr u32 kExpOne = 0x3f800000u;
+constexpr u32 kExpMinusOne = 0xbf800000u;
+constexpr u32 kExpHalf = 0x3f000000u;
+constexpr u32 kExpQuarter = 0x3e800000u;
+
+void CheckCompressedExportDecode(VulkanHarness *vulkan) {
+  const std::array<u32, 4> signed_unit{kExpOne, kExpMinusOne, 0u, kExpOne};
+  const auto rgba32f = vk::Format::eR32G32B32A32Sfloat;
+  const auto rgba16_snorm = vk::Format::eR16G16B16A16Snorm;
+  const auto a2b10g10r10 = vk::Format::eA2B10G10R10UnormPack32;
+
+  CheckCompressedExportCase(vulkan, "ExportSnorm16PknormToFloat", 6, ExportPacking::PknormI16,
+                            signed_unit, rgba32f, 4, {kExpOne, kExpMinusOne, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportSnorm16PknormToSnorm16", 6,
+                            ExportPacking::PknormI16, signed_unit, rgba16_snorm, 2,
+                            {0x80017fffu, 0x7fff0000u});
+  CheckCompressedExportCase(vulkan, "ExportSnorm16PknormToUnorm10", 6,
+                            ExportPacking::PknormI16, signed_unit, a2b10g10r10, 1,
+                            {0xc00003ffu});
+  CheckCompressedExportCase(vulkan, "ExportSnorm16LiteralToFloat", 6, ExportPacking::Literal,
+                            {0x80017fffu, 0x7fff0000u, 0u, 0u}, rgba32f, 4,
+                            {kExpOne, kExpMinusOne, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportUnorm16PknormToFloat", 5, ExportPacking::PknormU16,
+                            {kExpOne, 0u, 0u, kExpOne}, rgba32f, 4, {kExpOne, 0u, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportUnorm16LiteralToFloat", 5, ExportPacking::Literal,
+                            {0x0000ffffu, 0xffff0000u, 0u, 0u}, rgba32f, 4,
+                            {kExpOne, 0u, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportFp16PkrtzToFloat", 4, ExportPacking::Pkrtz,
+                            {kExpHalf, kExpOne, 0u, kExpOne}, rgba32f, 4,
+                            {kExpHalf, kExpOne, 0u, kExpOne});
+  CheckCompressedExportCase(vulkan, "ExportFp16PkrtzToUnorm10", 4, ExportPacking::Pkrtz,
+                            {kExpOne, 0u, kExpOne, kExpOne}, a2b10g10r10, 1, {0xfff003ffu});
+  CheckCompressedExportCase(vulkan, "ExportFp16LiteralToFloat", 4, ExportPacking::Literal,
+                            {0x3c003800u, 0x3c000000u, 0u, 0u}, rgba32f, 4,
+                            {kExpHalf, kExpOne, 0u, kExpOne});
+}
+
+void CheckColorExportHoleCase(VulkanHarness *vulkan, const char *name, u32 cb_shader_mask,
+                              u32 location, vk::Format format, u32 dwords_per_pixel,
+                              std::vector<u32> expected) {
+  GraphicsCase test{};
+  test.name = name;
+  test.cb_shader_mask = cb_shader_mask;
+  test.target_output_mode = {4, 4, 6, 0, 0, 0, 0, 0};
+  test.target_location = location;
+  test.target_format = format;
+  test.target_dwords_per_pixel = dwords_per_pixel;
+  test.expected_pixel = std::move(expected);
+  const std::array<std::array<u32, 4>, 3> values{{
+      {kExpQuarter, kExpQuarter, kExpQuarter, kExpQuarter},
+      {kExpHalf, kExpHalf, kExpHalf, kExpHalf},
+      {kExpOne, kExpMinusOne, 0u, kExpOne},
+  }};
+  for (u32 mrt = 0; mrt < 3; mrt++) {
+    for (u32 i = 0; i < 4; i++) {
+      AppendVMovLiteral(&test.fragment_code, i, values[mrt][i]);
+    }
+    const auto packing = mrt == 2 ? ExportPacking::PknormI16 : ExportPacking::Pkrtz;
+    const u32 dst = 8 + mrt * 2;
+    AppendPackedPair(&test.fragment_code, packing, dst, 0);
+    AppendPackedPair(&test.fragment_code, packing, dst + 1, 2);
+  }
+  for (u32 mrt = 0; mrt < 3; mrt++) {
+    const bool last = mrt == 2;
+    test.fragment_code.push_back(EncodeExp0(mrt, 0xf, last, true, last));
+    test.fragment_code.push_back(EncodeExp1(8 + mrt * 2, 9 + mrt * 2, 0, 0));
+  }
+  AppendEnd(&test.fragment_code);
+  RunGraphicsCase(vulkan, test);
+}
+
+void CheckColorExportHoles(VulkanHarness *vulkan) {
+  Require("ColorExportSlots", "mapping",
+          ColorExportSlots(0x0000fff0u) ==
+              std::array<uint8_t, 8>{1, 2, 3, NoColorExportSlot, NoColorExportSlot,
+                                     NoColorExportSlot, NoColorExportSlot, NoColorExportSlot} &&
+              ColorExportSlots(0x0000ff0fu) ==
+                  std::array<uint8_t, 8>{0, 2, 3, NoColorExportSlot, NoColorExportSlot,
+                                         NoColorExportSlot, NoColorExportSlot,
+                                         NoColorExportSlot} &&
+              ColorExportSlots(0x0000ffffu) ==
+                  std::array<uint8_t, 8>{0, 1, 2, 3, NoColorExportSlot, NoColorExportSlot,
+                                         NoColorExportSlot, NoColorExportSlot},
+          "export N must map to the N-th colour buffer CB_SHADER_MASK enables");
+  const auto rgba32f = vk::Format::eR32G32B32A32Sfloat;
+  const auto rgba16_snorm = vk::Format::eR16G16B16A16Snorm;
+  CheckColorExportHoleCase(vulkan, "ColorExportHoleBuffer1GetsExport0", 0x0000fff0u, 1, rgba32f,
+                           4, {kExpQuarter, kExpQuarter, kExpQuarter, kExpQuarter});
+  CheckColorExportHoleCase(vulkan, "ColorExportHoleBuffer2GetsExport1", 0x0000fff0u, 2, rgba32f,
+                           4, {kExpHalf, kExpHalf, kExpHalf, kExpHalf});
+  CheckColorExportHoleCase(vulkan, "ColorExportHoleBuffer3GetsSnormExport2", 0x0000fff0u, 3,
+                           rgba16_snorm, 2, {0x80017fffu, 0x7fff0000u});
+  CheckColorExportHoleCase(vulkan, "ColorExportMidHoleBuffer2GetsExport1", 0x0000ff0fu, 2,
+                           rgba32f, 4, {kExpHalf, kExpHalf, kExpHalf, kExpHalf});
+  CheckColorExportHoleCase(vulkan, "ColorExportMidHoleBuffer3GetsExport2", 0x0000ff0fu, 3,
+                           rgba16_snorm, 2, {0x80017fffu, 0x7fff0000u});
+  CheckColorExportHoleCase(vulkan, "ColorExportNoHoleBuffer2GetsExport2", 0x0000ffffu, 2,
+                           rgba16_snorm, 2, {0x80017fffu, 0x7fff0000u});
 }
 
 // A pixel shader that exports to several MRTs must keep every export. The draw path
@@ -47347,6 +47498,8 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuSuspendPoint();
   CheckMultiMrtExportOutputs(false);
   CheckMultiMrtExportOutputs(true);
+  CheckCompressedExportDecode(&vulkan);
+  CheckColorExportHoles(&vulkan);
   vulkan.CheckGpuCommandLane();
   if (skipped_device_checks) {
     std::printf(

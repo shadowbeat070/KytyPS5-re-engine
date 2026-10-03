@@ -591,9 +591,11 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 	const auto& sh_regs     = ctx.GetShaderRegisters();
 	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
+	const auto  slots       = ColorExportSlots(sh_regs.m_cbShaderMask);
 	uint32_t    output_mask = 0;
-	for (uint32_t slot = 0; slot < RENDER_COLOR_ATTACHMENTS_MAX; slot++) {
-		if (sh_regs.target_output_mode[slot] != 0 &&
+	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
+		const auto slot = slots[index];
+		if (sh_regs.target_output_mode[index] != 0 && slot < RENDER_COLOR_ATTACHMENTS_MAX &&
 		    render_target_mask_slot(write_mask, slot) != 0) {
 			output_mask |= 1u << slot;
 		}
@@ -945,8 +947,9 @@ bool RenderExecutor::PrepareDrawTargets(CommandBuffer& buffer, const DrawCallInf
 	uint32_t   mrt_mask          = 0;
 	if (state.ps_active) {
 		for (const auto& output: state.ps_input_info.stage.program->info.outputs) {
-			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt) {
-				mrt_mask |= 1u << output.index;
+			if (output.kind == ShaderRecompiler::IR::StageOutputKind::Mrt &&
+			    output.location < RENDER_COLOR_ATTACHMENTS_MAX) {
+				mrt_mask |= 1u << output.location;
 			}
 		}
 	}
