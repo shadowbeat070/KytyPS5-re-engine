@@ -343,8 +343,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	// No program, or no bound stage, means this pass could not derive the shader's
+	// descriptors. Either way the dispatch is dropped and the session kept.
 	if (!compute_program || !input_info.stage) {
-		// The shader's descriptors could not be derived; drop the dispatch, keep the session.
 		ResetBindings();
 		return;
 	}
