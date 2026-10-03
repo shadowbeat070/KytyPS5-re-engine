@@ -21810,6 +21810,58 @@ void CheckWave64ExecZeroLoopExit(VulkanHarness *vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+constexpr u32 kSelectedPointerFirst = 0x100u;
+constexpr u32 kSelectedPointerSecond = 0x200u;
+
+TestCase ScalarSelectIntoVccFeedsDescriptor(bool first) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = first ? "ScalarSelectVccDescriptorFirst" : "ScalarSelectVccDescriptorSecond";
+  test.code = {
+      EncodeSopc(0x07, 16, 128),        // s_cmp_lg_u32 s16, 0
+      EncodeSop2(0x0b, 106, 4, 6),      // s_cselect_b64 vcc, s[4:5], s[6:7]
+      EncodeVop1(0x01, 1, 106),         // v_mov_b32 v1, vcc_lo
+      EncodeVop1(0x02, 8, Vgpr(1)),     // v_readfirstlane_b32 s8, v1
+      EncodeSMovB32(9, 107),            // s_mov_b32 s9, vcc_hi
+      EncodeSMovB32(10, 2),             // s_mov_b32 s10, s2
+      EncodeSMovB32(11, 3),             // s_mov_b32 s11, s3
+  };
+  AppendVMovLiteral(&test.code, 0, 0xabcdef01u);
+  test.code.push_back(EncodeMubuf0(0x1cu, 0, false, false));
+  test.code.push_back(EncodeMubuf1(0, 2, 0));
+  AppendEnd(&test.code);
+  test.initial = {0u, 0u, 0u, 0u};
+  test.expected = {0xabcdef01u, 0u, 0u, 0u};
+  test.opcodes = {O::S_CMP_LG_U32, O::S_CSELECT_B64, O::V_MOV_B32, O::V_READFIRSTLANE_B32,
+                  O::S_MOV_B32, O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.user_data = MakeNativeUserData(nullptr);
+  test.user_data[2] = static_cast<u32>(test.initial.size() * sizeof(u32));
+  test.user_data[4] = kSelectedPointerFirst;
+  test.user_data[6] = kSelectedPointerSecond;
+  test.user_data[16] = first ? 1u : 0u;
+  test.has_user_data = true;
+  return test;
+}
+
+void CheckScalarSelectIntoVccFeedsDescriptor(VulkanHarness *vulkan) {
+  for (const bool first : {true, false}) {
+    const auto test = ScalarSelectIntoVccFeedsDescriptor(first);
+    const auto compiled = CompileCase(test, vulkan->SubgroupSize());
+    const auto &buffers = compiled.program.info.buffers;
+    const auto written = std::ranges::find_if(buffers, [](const auto &buffer) {
+      return buffer.written;
+    });
+    Require(test.name, "written buffer", written != buffers.end(),
+            "the store did not produce a written buffer");
+    const auto base =
+        compiled.resources.buffers.at(static_cast<size_t>(written - buffers.begin())).dwords[0];
+    const auto expected = first ? kSelectedPointerFirst : kSelectedPointerSecond;
+    Require(test.name, "selected descriptor", base == expected,
+            "descriptor base " + Hex(base) + " is not the selected pointer " + Hex(expected));
+    RunCase(vulkan, test);
+  }
+}
+
 TestCase IndirectImageTableSamples();
 
 // Whichever key the device searches, it must sample that key's candidate.
@@ -47130,6 +47182,11 @@ int main(int argc, char **argv) {
     CheckWave64ExecZeroLoopExit(&vulkan);
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--scalar-select-vcc-only") == 0) {
+    VulkanHarness vulkan;
+    CheckScalarSelectIntoVccFeedsDescriptor(&vulkan);
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStencilPlaneEqualFootprint(true);
@@ -48062,6 +48119,7 @@ int main(int argc, char **argv) {
   CheckComputeThreadDimensions(vulkan);
   CheckIndirectImageKeySwitch();
   CheckWave64ExecZeroLoopExit(&vulkan);
+  CheckScalarSelectIntoVccFeedsDescriptor(&vulkan);
   CheckWave64WholeWaveResults();
   CheckIndirectImageModuleStability();
   CheckBindlessImageModuleStability();
