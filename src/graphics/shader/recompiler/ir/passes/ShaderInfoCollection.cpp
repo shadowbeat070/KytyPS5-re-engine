@@ -228,21 +228,35 @@ void CollectPixelInputs(const Program& program, const ShaderPixelInputInfo* pixe
 	}
 	// Aliases of a vertex output share one SPIR-V interface variable. If any
 	// alias reads raw vertices, interpolate the other aliases from those too.
+	std::array<uint32_t, 32> active_inputs {};
+	uint32_t                 active_count = 0;
 	for (uint32_t input = 0; input < pixel->input_num; input++) {
-		for (uint32_t alias = 0; alias < pixel->input_num; alias++) {
+		if (!ShaderPixelParameterIsDefault(*pixel, input)) {
+			active_inputs[active_count++] = input;
+		}
+	}
+	const auto active = std::span<const uint32_t> {active_inputs.data(), active_count};
+	for (const auto input: active) {
+		if (ShaderPixelParameterIsFlat(*pixel, input) &&
+		    !ShaderPixelParameterGroupIsFlat(*pixel, active, input)) {
+			per_vertex[input] = true;
+		}
+	}
+	for (const auto input: active) {
+		for (const auto alias: active) {
 			if (ShaderPixelParameterMappedLocation(*pixel, input) ==
 			        ShaderPixelParameterMappedLocation(*pixel, alias) &&
-			    ShaderPixelParameterIsFlat(*pixel, input) ==
-			        ShaderPixelParameterIsFlat(*pixel, alias)) {
+			    ShaderPixelParameterGroupIsFlat(*pixel, active, input) ==
+			        ShaderPixelParameterGroupIsFlat(*pixel, active, alias)) {
 				per_vertex[input] = per_vertex[input] || per_vertex[alias];
 			}
 		}
 	}
-	for (uint32_t input = 0; input < pixel->input_num; input++) {
+	for (const auto input: active) {
 		AddInput(info, StageInputKind::Parameter, input, 4, fmt::format("in_param_{}", input),
 		         per_vertex[input]);
 	}
-	for (uint32_t input = 0; input < pixel->input_num; input++) {
+	for (const auto input: active) {
 		if (interpolated[input] && per_vertex[input]) {
 			const auto kind = pixel->ps_no_perspective ? StageInputKind::BaryCoordNoPerspective
 			                                           : StageInputKind::BaryCoordSmooth;
@@ -403,6 +417,43 @@ void CollectOutputs(const Program& program, ShaderStageInputInfo input_info, Sha
 					break;
 				default: break;
 			}
+		}
+	}
+	const bool feeds_rasterizer = program.stage == ShaderType::Vertex ||
+	                              program.stage == ShaderType::TessellationEvaluation ||
+	                              program.stage == ShaderType::Mesh;
+	if (feeds_rasterizer && input_info.vertex != nullptr &&
+	    input_info.vertex->param_duplicate_mask != 0) {
+		const auto& vertex = *input_info.vertex;
+		const auto  used   = [&](uint32_t location) {
+			return (vertex.param_duplicate_mask & (1u << location)) != 0 ||
+			       std::ranges::any_of(info.outputs, [&](const StageOutput& output) {
+				       return output.kind == StageOutputKind::Parameter &&
+				              output.location == location;
+			       });
+		};
+		for (uint32_t location = 0; location < 32u; location++) {
+			const auto source = vertex.param_duplicate_source[location];
+			if ((vertex.param_duplicate_mask & (1u << location)) == 0 ||
+			    !HasOutput(info, StageOutputKind::Parameter, source)) {
+				continue;
+			}
+			const auto occupant =
+			    std::ranges::find_if(info.outputs, [&](const StageOutput& output) {
+				    return output.kind == StageOutputKind::Parameter && output.location == location;
+			    });
+			if (occupant != info.outputs.end()) {
+				uint32_t free = 0;
+				while (free < 32u && used(free)) {
+					free++;
+				}
+				if (free == 32u) {
+					continue;
+				}
+				occupant->location = free;
+			}
+			info.outputs.push_back({StageOutputKind::Parameter, source, location,
+			                        fmt::format("out_param_{}_at_{}", source, location)});
 		}
 	}
 }
