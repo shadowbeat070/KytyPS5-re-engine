@@ -455,6 +455,7 @@ void TextureCache::RegisterImage(ImageId id) {
 	});
 	image.registered = true;
 	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.frame_touched_last = m_frame_index.load(std::memory_order_relaxed);
 	m_total_used_memory += image.AccountedSize();
 }
 
@@ -523,6 +524,7 @@ void TextureCache::DeleteImage(ImageId id) {
 }
 
 void TextureCache::FreeImage(ImageId id) {
+	m_evict_backoff.erase(id);
 	auto& image = m_slot_images[id];
 	if (image.IsGpuModified()) {
 		image.ClearGpuModified();
@@ -531,6 +533,7 @@ void TextureCache::FreeImage(ImageId id) {
 }
 
 void TextureCache::TouchImage(Image& image) {
+	image.frame_touched_last = m_frame_index.load(std::memory_order_relaxed);
 	if (image.registered) {
 		m_lru_cache.Touch(image.lru_id, m_gc_tick);
 	}
@@ -2878,11 +2881,20 @@ void TextureCache::RunGarbageCollector() {
 	if (m_total_used_memory >= m_pressure_gc_memory) {
 		m_tiler.ReleaseScratch();
 	}
+	const uint64_t frame       = m_frame_index.load(std::memory_order_relaxed);
+	uint32_t       evictions   = 0;
+	const auto     budget      = m_graphics.GetMemoryBudget();
+	const bool     over_budget = budget.reported && budget.usage > budget.budget;
+	if ((tick & 1023u) == 0u) {
+		std::erase_if(m_evicted_addresses, [frame](const auto& entry) {
+			return frame - std::min(frame, entry.second) >= Headroom::EvictBackoffFrames;
+		});
+	}
 	const auto collect = [&](bool allow_aggressive) {
 		bool           pressured  = m_total_used_memory >= m_pressure_gc_memory;
 		bool           aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
 		const uint64_t age       = std::min<uint64_t>(aggressive ? 160 : pressured ? 80 : 16, tick);
-		size_t         deletions = aggressive ? 40 : pressured ? 20 : 10;
+		size_t         deletions = over_budget ? 128 : aggressive ? 40 : pressured ? 20 : 10;
 		std::vector<ImageId> candidates;
 		candidates.reserve(deletions);
 		// Deleting depth recursively deletes its stencil association, so finish LRU traversal
@@ -2906,13 +2918,37 @@ void TextureCache::RunGarbageCollector() {
 			// Keep means nothing could restore these pixels; Evict means they can be restored but
 			// have not been written back yet, which is what a tiled GPU-modified surface is -
 			// BuildDownload plans a re-tile for one.
+			const auto requeue = [&] {
+				if (owner->registered) {
+					m_lru_cache.Touch(owner->lru_id, tick);
+				}
+			};
 			const auto verdict = Headroom::ClassifyForCollection(CollectorFacts(*owner, true),
 			                                                     pressured);
 			if (verdict == Headroom::CollectorVerdict::Skip ||
 			    verdict == Headroom::CollectorVerdict::Keep) {
+				requeue();
+				continue;
+			}
+			uint64_t backoff_until = 0;
+			if (const auto backoff = m_evict_backoff.find(id); backoff != m_evict_backoff.end()) {
+				backoff_until = backoff->second;
+			}
+			if (const auto evicted = m_evicted_addresses.find(owner->info.data.address);
+			    evicted != m_evicted_addresses.end()) {
+				backoff_until =
+				    std::max(backoff_until, evicted->second + Headroom::EvictBackoffFrames);
+			}
+			if (!Headroom::CollectionAllowed(verdict, frame, owner->frame_touched_last,
+			                                 backoff_until, aggressive, over_budget) ||
+			    (verdict == Headroom::CollectorVerdict::Evict &&
+			     evictions >= Headroom::MaxEvictionsPerCollection)) {
+				requeue();
 				continue;
 			}
 			if (verdict == Headroom::CollectorVerdict::Evict) {
+				++evictions;
+				m_evicted_addresses.insert_or_assign(owner->info.data.address, frame);
 				if (!DownloadImageMemory(id)) {
 					continue;
 				}
@@ -2965,6 +3001,8 @@ void TextureCache::FreePublishedEvictions() {
 			continue;
 		}
 		if (owner->GpuWriteSerial() != serial_at_eviction) {
+			m_evict_backoff.insert_or_assign(id, m_frame_index.load(std::memory_order_relaxed) +
+			                                         Headroom::EvictBackoffFrames);
 			continue;
 		}
 		FreeImage(id);

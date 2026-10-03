@@ -21,6 +21,11 @@ namespace {
 using Libs::Graphics::Headroom::CollectorImageFacts;
 using Libs::Graphics::Headroom::CollectorVerdict;
 using Libs::Graphics::Headroom::ClassifyForCollection;
+using Libs::Graphics::Headroom::CollectionAllowed;
+using Libs::Graphics::Headroom::EvictBackoffFrames;
+using Libs::Graphics::Headroom::EvictMinIdleFrames;
+using Libs::Graphics::Headroom::EvictMinIdleFramesCritical;
+using Libs::Graphics::Headroom::ReleaseMinIdleFrames;
 using Libs::Graphics::Headroom::CollectorCriticalPercent;
 using Libs::Graphics::Headroom::CollectorPressurePercent;
 using Libs::Graphics::Headroom::CollectorTriggerPercent;
@@ -286,6 +291,44 @@ void TestCollectorThresholds() {
 	      "an unknown ceiling resolves to nothing, not to a ceiling of zero");
 }
 
+void TestCollectorKeepsTheWorkingSet() {
+	constexpr uint64_t frame = 10000;
+	for (const bool critical: {false, true}) {
+		Check(!CollectionAllowed(CollectorVerdict::Evict, frame, frame, 0, critical),
+		      "an image used this frame is never evicted");
+		Check(!CollectionAllowed(CollectorVerdict::Evict, frame, frame - 1, 0, critical),
+		      "an image used last frame is never evicted");
+		Check(!CollectionAllowed(CollectorVerdict::Free, frame, frame - 1, 0, critical),
+		      "a clean image used last frame is not dropped to be uploaded again");
+		Check(!CollectionAllowed(CollectorVerdict::Keep, frame, 0, 0, critical) &&
+		          !CollectionAllowed(CollectorVerdict::Skip, frame, 0, 0, critical),
+		      "Keep and Skip are never released");
+	}
+	Check(CollectionAllowed(CollectorVerdict::Free, frame, frame - ReleaseMinIdleFrames, 0, false),
+	      "a clean image idle for a few frames may be dropped");
+	Check(!CollectionAllowed(CollectorVerdict::Evict, frame, frame - EvictMinIdleFramesCritical, 0,
+	                         false),
+	      "outside critical pressure an eviction waits for the long idle period");
+	Check(CollectionAllowed(CollectorVerdict::Evict, frame, frame - EvictMinIdleFramesCritical, 0,
+	                        true),
+	      "critical pressure evicts sooner, but still only idle images");
+	Check(CollectionAllowed(CollectorVerdict::Evict, frame, frame - EvictMinIdleFrames, 0, false),
+	      "an image idle for the long period may be evicted");
+	Check(!CollectionAllowed(CollectorVerdict::Evict, frame, frame - EvictMinIdleFrames,
+	                         frame + 1, true),
+	      "an image that outran its last eviction is left alone until its backoff ends");
+	Check(CollectionAllowed(CollectorVerdict::Evict, frame + EvictBackoffFrames,
+	                        frame - EvictMinIdleFrames, frame + EvictBackoffFrames, false),
+	      "the backoff ends");
+	Check(!CollectionAllowed(CollectorVerdict::Evict, 5, 9, 0, true),
+	      "a touch stamped after the collector read the frame counts as current");
+	Check(!CollectionAllowed(CollectorVerdict::Free, frame, frame - 1, 0, false, true) &&
+	          CollectionAllowed(CollectorVerdict::Free, frame, frame - 2, 0, false, true),
+	      "past the device budget a clean image goes after two idle frames, never sooner");
+	Check(!CollectionAllowed(CollectorVerdict::Evict, frame, frame - 1, 0, true, true),
+	      "being over budget never evicts an image in use");
+}
+
 } // namespace
 
 int main() {
@@ -297,6 +340,7 @@ int main() {
 	TestEmergencyReclaimNeverRecordsGpuWork();
 	TestBudgetArithmetic();
 	TestCollectorThresholds();
+	TestCollectorKeepsTheWorkingSet();
 
 	if (g_failures != 0) {
 		std::fprintf(stderr, "VramHeadroomTests: %d check(s) failed\n", g_failures);

@@ -303,6 +303,8 @@ private:
 	// appends to m_evict_published under its own leaf mutex, never m_lock, which would deadlock a
 	// caller already waiting on a priority operation.
 	std::unordered_map<ImageId, uint64_t>             m_evict_pending;
+	std::unordered_map<ImageId, uint64_t>             m_evict_backoff;
+	std::unordered_map<uint64_t, uint64_t>            m_evicted_addresses;
 	std::mutex                                        m_evict_published_lock;
 	std::vector<ImageId>                              m_evict_published;
 	std::map<uint64_t, MetaDataInfo>                  m_surface_metas;

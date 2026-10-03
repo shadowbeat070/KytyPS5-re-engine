@@ -14,6 +14,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/memoryHeadroom.h"
 #include "graphics/host_gpu/memoryTracker.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/renderer/cache/bindlessTranslation.h"
@@ -249,11 +250,16 @@ struct TextureCacheTestAccess {
     cache.m_pressure_gc_memory = pressure;
     cache.m_critical_gc_memory = UINT64_MAX;
     cache.m_gc_tick = tick;
+    cache.m_evicted_addresses.clear();
+    const uint64_t frame = std::max<uint64_t>(cache.m_frame_index.load(),
+                                              Headroom::EvictMinIdleFrames);
+    cache.m_frame_index.store(frame);
     std::vector<ImageId> live;
     cache.m_lru_cache = {};
     cache.m_slot_images.ForEach([&](ImageId id, Image &image) {
       if (image.registered) {
         image.tick_accessed_last = cache.m_scheduler.CurrentTick();
+        image.frame_touched_last = frame;
         live.push_back(id);
       }
     });
@@ -261,6 +267,7 @@ struct TextureCacheTestAccess {
       const auto owner = cache.m_slot_images.try_get(id);
       if (owner != nullptr && owner->registered) {
         owner->tick_accessed_last = 0;
+        owner->frame_touched_last = 0;
         owner->lru_id = cache.m_lru_cache.Insert(id, 0);
       }
     }
@@ -268,6 +275,21 @@ struct TextureCacheTestAccess {
       if (std::ranges::find(oldest, id) == oldest.end()) {
         cache.m_slot_images[id].lru_id = cache.m_lru_cache.Insert(id, tick);
       }
+    }
+  }
+
+  static void QueueForCollection(TextureCache &cache, std::span<const ImageId> order,
+                                 std::span<const uint64_t> frames, uint64_t frame) {
+    cache.m_trigger_gc_memory = 0;
+    cache.m_pressure_gc_memory = 0;
+    cache.m_critical_gc_memory = UINT64_MAX;
+    cache.m_gc_tick = 1000;
+    cache.m_frame_index.store(frame);
+    cache.m_lru_cache = {};
+    for (size_t i = 0; i < order.size(); i++) {
+      auto &image = cache.m_slot_images[order[i]];
+      image.frame_touched_last = frames[i];
+      image.lru_id = cache.m_lru_cache.Insert(order[i], i);
     }
   }
 
@@ -4344,6 +4366,93 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
                 0,
             "fault-parser allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckTextureCacheCollectorProgress() {
+    constexpr const char *name = "TextureCacheCollectorProgress";
+    constexpr uintptr_t base = 0x0000000208800000ull;
+    constexpr uint64_t image_bytes = 0x10000;
+    constexpr uint32_t in_use = 24;
+    constexpr uint32_t idle = 4;
+    constexpr uint64_t allocation_size = image_bytes * (in_use + idle);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                0x10000, 0, &direct_offset) == 0,
+            "collector direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset, 0x10000) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "collector fixed mapping failed");
+    {
+      context.MapMemory(base, allocation_size);
+      auto &cache = context.GetTextureCache();
+      std::vector<ImageId> images;
+      for (uint32_t i = 0; i < in_use + idle; i++) {
+        ImageDesc desc{};
+        desc.type = BindingType::Texture;
+        desc.info.data = {base + i * image_bytes, image_bytes};
+        desc.info.pixel_format = vk::Format::eR8Unorm;
+        desc.info.guest_format = Prospero::BufferFormat::k8UNorm;
+        desc.info.type = Prospero::ImageType::kColor2D;
+        desc.info.extent = {256, 256, 1};
+        desc.info.resources = {1, 1};
+        desc.info.pitch = 256;
+        desc.info.bytes_per_block = 1;
+        desc.info.samples = 1;
+        desc.info.tile_mode = Prospero::TileMode::kLinear;
+        desc.info.mip_layout[0] = {0, image_bytes, 256, 256};
+        desc.view_info.format = desc.info.pixel_format;
+        desc.view_info.type = vk::ImageViewType::e2D;
+        desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
+        desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
+        images.push_back(cache.FindImage(desc));
+      }
+      scheduler.Finish();
+      constexpr uint64_t frame = 1000;
+      std::vector<uint64_t> frames(images.size(), frame);
+      for (uint32_t i = in_use; i < images.size(); i++) {
+        frames[i] = 0;
+      }
+      TextureCacheTestAccess::QueueForCollection(cache, images, frames, frame);
+      for (uint32_t pass = 0; pass < 4; pass++) {
+        cache.RunGarbageCollector();
+      }
+      uint32_t kept = 0;
+      uint32_t freed = 0;
+      for (uint32_t i = 0; i < images.size(); i++) {
+        const bool present = TextureCacheTestAccess::Contains(cache, images[i]);
+        kept += i < in_use && present ? 1u : 0u;
+        freed += i >= in_use && !present ? 1u : 0u;
+      }
+      Require(name, "working set kept", kept == in_use,
+              "an image used this frame was released: " + std::to_string(kept) + " of " +
+                  std::to_string(in_use) + " kept");
+      Require(name, "idle images freed behind it", freed == idle,
+              "the idle images behind the in-use ones were never reached: " +
+                  std::to_string(freed) + " of " + std::to_string(idle) + " freed");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "collector mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "collector allocation release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -48193,6 +48302,7 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     vulkan.CheckBufferCacheDirtyGarbageCollection();
     vulkan.CheckBufferCacheDetachedDownload();
+    vulkan.CheckTextureCacheCollectorProgress();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--sampler-border-only") == 0) {
