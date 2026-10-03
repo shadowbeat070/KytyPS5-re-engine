@@ -800,9 +800,20 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                  kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::SccZero;
 	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr,
 	                              TypeU32(ctx.state), combined, low, high);
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual,
-	                              TypeBool(ctx.state), result, combined,
-	                              ConstantU32(ctx.state, zero ? ~0u : 0u));
+	uint32_t reference = 0;
+	if (zero && ctx.state.loop_exit_blocks.contains(inst.Parent())) {
+		const auto active = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(ctx.state, 4),
+		                              active, ConstantU32(ctx.state, spv::ScopeSubgroup),
+		                              ConstantBool(ctx.state, true));
+		reference = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), reference,
+		                              active, 0);
+	} else {
+		reference = ConstantU32(ctx.state, zero ? ~0u : 0u);
+	}
+	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
+	                              result, combined, reference);
 	return result;
 }
 
