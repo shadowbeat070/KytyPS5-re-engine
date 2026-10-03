@@ -284,6 +284,13 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 		frame_code.resize(offset + sizeof(value));
 		std::memcpy(frame_code.data() + offset, &value, sizeof(value));
 	};
+	// Only the first function is described to the patcher; the rest have to be discovered from
+	// the int3 alignment padding between them or from a code pointer, as in SILENT HILL f.
+	const auto pad = [&frame_code]() {
+		do {
+			frame_code.push_back(0xcc);
+		} while (frame_code.size() % 16 != 0);
+	};
 	emit({0x55});                             // push rbp
 	emit({0x48, 0x89, 0xe5});                 // mov rbp, rsp
 	emit({0x41, 0x57});                       // push r15
@@ -306,6 +313,7 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	emit({0x0f, 0xb6, 0xc0});                 // movzx eax, al
 	emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});     // pop rbx; pop r12; pop r13
 	emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+	pad();
 
 	// Same prologue, but every rbp-relative access lands at or above rsp: [rbp-0x08] and
 	// [rbp-0x28] are saved registers and [rbp+0x10] is an incoming argument. None of them is
@@ -321,6 +329,7 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	emit({0x48, 0x8b, 0x17});                 // mov rdx, [rdi] (faultable, 3 bytes)
 	emit({0x5b, 0x41, 0x5c, 0x41, 0x5d});     // pop rbx; pop r12; pop r13
 	emit({0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3}); // pop r14; pop r15; pop rbp; ret
+	pad();
 
 	// An rsp adjustment the patcher cannot model must poison the frame-pointer distance, so the
 	// [rbp-0x48] below is left alone rather than folded onto a guessed offset. Analyzed only.
@@ -341,11 +350,13 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	Loader::RegisterGuestInstructionPatchModule(
 	    reinterpret_cast<void*>(mapping), CODE_SIZE, reinterpret_cast<void*>(mapping + CODE_SIZE),
 	    TRAMPOLINE_SIZE);
-	const std::array<uintptr_t, 3> frame_starts = {
-	    static_cast<uintptr_t>(mapping), static_cast<uintptr_t>(mapping + above_offset),
-	    static_cast<uintptr_t>(mapping + unknown_offset)};
+	const std::array<Loader::RedZoneFunctionRange, 1> unwind_functions = {
+	    Loader::RedZoneFunctionRange {.start = static_cast<uintptr_t>(mapping), .size = above_offset}};
+	const std::array<uintptr_t, 1> code_pointers = {static_cast<uintptr_t>(mapping + unknown_offset)};
 	const auto frame_result = Loader::PatchGuestInstructions(
-	    mapping, frame_code.size(), frame_starts, true, false);
+	    mapping, frame_code.size(),
+	    {.unwind_functions = unwind_functions, .code_pointers = code_pointers, .execute_only = true},
+	    true, false);
 	const bool frame_preserved = run_fault();
 
 	Loader::UnregisterGuestInstructionPatchModule(reinterpret_cast<void*>(mapping));
@@ -365,6 +376,10 @@ void TestWindowsGuestRedZoneStaticPatcher() {
 	      "static patcher did not cover the frame-pointer faultable instruction");
 	Check(test, frame_result.frame_pointer_red_zone_function_count == 1,
 	      "static patcher mis-classified a frame-pointer addressed red zone");
+	Check(test, frame_result.sweep_trusted && frame_result.function_count == 3 &&
+	                frame_result.padding_function_count == 1 &&
+	                frame_result.code_pointer_function_count == 1,
+	      "static patcher did not discover the undescribed functions");
 	Check(test, preserved, "patched fault still corrupted the guest red zone");
 	Check(test, frame_preserved,
 	      "patched fault still corrupted the frame-pointer addressed red zone");

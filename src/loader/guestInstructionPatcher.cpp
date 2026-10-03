@@ -10,6 +10,8 @@
 #include <Zydis/Zydis.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
+#include <bit>
 #include <bitset>
 #include <climits>
 #include <cstdlib>
@@ -20,6 +22,8 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <string_view>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 #if !defined(__APPLE__)
@@ -954,6 +958,144 @@ bool GenerateProtectedIndirectCall(const DecodedCodeInstruction& decoded,
 	return true;
 }
 
+class AddressBits {
+public:
+	AddressBits(uintptr_t base, size_t size): m_base(base), m_bits((size + 63) / 64) {}
+
+	void Set(uintptr_t address) {
+		const size_t bit = address - m_base;
+		m_bits[bit / 64] |= u64 {1} << (bit % 64);
+	}
+
+	[[nodiscard]] bool Test(uintptr_t address) const {
+		const size_t bit = address - m_base;
+		return bit / 64 < m_bits.size() && (m_bits[bit / 64] & (u64 {1} << (bit % 64))) != 0;
+	}
+
+	[[nodiscard]] bool AnyInRange(uintptr_t start, uintptr_t end) const {
+		for (size_t bit = start - m_base; bit < end - m_base;) {
+			const u64 word = m_bits[bit / 64] >> (bit % 64);
+			if (word != 0) {
+				return bit + std::countr_zero(word) < end - m_base;
+			}
+			bit = (bit / 64 + 1) * 64;
+		}
+		return false;
+	}
+
+private:
+	uintptr_t        m_base;
+	std::vector<u64> m_bits;
+};
+
+struct SegmentSweep {
+	AddressBits            boundaries;
+	AddressBits            jump_targets;
+	AddressBits            red_zone_candidates;
+	AddressBits            indirect_jumps;
+	std::vector<uintptr_t> call_targets;
+	std::vector<uintptr_t> padded_starts;
+	u64                    instruction_count {};
+	u64                    decode_failure_count {};
+
+	SegmentSweep(uintptr_t base, size_t size)
+	    : boundaries(base, size), jump_targets(base, size), red_zone_candidates(base, size),
+	      indirect_jumps(base, size) {}
+};
+
+bool MayAddressRedZone(const ZydisDecoderContext&     context,
+                       const ZydisDecodedInstruction& instruction) {
+	if ((instruction.attributes & ZYDIS_ATTRIB_HAS_MODRM) == 0 || instruction.raw.modrm.mod == 3 ||
+	    instruction.raw.disp.size == 0 || instruction.raw.disp.value >= 0) {
+		return false;
+	}
+	std::array<ZydisDecodedOperand, ZYDIS_MAX_OPERAND_COUNT> operands {};
+	if (!ZYAN_SUCCESS(ZydisDecoderDecodeOperands(&GetDecoder(), &context, &instruction,
+	                                             operands.data(), instruction.operand_count))) {
+		return true;
+	}
+	return std::ranges::any_of(
+	    std::span {operands}.first(instruction.operand_count_visible), [](const auto& operand) {
+		    if (operand.type != ZYDIS_OPERAND_TYPE_MEMORY || operand.mem.disp.value >= 0) {
+			    return false;
+		    }
+		    const ZydisRegister base =
+		        ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, operand.mem.base);
+		    return base == ZYDIS_REGISTER_RSP || base == ZYDIS_REGISTER_RBP;
+	    });
+}
+
+// Only valid for execute-only code, which holds no embedded data.
+void SweepSegment(SegmentSweep& sweep, uintptr_t segment_start, uintptr_t segment_end) {
+	constexpr uintptr_t     FunctionAlignment = 16;
+	ZydisDecoderContext     context {};
+	ZydisDecodedInstruction instruction {};
+	bool                    after_padding    = false;
+	bool                    after_terminator = false;
+	for (uintptr_t address = segment_start; address < segment_end;) {
+		// Section alignment is zero-filled, and `00 00` would decode as an instruction.
+		if (after_terminator && *reinterpret_cast<const u8*>(address) == 0) {
+			uintptr_t run_end = address;
+			while (run_end < segment_end && *reinterpret_cast<const u8*>(run_end) == 0) {
+				++run_end;
+			}
+			after_terminator = false;
+			if (run_end % FunctionAlignment == 0 || run_end == segment_end) {
+				after_padding = true;
+				address       = run_end;
+				continue;
+			}
+		}
+		if (!ZYAN_SUCCESS(ZydisDecoderDecodeInstruction(&GetDecoder(), &context,
+		                                                reinterpret_cast<void*>(address),
+		                                                segment_end - address, &instruction))) {
+			++sweep.decode_failure_count;
+			after_padding    = false;
+			after_terminator = false;
+			++address;
+			continue;
+		}
+		++sweep.instruction_count;
+		sweep.boundaries.Set(address);
+		const uintptr_t next_address = address + instruction.length;
+		after_terminator             = IsControlFlowTerminator(instruction);
+		if (instruction.mnemonic == ZYDIS_MNEMONIC_INT3) {
+			after_padding = true;
+			address       = next_address;
+			continue;
+		}
+		if (after_padding && address % FunctionAlignment == 0) {
+			sweep.padded_starts.push_back(address);
+		}
+		after_padding = false;
+
+		if (instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR &&
+		    !instruction.raw.imm[0].is_relative) {
+			sweep.indirect_jumps.Set(address);
+		}
+		for (const auto& immediate: instruction.raw.imm) {
+			if (!immediate.is_relative) {
+				continue;
+			}
+			const uintptr_t target = next_address + immediate.value.s;
+			if (target < segment_start || target >= segment_end) {
+				break;
+			}
+			if (instruction.meta.category == ZYDIS_CATEGORY_CALL) {
+				sweep.call_targets.push_back(target);
+			} else if (instruction.meta.category == ZYDIS_CATEGORY_COND_BR ||
+			           instruction.meta.category == ZYDIS_CATEGORY_UNCOND_BR) {
+				sweep.jump_targets.Set(target);
+			}
+			break;
+		}
+		if (MayAddressRedZone(context, instruction)) {
+			sweep.red_zone_candidates.Set(address);
+		}
+		address = next_address;
+	}
+}
+
 void CollectRedZoneMemoryInstructions(const DecodedFunction&                   function,
                                       std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
                                       GuestInstructionPatchResult&             result) {
@@ -1187,7 +1329,13 @@ void TrapUnrelocatedInstructions(const PatchModule& module, const DecodedFunctio
 
 void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& function,
                                const std::map<uintptr_t, InstructionRewrite>& rewrite_sites,
-                               GuestInstructionPatchResult&                   result) {
+                               const SegmentSweep* sweep, bool restrict_relocation,
+                               GuestInstructionPatchResult& result) {
+	const auto is_jump_target = [&function, sweep](uintptr_t address) {
+		return function.branch_targets.contains(address) ||
+		       (sweep != nullptr && sweep->jump_targets.Test(address));
+	};
+
 	struct RelocationSpan {
 		std::vector<const DecodedCodeInstruction*> instructions;
 		uintptr_t                                  patch_start {};
@@ -1311,7 +1459,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 				const auto decoded_it = function.instructions.find(span.continuation);
 				if (decoded_it == function.instructions.end() ||
 				    (span.continuation != site &&
-				     function.branch_targets.contains(span.continuation))) {
+				     is_jump_target(span.continuation))) {
 					return std::nullopt;
 				}
 
@@ -1340,7 +1488,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 			while (span.patch_size < NearJumpSize) {
 				const auto previous_end = function.instructions.lower_bound(span.patch_start);
 				if (previous_end == function.instructions.begin() ||
-				    function.branch_targets.contains(span.patch_start)) {
+				    is_jump_target(span.patch_start)) {
 					return std::nullopt;
 				}
 
@@ -1362,7 +1510,8 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 		std::optional<RelocationSpan> selected_span;
 		std::optional<size_t>         trampoline_offset;
 		const auto&                   site_instruction       = function.instructions.at(site);
-		const bool                    can_relocate_neighbors = !function.has_indirect_branch;
+		const bool                    can_relocate_neighbors =
+		    !function.has_indirect_branch && !restrict_relocation;
 		if (can_relocate_neighbors || site_instruction.instruction.length >= NearJumpSize) {
 			auto forward_span = collect_forward_span();
 			if (forward_span) {
@@ -1426,7 +1575,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 
 		const auto site_instruction = function.instructions.find(site);
 		ASSERT(site_instruction != function.instructions.end());
-		if (function.has_indirect_branch ||
+		if (function.has_indirect_branch || restrict_relocation ||
 		    site_instruction->second.instruction.length < ShortJumpSize) {
 			record_unsupported(site);
 			continue;
@@ -1496,7 +1645,7 @@ void RelocateGuestInstructions(PatchModule* module, const DecodedFunction& funct
 					const auto instruction = function.instructions.find(span.continuation);
 					if (instruction == function.instructions.end() ||
 					    (span.continuation != span.patch_start &&
-					     function.branch_targets.contains(span.continuation))) {
+					     is_jump_target(span.continuation))) {
 						span.instructions.clear();
 						break;
 					}
@@ -1674,7 +1823,7 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 }
 
 GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
-                                                   std::span<const uintptr_t> function_starts,
+                                                   const RedZoneCodeHints& hints,
                                                    bool protect_memory, bool emulate_amd,
                                                    GuestInstructionHostFeatures host_features) {
 	GuestInstructionPatchResult result {};
@@ -1682,43 +1831,160 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 		return result;
 	}
 	auto*              module = GetContainingModule(reinterpret_cast<void*>(segment_addr));
-	if (module == nullptr || function_starts.empty()) {
+	if (module == nullptr || segment_size == 0) {
 		return result;
 	}
 
-	const uintptr_t        segment_end = segment_addr + segment_size;
-	std::vector<uintptr_t> starts;
-	starts.reserve(function_starts.size());
-	for (const uintptr_t start: function_starts) {
-		if (start >= segment_addr && start < segment_end) {
-			starts.push_back(start);
+	enum class StartSource : u8 { Unwind, CallTarget, CodePointer, Padding };
+	const uintptr_t                   segment_end = segment_addr + segment_size;
+	std::vector<RedZoneFunctionRange> unwind_functions;
+	std::map<uintptr_t, StartSource>  starts;
+	for (const auto& function: hints.unwind_functions) {
+		if (function.start >= segment_addr && function.start < segment_end) {
+			unwind_functions.push_back(function);
+			starts.emplace(function.start, StartSource::Unwind);
 		}
 	}
-	std::ranges::sort(starts);
-	const auto unique_end = std::ranges::unique(starts).begin();
-	starts.erase(unique_end, starts.end());
+	std::ranges::sort(unwind_functions, {}, &RedZoneFunctionRange::start);
+	result.unwind_function_count = starts.size();
 
-	std::unique_lock lock {module->mutex};
-	const size_t     trampoline_begin = module->trampoline_gen.getSize();
+	std::optional<SegmentSweep> sweep;
+	if (hints.execute_only && !std::getenv("KYTY_NO_RED_ZONE_DISCOVERY")) {
+		sweep.emplace(segment_addr, segment_size);
+		SweepSegment(*sweep, segment_addr, segment_end);
+		result.swept_instruction_count    = sweep->instruction_count;
+		result.sweep_decode_failure_count = sweep->decode_failure_count;
+		result.misaligned_unwind_start_count =
+		    std::ranges::count_if(unwind_functions, [&sweep](const auto& function) {
+			    return !sweep->boundaries.Test(function.start);
+		    });
+		std::ranges::sort(sweep->call_targets);
+		sweep->call_targets.erase(std::ranges::unique(sweep->call_targets).begin(),
+		                          sweep->call_targets.end());
+		result.misaligned_call_target_count =
+		    std::ranges::count_if(sweep->call_targets, [&sweep](uintptr_t target) {
+			    return !sweep->boundaries.Test(target);
+		    });
+		constexpr u64 MisalignedCallTolerance = 1000;
+		result.sweep_trusted =
+		    result.misaligned_unwind_start_count == 0 &&
+		    result.misaligned_call_target_count * MisalignedCallTolerance <=
+		        std::max<u64>(sweep->call_targets.size(), MisalignedCallTolerance);
+		if (!result.sweep_trusted) {
+			sweep.reset();
+		}
+	}
+
+	if (sweep) {
+		const auto inside_unwind_function = [&unwind_functions](uintptr_t address) {
+			auto next = std::ranges::upper_bound(unwind_functions, address, {},
+			                                     &RedZoneFunctionRange::start);
+			if (next == unwind_functions.begin()) {
+				return false;
+			}
+			const auto& function = *std::prev(next);
+			return address > function.start && address - function.start < function.size;
+		};
+		const auto add_start = [&](uintptr_t address, StartSource source, u64& counter) {
+			if (address < segment_addr || address >= segment_end ||
+			    !sweep->boundaries.Test(address) || inside_unwind_function(address) ||
+			    *reinterpret_cast<const u8*>(address) == 0xcc) {
+				return;
+			}
+			if (starts.emplace(address, source).second) {
+				++counter;
+			}
+		};
+		for (const uintptr_t target: sweep->call_targets) {
+			add_start(target, StartSource::CallTarget, result.call_target_function_count);
+		}
+		for (const uintptr_t pointer: hints.code_pointers) {
+			add_start(pointer, StartSource::CodePointer, result.code_pointer_function_count);
+		}
+		for (const uintptr_t start: sweep->padded_starts) {
+			add_start(start, StartSource::Padding, result.padding_function_count);
+		}
+		std::vector<uintptr_t>().swap(sweep->call_targets);
+		std::vector<uintptr_t>().swap(sweep->padded_starts);
+	}
+	if (starts.empty()) {
+		return result;
+	}
+
 	bool analyze_red_zone = protect_memory;
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	analyze_red_zone |= emulate_amd;
 #endif
-	for (size_t function_index = 0; function_index < starts.size(); ++function_index) {
-		const uintptr_t function_start = starts[function_index];
-		const uintptr_t function_end =
-		    function_index + 1 < starts.size() ? starts[function_index + 1] : segment_end;
-		if (function_end <= function_start) {
-			continue;
+
+	const std::vector<std::pair<uintptr_t, StartSource>> functions(starts.begin(), starts.end());
+	const auto function_end_at = [&functions, segment_end](size_t index) {
+		return index + 1 < functions.size() ? functions[index + 1].first : segment_end;
+	};
+
+	struct FunctionSummary {
+		u64  instruction_count {};
+		bool analyzed {};
+		bool uses_red_zone {};
+		bool has_indirect_branch {};
+	};
+	std::vector<FunctionSummary> summaries(functions.size());
+	std::atomic<size_t>          next_summary {0};
+	{
+		const auto worker = [&]() {
+			for (size_t index = next_summary++; index < functions.size(); index = next_summary++) {
+				const uintptr_t start   = functions[index].first;
+				const uintptr_t end     = function_end_at(index);
+				auto&           summary = summaries[index];
+				if (sweep && !emulate_amd && !sweep->red_zone_candidates.AnyInRange(start, end)) {
+					summary.has_indirect_branch = sweep->indirect_jumps.AnyInRange(start, end);
+					continue;
+				}
+				auto function = DecodeFunction(start, end, segment_addr, segment_end);
+				if (analyze_red_zone) {
+					AnalyzeFramePointerRedZone(function, start);
+				}
+				summary.instruction_count   = function.instructions.size();
+				summary.analyzed            = true;
+				summary.uses_red_zone       = function.uses_red_zone;
+				summary.has_indirect_branch = function.has_indirect_branch;
+			}
+		};
+		const size_t thread_count = std::clamp<size_t>(std::thread::hardware_concurrency(), 1, 16);
+		std::vector<std::thread> threads;
+		for (size_t index = 1; index < thread_count; ++index) {
+			threads.emplace_back(worker);
 		}
+		worker();
+		for (auto& thread: threads) {
+			thread.join();
+		}
+	}
+
+	std::unique_lock lock {module->mutex};
+	const size_t     trampoline_begin = module->trampoline_gen.getSize();
+	// A false start inside a function could take its jump-table cases; patch in place only.
+	bool previous_unresolved_branch = false;
+	for (size_t function_index = 0; function_index < functions.size(); ++function_index) {
+		const auto [function_start, source] = functions[function_index];
+		const uintptr_t function_end        = function_end_at(function_index);
+		const auto&     summary             = summaries[function_index];
+		const bool      restrict_relocation =
+		    previous_unresolved_branch &&
+		    (source == StartSource::CodePointer || source == StartSource::Padding);
+		previous_unresolved_branch = restrict_relocation || summary.has_indirect_branch;
 
 		++result.function_count;
+		result.analyzed_function_count += summary.analyzed;
+		result.instruction_count += summary.instruction_count;
+		if (!summary.analyzed || (!summary.uses_red_zone && !emulate_amd)) {
+			continue;
+		}
 		auto function = DecodeFunction(function_start, function_end, segment_addr, segment_end);
 		if (analyze_red_zone) {
 			AnalyzeFramePointerRedZone(function, function_start);
 			AnalyzeRedZoneLiveness(function);
 		}
-		result.instruction_count += function.instructions.size();
+		result.restricted_function_count += restrict_relocation;
 
 		std::map<uintptr_t, InstructionRewrite> rewrite_sites;
 
@@ -1734,10 +2000,12 @@ GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment
 			CollectAmdInstructions(function, rewrite_sites, result, host_features);
 		}
 		if (!rewrite_sites.empty()) {
-			RelocateGuestInstructions(module, function, rewrite_sites, result);
+			RelocateGuestInstructions(module, function, rewrite_sites, sweep ? &*sweep : nullptr,
+			                          restrict_relocation, result);
 			TrapUnrelocatedInstructions(*module, function, rewrite_sites, result);
 		}
 	}
+	result.trampoline_bytes = module->trampoline_gen.getSize() - trampoline_begin;
 	const auto trampoline_addr =
 	    reinterpret_cast<u64>(module->trampoline_gen.getCode()) + trampoline_begin;
 	const auto trampoline_size = module->trampoline_gen.getSize() - trampoline_begin;
@@ -1754,12 +2022,25 @@ GuestInstructionHostFeatures GetGuestInstructionHostFeatures() {
 	return {};
 }
 
-GuestInstructionPatchResult PatchGuestInstructions(u64, u64, std::span<const uintptr_t>, bool, bool,
+GuestInstructionPatchResult PatchGuestInstructions(u64, u64, const RedZoneCodeHints&, bool, bool,
                                                    GuestInstructionHostFeatures) {
 	return {};
 }
 
 #endif
+
+GuestInstructionPatchResult PatchGuestInstructions(u64 segment_addr, u64 segment_size,
+                                                   std::span<const uintptr_t> function_starts,
+                                                   bool protect_memory, bool emulate_amd,
+                                                   GuestInstructionHostFeatures host_features) {
+	std::vector<RedZoneFunctionRange> functions;
+	functions.reserve(function_starts.size());
+	for (const uintptr_t start: function_starts) {
+		functions.push_back({.start = start});
+	}
+	return PatchGuestInstructions(segment_addr, segment_size, {.unwind_functions = functions},
+	                              protect_memory, emulate_amd, host_features);
+}
 
 namespace {
 
@@ -1877,14 +2158,132 @@ bool ReadEncodedEhPointer(const uint8_t** cursor, const uint8_t* end, uint8_t en
 	return true;
 }
 
+std::optional<size_t> EhPointerFormatSize(uint8_t encoding) {
+	switch (encoding & DW_EH_PE_FORMAT_MASK) {
+		case 0x00:
+		case 0x04:
+		case 0x0c: return 8;
+		case 0x02:
+		case 0x0a: return 2;
+		case 0x03:
+		case 0x0b: return 4;
+		default: return std::nullopt;
+	}
+}
+
+bool ReadUleb128(const uint8_t** cursor, const uint8_t* end, uint64_t* value) {
+	uint64_t result = 0;
+	for (unsigned shift = 0; *cursor < end && shift < 64; shift += 7) {
+		const uint8_t byte = *(*cursor)++;
+		result |= static_cast<uint64_t>(byte & 0x7f) << shift;
+		if ((byte & 0x80) == 0) {
+			*value = result;
+			return true;
+		}
+	}
+	return false;
+}
+
+std::optional<uint8_t> ReadCieFdeEncoding(const uint8_t* cie) {
+	const uint8_t* cursor = cie;
+	uint32_t       length = 0;
+	uint32_t       id     = 0;
+	uint8_t        version {};
+	if (!ReadEhValue(&cursor, cursor + sizeof(length), &length) || length == 0 ||
+	    length == UINT32_MAX) {
+		return std::nullopt;
+	}
+	const uint8_t* end = cursor + length;
+	if (!ReadEhValue(&cursor, end, &id) || id != 0 || !ReadEhValue(&cursor, end, &version)) {
+		return std::nullopt;
+	}
+	const uint8_t* augmentation = cursor;
+	while (cursor < end && *cursor != 0) {
+		++cursor;
+	}
+	if (cursor >= end) {
+		return std::nullopt;
+	}
+	const std::string_view aug(reinterpret_cast<const char*>(augmentation),
+	                           static_cast<size_t>(cursor - augmentation));
+	++cursor;
+	if (aug.find("eh") != std::string_view::npos) {
+		cursor += sizeof(uintptr_t);
+	}
+	uint64_t ignored = 0;
+	if (!ReadUleb128(&cursor, end, &ignored) || !ReadUleb128(&cursor, end, &ignored)) {
+		return std::nullopt;
+	}
+	if (version == 1) {
+		++cursor;
+	} else if (!ReadUleb128(&cursor, end, &ignored)) {
+		return std::nullopt;
+	}
+	if (aug.empty() || aug[0] != 'z' || !ReadUleb128(&cursor, end, &ignored)) {
+		return aug.empty() ? std::optional<uint8_t>(0) : std::nullopt;
+	}
+	for (const char ch: aug.substr(1)) {
+		if (cursor >= end) {
+			return std::nullopt;
+		}
+		if (ch == 'R') {
+			return *cursor;
+		}
+		if (ch == 'P') {
+			const auto size = EhPointerFormatSize(*cursor);
+			if (!size) {
+				return std::nullopt;
+			}
+			cursor += 1 + *size;
+		} else if (ch == 'L') {
+			++cursor;
+		} else if (ch != 'S' && ch != 'B') {
+			return std::nullopt;
+		}
+	}
+	return uint8_t {0};
+}
+
+uint64_t ReadFdeRange(uintptr_t fde_address, std::map<uintptr_t, std::optional<uint8_t>>* cies) {
+	const auto* cursor  = reinterpret_cast<const uint8_t*>(fde_address);
+	uint32_t    length  = 0;
+	int32_t     cie_ref = 0;
+	if (!ReadEhValue(&cursor, cursor + sizeof(length), &length) || length == 0 ||
+	    length == UINT32_MAX) {
+		return 0;
+	}
+	const uint8_t* end = cursor + length;
+	if (!ReadEhValue(&cursor, end, &cie_ref) || cie_ref == 0) {
+		return 0;
+	}
+	const uintptr_t cie    = reinterpret_cast<uintptr_t>(cursor) - sizeof(cie_ref) - cie_ref;
+	auto            cached = cies->find(cie);
+	if (cached == cies->end()) {
+		cached =
+		    cies->emplace(cie, ReadCieFdeEncoding(reinterpret_cast<const uint8_t*>(cie))).first;
+	}
+	if (!cached->second) {
+		return 0;
+	}
+	const auto size = EhPointerFormatSize(*cached->second);
+	if (!size || static_cast<size_t>(end - cursor) < *size * 2) {
+		return 0;
+	}
+	cursor += *size;
+	uintptr_t range = 0;
+	return ReadEncodedEhPointer(&cursor, end, *cached->second & DW_EH_PE_FORMAT_MASK, 0, &range)
+	           ? range
+	           : 0;
+}
+
 } // namespace
 
-bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
-                                 std::vector<uintptr_t>* function_starts) {
-	if (function_starts == nullptr) {
+bool DecodeEhFrameFunctions(uint64_t eh_frame_header_addr, uint64_t eh_frame_header_size,
+                            std::vector<RedZoneFunctionRange>* functions) {
+	if (functions == nullptr) {
 		return false;
 	}
-	function_starts->clear();
+	functions->clear();
 	if (eh_frame_header_addr == 0 || eh_frame_header_size < 4 ||
 	    eh_frame_header_size > UINTPTR_MAX - eh_frame_header_addr) {
 		return false;
@@ -1920,18 +2319,18 @@ bool DecodeEhFrameFunctionStarts(uint64_t eh_frame_header_addr, uint64_t eh_fram
 		return false;
 	}
 
-	function_starts->reserve(static_cast<size_t>(fde_count));
+	std::map<uintptr_t, std::optional<uint8_t>> cies;
+	functions->reserve(static_cast<size_t>(fde_count));
 	for (uintptr_t index = 0; index < fde_count; ++index) {
 		uintptr_t function_start = 0;
-		uintptr_t ignored_fde    = 0;
+		uintptr_t fde            = 0;
 		if (!ReadEncodedEhPointer(&cursor, end, table_encoding, eh_frame_header_addr,
 		                          &function_start) ||
-		    !ReadEncodedEhPointer(&cursor, end, table_encoding, eh_frame_header_addr,
-		                          &ignored_fde)) {
-			function_starts->clear();
+		    !ReadEncodedEhPointer(&cursor, end, table_encoding, eh_frame_header_addr, &fde)) {
+			functions->clear();
 			return false;
 		}
-		function_starts->push_back(function_start);
+		functions->push_back({.start = function_start, .size = ReadFdeRange(fde, &cies)});
 	}
 	return true;
 }
