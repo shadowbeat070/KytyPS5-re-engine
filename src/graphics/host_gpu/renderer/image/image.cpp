@@ -20,6 +20,11 @@
 
 namespace Libs::Graphics {
 
+uint64_t NextImageWriteEpoch() noexcept {
+	static std::atomic<uint64_t> epoch {0};
+	return epoch.fetch_add(1, std::memory_order_relaxed) + 1;
+}
+
 namespace {
 
 [[nodiscard]] vk::ImageType HostImageType(Prospero::ImageType type) {
