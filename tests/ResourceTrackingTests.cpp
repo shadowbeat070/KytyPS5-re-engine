@@ -32,6 +32,13 @@ void Check(bool condition, const char *message) {
 }
 
 template <typename F>
+void CheckTrackingRejected(F &fixture, std::string_view expected,
+                           const char *message) {
+  const auto status = fixture.TryPlanAndTrack();
+  Check(!status.ok && status.reason.find(expected) != std::string::npos, message);
+}
+
+template <typename F>
 void CheckFatal(F &&function, std::string_view expected, const char *message) {
   try {
     function();
@@ -126,7 +133,7 @@ struct Fixture {
                  Value(0u), Value(0u), Value(0u)});
   }
 
-  void PlanAndTrack() {
+  ResourceTrackingStatus TryPlanAndTrack() {
     for (size_t index = 0; index < program.block_info.size(); ++index) {
       const auto condition = program.block_info[index].condition;
       if (!condition.IsEmpty())
@@ -148,7 +155,14 @@ struct Fixture {
         Emit(ValueOpcode::ReferenceU32, {value}, 0, target);
       }
     }
-    TrackResources(program, {}, {});
+    return TrackResources(program, {}, {});
+  }
+
+  void PlanAndTrack() {
+    const auto status = TryPlanAndTrack();
+    if (!status.ok) {
+      throw std::runtime_error(status.reason);
+    }
   }
 };
 
@@ -547,8 +561,8 @@ void TestInvariantIndirectImageMaterialization() {
 
   auto malformed = MakeIndirectImageFixture(true);
 
-  CheckFatal([&] { malformed->PlanAndTrack(); }, "not a valid runtime value",
-             "malformed indirect image pattern was accepted");
+  CheckTrackingRejected(*malformed, "not a valid runtime value",
+                        "malformed indirect image pattern was accepted");
   Check(!malformed->program.resource_tracking_complete &&
             malformed->program.info.images.empty() &&
             malformed->program.descriptor_sources.empty(),
@@ -1989,8 +2003,7 @@ void TestSampleAdjustSamplerScratch() {
                   {rejected_image, rejected_sampler, rejected.ImageAddress()},
                   rejected.AddMemory(rejected_memory, 0x200));
 
-    CheckFatal([&] { rejected.PlanAndTrack(); },
-               "not a valid runtime value", message);
+    CheckTrackingRejected(rejected, "not a valid runtime value", message);
   };
   CheckRejected(0u, 12u,
                 "ordinary sampling accepted SampleAdjust reserved scratch");
@@ -2430,7 +2443,7 @@ void TestWritableDescriptorPhi() {
                {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
                fixture.AddMemory(memory, 20), merge);
 
-  CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
+  CheckTrackingRejected(fixture, "not a valid runtime value",
              "control-dependent writable descriptor phi was accepted");
   Check(!fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
@@ -3573,9 +3586,8 @@ void TestResourceLimitIsTransactional() {
                  fixture.AddMemory(memory, index * 4u));
   }
 
-  CheckFatal([&] { fixture.PlanAndTrack(); },
-             "buffer resource limit exceeded",
-             "resource-limit failure was not reported");
+  CheckTrackingRejected(fixture, "buffer resource limit exceeded",
+                        "resource-limit failure was not reported");
   Check(!fixture.program.resource_tracking_complete &&
             fixture.program.info.buffers.empty() &&
             fixture.program.descriptor_sources.empty(),
@@ -3592,9 +3604,8 @@ void TestMalformedMemoryKindsRejected() {
                  {address, Value(0u), Value(0u), Value(1u), Value(true)},
                  fixture.AddMemory(memory, 4));
 
-    CheckFatal(
-        [&] { fixture.PlanAndTrack(); },
-        "address operation has invalid resource kind",
+    CheckTrackingRejected(
+        fixture, "address operation has invalid resource kind",
         "resource tracking accepted an address opcode with buffer metadata");
   }
   {
@@ -3609,9 +3620,8 @@ void TestMalformedMemoryKindsRejected() {
                  {image, fixture.ImageAddress(), Value(true)},
                  fixture.AddMemory(memory, 8));
 
-    CheckFatal(
-        [&] { fixture.PlanAndTrack(); },
-        "image operation has invalid resource kind",
+    CheckTrackingRejected(
+        fixture, "image operation has invalid resource kind",
         "resource tracking accepted an image opcode with address metadata");
   }
 }

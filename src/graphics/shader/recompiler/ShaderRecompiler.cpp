@@ -541,6 +541,23 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     static_cast<uint64_t>(native_cfg.blocks.size()),
 	     static_cast<uint64_t>(native_cfg.natural_loops.size()),
 	     static_cast<uint64_t>(native_cfg.back_edges.size()), phase_ms());
+	// A shader the CFG builder cannot model - an undecodable instruction, a branch into nothing -
+	// is dropped, not fatal. Only a build failure sets unsupported here: the irreducible path
+	// clears it inside BuildGraph, and the structurizer has not run yet.
+	if (native_cfg.unsupported) {
+		LOGF("%s CFG build rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32 " %s\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
+		     native_cfg.failure_pc, native_cfg.unsupported_reason.c_str());
+		TranslateResult result;
+		result.status.ok     = false;
+		result.status.pc     = native_cfg.failure_pc;
+		result.status.reason = native_cfg.unsupported_reason;
+		if (options.dump_ir) {
+			result.decoded_dump = std::move(decoded_dump);
+			result.cfg_dump     = CFG::GraphToString(native_cfg);
+		}
+		return result;
+	}
 	if (native_cfg.irreducible) {
 		LogDispatcherFallback(options, native_cfg, "build");
 	} else {
@@ -616,8 +633,19 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     MakeIrDump(cfg_dump, ir).c_str());
 		}
 	}
-	IR::TrackResources(ir, decoded, native_cfg);
+	auto tracking = IR::TrackResources(ir, decoded, native_cfg);
 	TranslateResult result;
+	if (!tracking.ok) {
+		LOGF("%s resource tracking rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32
+		     " %s\n",
+		     GetDumpLabel(options), StageName(options.stage), options.shader_hash, tracking.pc,
+		     tracking.reason.c_str());
+		result.status.ok     = false;
+		result.status.pc     = tracking.pc;
+		result.status.reason = std::move(tracking.reason);
+		result.program       = std::move(ir);
+		return result;
+	}
 	result.program = std::move(ir);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);

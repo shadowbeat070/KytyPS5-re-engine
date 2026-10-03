@@ -25,12 +25,14 @@
 #include <atomic>
 #include <cctype>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -220,6 +222,8 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		ShaderRecompiler::IR::CompiledShaderInfo     program;
 		ShaderProgram                                handle;
+		// Set instead of `handle` when the backend refused the program.
+		std::string                                  reason;
 	};
 
 	struct SourceEntry {
@@ -233,6 +237,41 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                    permutations;
 	};
+
+	static const char* StageShortName(ShaderType stage) {
+		switch (stage) {
+			case ShaderType::Vertex: return "vs";
+			case ShaderType::Mesh: return "ms";
+			case ShaderType::Pixel: return "ps";
+			case ShaderType::Compute: return "cs";
+			default: return "unknown";
+		}
+	}
+
+	// A shader whose descriptors cannot be derived is dropped, not fatal: the draw is lost, the
+	// session is not. Report each distinct hash once so a per-frame skip does not flood the log.
+	void ReportSkipped(ShaderType stage, uint64_t hash, uint32_t pc, std::string_view reason) {
+		if (!skipped_shaders.insert(hash).second) {
+			return;
+		}
+		if (reason.empty()) {
+			reason = "descriptor materialization failed";
+		}
+		PipelineCacheLog("shader resources unavailable, skipping draws: hash=0x{:016x} "
+		                 "stage={} pc=0x{:08x} {}",
+		                 hash, StageShortName(stage), pc, reason);
+	}
+
+	// A hardware ray-tracing intersect lowered to a constant miss: the shader runs, but its
+	// traced results are fabricated. Report each distinct hash once so the log says so.
+	void ReportStubbed(ShaderType stage, uint64_t hash) {
+		if (!stubbed_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("hardware ray tracing stubbed to a permanent miss: hash=0x{:016x} "
+		                 "stage={}",
+		                 hash, StageShortName(stage));
+	}
 
 	struct ProgramKeyHash {
 		std::size_t operator()(const ProgramKey& key) const {
@@ -259,6 +298,14 @@ struct PipelineCache::ProgramCache {
 	                               uint32_t push_data_start_dword) {
 		auto result = ShaderRecompiler::CompileProgram(std::move(translated), options,
 		                                               specialization, push_data_start_dword);
+		if (!result.status.ok) {
+			// The backend refused the program. Hand back a permutation with no module; the caller
+			// reports it once and drops the shader's draws.
+			Permutation rejected;
+			rejected.specialization = std::move(specialization);
+			rejected.reason         = std::move(result.status.reason);
+			return rejected;
+		}
 		if (!ValidateShaderSpirv(options.dump_label, options.shader_hash, result.spirv)) {
 			DumpShaderSpirv(stage_name, options.shader_hash, result.spirv);
 			EXIT("%s failed hash=0x%016" PRIx64 ": SPIR-V validation failed\n", options.dump_label,
@@ -293,6 +340,12 @@ struct PipelineCache::ProgramCache {
 		}
 
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
+		// A shader already rejected once is rejected for good: skip it before paying for another
+		// translation, which would otherwise repeat on every dispatch.
+		if (skipped_shaders.contains(params.hash)) {
+			return {};
+		}
+
 		lookup_key.stage           = stage;
 		lookup_key.hash            = params.hash;
 		lookup_key.user_data_count = params.user_data_count;
@@ -308,9 +361,14 @@ struct PipelineCache::ProgramCache {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
 		if (entry != programs.end()) {
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			// Call unconditionally: EXIT_IF drops its argument under KYTY_FINAL.
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				ReportSkipped(stage, params.hash, 0, {});
+				return {};
+			}
+
 			if (const auto permutation = std::ranges::find_if(
 			        entry->second.permutations, [&](const Permutation& candidate) {
 				        const auto& layout = candidate.program.bindings;
@@ -369,15 +427,39 @@ struct PipelineCache::ProgramCache {
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		// A rejected recompile leaves no usable program: a CFG-build rejection returns an empty
+		// one, and resource tracking rewrites the program in place so a rejected pass leaves it
+		// half-written - extracting a plan from that indexes past the end of a resource list.
+		// Checked before the cache branch because the other arm falls through to
+		// CompilePermutation, which would emit SPIR-V from the same unusable program.
+		if (!translated.status.ok) {
+			ReportSkipped(stage, params.hash, translated.status.pc, translated.status.reason);
+			return {};
+		}
+		if (translated.program.uses_bvh_intersect_stub) {
+			ReportStubbed(stage, params.hash);
+		}
 		if (entry == programs.end()) {
 			entry = programs.try_emplace(lookup_key,
 			    ShaderRecompiler::IR::ExtractResourcePlan(translated.program)).first;
-			EXIT_IF(!ShaderRecompiler::IR::MaterializeResources(
-			    entry->second.resource_plan, runtime, entry->second.resources,
-			    entry->second.specialization));
+			// A rejected plan is still cached: MaterializeResources fails on it again, so later
+			// draws take the cheap cached path instead of re-translating the shader every time.
+			if (!ShaderRecompiler::IR::MaterializeResources(
+			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.specialization)) {
+				ReportSkipped(stage, params.hash, 0, {});
+				return {};
+			}
+
 		}
 		entry->second.permutations.push_back(CompilePermutation(
 		    stage_name, options, std::move(translated), entry->second.specialization, push_data_cursor));
+		if (!entry->second.permutations.back().handle) {
+			auto rejected = std::move(entry->second.permutations.back());
+			entry->second.permutations.pop_back();
+			ReportSkipped(stage, params.hash, 0, rejected.reason);
+			return {};
+		}
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
@@ -411,6 +493,8 @@ struct PipelineCache::ProgramCache {
 	}
 
 	std::unordered_map<ProgramKey, SourceEntry, ProgramKeyHash> programs;
+	std::unordered_set<uint64_t>                                skipped_shaders;
+	std::unordered_set<uint64_t>                                stubbed_shaders;
 	ProgramKey                                                  lookup_key;
 	vk::Device                                                  device;
 	uint64_t                                                    next_shader_id = 0;
@@ -671,6 +755,9 @@ PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
 	GraphicsPrograms  result;
 	if (pixel_active) {
 		result.pixel = m_program_cache->Get(pixel_params, pixel_info, push_data_cursor);
+		if (!result.pixel) {
+			return {};
+		}
 	}
 	for (uint32_t i = 0; i < (tess_active ? 3u : 1u); i++) {
 		result.vertex[i] = m_program_cache->Get(vertex_params[i], vertex_info[i], push_data_cursor);
