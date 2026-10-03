@@ -49,9 +49,9 @@ size_t BindlessImageHeap::HeapKeyHash::operator()(const HeapKey& key) const noex
 	return static_cast<size_t>(XXH3_64bits(words.data(), sizeof(words)));
 }
 
-std::array<vk::DescriptorSetLayoutBinding, 4>
+std::array<vk::DescriptorSetLayoutBinding, 1u + BindlessImageHeap::Arrays>
 BindlessImageHeap::LayoutBindings(vk::ShaderStageFlags stages) {
-	std::array<vk::DescriptorSetLayoutBinding, 4> bindings {};
+	std::array<vk::DescriptorSetLayoutBinding, 1u + Arrays> bindings {};
 	bindings[0] = {IR::BindlessArenaBinding, vk::DescriptorType::eStorageBuffer, 1, stages,
 	               nullptr};
 	for (uint32_t shape = 0; shape < Arrays; shape++) {
@@ -125,8 +125,9 @@ void BindlessImageHeap::EnsureNullImages() {
 		TextureCache::ImageDesc desc {};
 		desc.info.guest_format    = Prospero::BufferFormat::k32Float;
 		desc.info.pixel_format    = vk::Format::eR32Sfloat;
-		desc.info.type            = kind == BindlessShape::Image3D ? Prospero::ImageType::kColor3D
-		                                                           : Prospero::ImageType::kColor2D;
+		desc.info.type = kind == BindlessShape::Image3D   ? Prospero::ImageType::kColor3D
+		                 : kind == BindlessShape::Image1D ? Prospero::ImageType::kColor1D
+		                                                  : Prospero::ImageType::kColor2D;
 		desc.info.extent          = {1, 1, 1};
 		desc.info.resources       = {1, 1};
 		desc.info.bytes_per_block = 4;
@@ -135,6 +136,7 @@ void BindlessImageHeap::EnsureNullImages() {
 		desc.view_info.format     = desc.info.pixel_format;
 		desc.view_info.type   = kind == BindlessShape::Image3D        ? vk::ImageViewType::e3D
 		                        : kind == BindlessShape::Image2DArray ? vk::ImageViewType::e2DArray
+		                        : kind == BindlessShape::Image1D      ? vk::ImageViewType::e1D
 		                                                              : vk::ImageViewType::e2D;
 		desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
 		desc.view_info.usage  = vk::ImageUsageFlagBits::eSampled;

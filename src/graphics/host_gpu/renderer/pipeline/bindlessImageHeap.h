@@ -38,7 +38,9 @@ public:
 
 	[[nodiscard]] static vk::DescriptorSetLayout SetLayout(GraphicContext& graphics);
 	[[nodiscard]] static vk::DescriptorSetLayout EmptySetLayout(GraphicContext& graphics);
-	[[nodiscard]] static std::array<vk::DescriptorSetLayoutBinding, 4>
+	[[nodiscard]] static std::array<
+	    vk::DescriptorSetLayoutBinding,
+	    1u + static_cast<size_t>(ShaderRecompiler::IR::BindlessShape::Count)>
 	LayoutBindings(vk::ShaderStageFlags stages);
 
 private:
