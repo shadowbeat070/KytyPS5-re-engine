@@ -216,44 +216,8 @@ uint32_t F32ArrayType(EmitterState& state, uint32_t count) {
 }
 
 void DefineDescriptors(EmitterState& state) {
-	using Kind = IR::DescriptorBindingKind;
-	auto& info = state.program.info;
-	auto& bindings = state.program.bindings;
-	auto& counts = bindings.descriptor_counts;
-	auto& buffer_count = counts[static_cast<size_t>(Kind::Buffers)];
-	for (uint32_t index = 0; index < info.buffers.size(); ++index) {
-		info.buffers[index].descriptor_index = (info.live_buffers & (uint64_t{1} << index)) != 0
-		                                          ? buffer_count++ : UINT32_MAX;
-	}
-	std::array<const IR::ImageResource*, IR::ImageBindingCount> image_types {};
-	for (auto& image: info.images) {
-		const auto kind = IR::DescriptorBindingForImage(image);
-		if (!kind.has_value() || image.mip_count == 0u ||
-		    (image.mip_mode != IR::ImageMipMode::Dynamic && image.mip_count != 1u)) {
-			EXIT("shader image has an invalid descriptor type or mip count");
-		}
-		auto& count = counts[static_cast<size_t>(*kind)];
-		image.descriptor_index = count;
-		if (count == 0) image_types[IR::ImageBindingIndex(*kind)] = &image;
-		count += image.mip_count;
-	}
-	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
-	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
-	counts[static_cast<size_t>(Kind::SharedMemory)] =
-	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
-	counts[static_cast<size_t>(Kind::BdaPagetable)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FaultBuffer)] = info.uses_dma;
-	counts[static_cast<size_t>(Kind::FlattenedSrt)] = info.uses_flattened_srt;
-	bindings.memory_offset_dword = static_cast<uint32_t>(info.user_data_registers.size());
-	if (info.uses_dispatch_threads) {
-		bindings.dispatch_thread_dword = bindings.memory_offset_dword;
-		bindings.memory_offset_dword += 3u;
-	}
-	bindings.push_data_start_dword =
-	    IR::PushData::StartFor(bindings.push_data_start_dword, bindings.ShaderDataDwords());
-	counts[static_cast<size_t>(Kind::ShaderData)] =
-	    bindings.ShaderDataDwords() != 0 && !bindings.UsesPushData();
-	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh) {
+	if (state.program.bindings.UsesPushData() || state.program.stage == ShaderType::Mesh ||
+	    state.requirements.dispatch_thread_limit) {
 		const auto type              = PushConstantBlockType(state);
 		state.push_constant_variable = state.builder.DefineGlobalVariable(
 		    TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
@@ -822,7 +786,7 @@ void DefineModule(EmitterState& state) {
 	if (state.program.info.buffer_u16) {
 		state.builder.RequireCapability(spv::CapabilityStorageBuffer16BitAccess);
 	}
-	if (state.program.info.uses_dma) {
+	if (state.program.info.uses_dma || state.requirements.dispatch_thread_limit) {
 		state.builder.RequireCapability(spv::CapabilityInt64);
 		state.builder.RequireCapability(spv::CapabilityPhysicalStorageBufferAddresses);
 		state.builder.RequireExtension("SPV_KHR_physical_storage_buffer");
@@ -883,7 +847,8 @@ void DefineModule(EmitterState& state) {
 		state.builder.RequireExtension("SPV_KHR_fragment_shader_barycentric");
 	}
 	state.builder.RequireExtension("SPV_KHR_float_controls");
-	state.builder.AddMemoryModel(state.program.info.uses_dma
+	state.builder.AddMemoryModel(state.program.info.uses_dma ||
+	                                     state.requirements.dispatch_thread_limit
 	                                 ? spv::AddressingModelPhysicalStorageBuffer64
 	                                 : spv::AddressingModelLogical,
 	                             spv::MemoryModelGLSL450);
