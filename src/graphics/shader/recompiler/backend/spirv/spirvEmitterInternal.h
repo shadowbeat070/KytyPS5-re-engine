@@ -123,7 +123,14 @@ struct EmitterState {
 	uint32_t                                         storage_buffer_u8_variable = 0;
 	uint32_t                                         storage_buffer_u16_variable = 0;
 	uint32_t                                         storage_buffer_u64_variable = 0;
-	std::array<uint32_t, IR::ShaderInfo::MaxBuffers> memory_byte_offsets {};
+	std::array<uint32_t, IR::ShaderInfo::MaxDenseBuffers> memory_byte_offsets {};
+	// While non-zero, a storage-buffer access to dynamic_buffer_resource indexes the descriptor
+	// array with this id rather than with that resource's own constant slot. An indirect buffer
+	// table sets it around the one access every candidate of a shape shares.
+	uint32_t                                         dynamic_buffer_index    = 0;
+	uint32_t                                         dynamic_buffer_resource = 0;
+	// That slot's unpacked byte offset, read once for the whole access rather than per component.
+	uint32_t                                         dynamic_buffer_byte_offset = 0;
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
@@ -140,6 +147,12 @@ struct EmitterState {
 	uint32_t                                         lds_u64_variable        = 0;
 	std::array<uint32_t, 2>                          scratch_variable {};
 	std::array<uint32_t, IR::ImageBindingCount>      image_variables {};
+	// While non-zero, a sampled-image load naming dynamic_image_resource indexes its descriptor
+	// array with this id rather than with that resource's own constant slot. An indirect image
+	// table sets it around the one sample every candidate of a shape shares. The same reasoning
+	// as dynamic_buffer_index above, in the other descriptor class.
+	uint32_t                   dynamic_image_index                   = 0;
+	uint32_t                   dynamic_image_resource                = 0;
 	uint32_t                   sampler_variable                      = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
@@ -340,16 +353,14 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image);
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension);
 
-uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0,
-                                uint32_t array_index = 0);
+uint32_t ImageDescriptorPointer(EmitterState& state, uint32_t resource, uint32_t mip = 0);
 
-uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0,
-                             uint32_t array_index = 0);
+uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mip = 0);
 
 uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler);
 
 uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
-                          uint32_t mip = 0, uint32_t array_index = 0);
+                          uint32_t mip = 0);
 
 void EmitStorageImageWrite(EmitterState& state, uint32_t resource, uint32_t mip_lod, uint32_t coord,
                            uint32_t texel);
@@ -416,6 +427,14 @@ uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32
 
 uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index);
 
+// EmitShaderDataDwordLoad for an index the shader computes. Push constants and the shader-data
+// storage buffer are both plain arrays, so indexing either one dynamically needs no feature.
+uint32_t EmitShaderDataDwordLoadDynamic(EmitterState& state, uint32_t dword_index);
+
+// The packed per-buffer byte offset EmitMemoryOffsets unpacks at entry, for a resource slot the
+// shader picks at runtime. One byte per dense buffer, four to a shader-data dword.
+uint32_t EmitDynamicMemoryByteOffset(EmitterState& state, uint32_t resource_index);
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem);
 
 Prospero::BufferFormat StorageBufferFormat(const EmitterState& state, const IR::MemoryInfo& mem);
@@ -433,6 +452,7 @@ struct MemoryResourceAccess {
 	uint32_t              byte_offset      = 0;
 	uint32_t              element_bits     = 32;
 	spv::MemoryAccessMask memory_access    = spv::MemoryAccessMaskNone;
+
 	// glc=1: only storage buffers and raw pointers have a cache to bypass.
 	bool             coherent         = false;
 };
@@ -456,6 +476,13 @@ uint32_t EmitMemoryElementPointer(EmitterState& state, const MemoryResourceAcces
 
 uint32_t EmitStorageBufferElementPointer(EmitterState& state, const MemoryResourceAccess& access,
                                          uint32_t index, uint32_t pointer_type);
+
+// Walks the key-to-candidate mapping the host laid out in the flattened SRT and yields the
+// candidate slot the key names, or zero when the mapping does not hold it. Branchless: the search
+// always runs its full iteration count, so it stays one basic block whatever the key is. Images and
+// buffers lay their mappings out identically and share this.
+uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_offset,
+                                     uint32_t iterations, uint32_t key);
 
 uint32_t EmitTBufferBitcastU32ToI32(EmitterState& state, uint32_t value);
 

@@ -229,12 +229,15 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 					requirements.subgroup_local_invocation_id = true;
 				}
 				// Must match the emitter's predicate, or a module can use the alias undeclared.
-				if (IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Atomic &&
+				if (!memory.planning_only &&
+				    IR::BufferAccessOf(inst.GetOpcode()) != IR::BufferAccess::Atomic &&
 				    Emitter::CoherentBufferAccess(memory)) {
 					requirements.coherent_buffers = true;
 				}
-				if (memory.kind == IR::ResourceKind::Buffer) {
+				// A planning-only read is never tracked or emitted; its resource is still a register.
+				if (!memory.planning_only && memory.kind == IR::ResourceKind::Buffer) {
 					requirements.coherent_buffers |= memory.coherent;
+
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");
 					}

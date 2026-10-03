@@ -906,7 +906,7 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			operands.push_back(AddressF32(ctx, mem, *address, layout.bias));
 		}
 		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
-		const auto EmitSample = [&](uint32_t resource, uint32_t array_index = 0u) {
+		const auto EmitSample = [&](uint32_t resource) {
 			const auto& candidate = state.program.info.images[resource];
 			const auto coord =
 			    CoordF32(ctx, mem, *address, layout.coord,
@@ -952,42 +952,55 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			ctx.Fail(inst, "has no indirect image runtime mapping");
 			return;
 		}
-		const auto selected = EmitIndirectResourceIndex(
-		    state, key, image.indirect_mapping_offset, image.indirect_search_iterations, 0u);
-		const auto kind = *IR::DescriptorBindingForImage(image);
-		const auto& binding = *IR::FindBinding(state.program.bindings, kind);
-		uint32_t first_child = 0;
-		bool homogeneous = true;
-		for (uint32_t ordinal = 0; ordinal < image.indirect_resources.size(); ++ordinal) {
-			const auto resource = image.indirect_resources[ordinal];
-			const auto& candidate = state.program.info.images[resource];
-			if (candidate.dimension != image.dimension || candidate.cube != image.cube ||
-			    IR::DescriptorBindingForImage(candidate) != kind ||
-			    candidate.mip_count != 1u) {
-				homogeneous = false;
-				break;
-			}
-			if (ordinal == 1u) first_child = ResourceForDescriptor(state, kind, resource);
-			const auto child_slot = first_child + ordinal - 1u;
-			if (ordinal > 1u && (child_slot >= binding.resources.size() ||
-			                     binding.resources[child_slot] != resource)) {
-				homogeneous = false;
-				break;
-			}
-		}
-		if (homogeneous) {
-			const auto child_index = Binary(state, spv::OpIAdd, TypeU32(state), selected,
-			                                ConstantU32(state, first_child - 1u));
-			const auto is_root = Binary(state, spv::OpIEqual, TypeBool(state), selected,
-			                            ConstantU32(state, 0u));
-			const auto array_index = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpSelect, TypeU32(state), array_index, is_root,
-			                          ConstantU32(state, ResourceForDescriptor(state, kind, mem.resource)),
-			                          child_index);
-			const auto sample = EmitSample(mem.resource, array_index);
-			const auto result = dref ? sample : UnpackImageTexel(ctx, mem, sample);
-			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
-			return;
+		const auto LoadMapping = [&](uint32_t index) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+			                          index);
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+			return value;
+		};
+		const auto mapping  = ConstantU32(state, image.indirect_mapping_offset);
+		auto       low      = ConstantU32(state, 0u);
+		auto       high     = LoadMapping(mapping);
+		auto       selected = ConstantU32(state, 0u);
+		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
+		     iteration++) {
+			const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
+			const auto mid    = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+			                           Binary(state, spv::OpIAdd, TypeU32(state), low, high),
+			                           ConstantU32(state, 1u));
+			const auto probe  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), probe, active, mid,
+			                          ConstantU32(state, 0u));
+			const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), mapping,
+			                          Binary(state, spv::OpIAdd, TypeU32(state),
+			                                 Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+			                                        probe, ConstantU32(state, 1u)),
+			                                 ConstantU32(state, 1u)));
+			const auto mapped_key = LoadMapping(entry);
+			const auto candidate  = LoadMapping(
+			    Binary(state, spv::OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+			const auto equal = Binary(state, spv::OpIEqual, TypeBool(state), mapped_key, key);
+			const auto match = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, equal);
+			const auto next_selected = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_selected, match,
+			                          candidate, selected);
+			selected              = next_selected;
+			const auto less = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
+			const auto take_upper = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less);
+			const auto take_lower = Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
+			                               Unary(state, spv::OpLogicalNot, TypeBool(state), less));
+			const auto next_low   = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    spv::OpSelect, TypeU32(state), next_low, take_upper,
+			    Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
+			low                  = next_low;
+			const auto next_high = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_high, take_lower, mid,
+			                          high);
+			high = next_high;
 		}
 		const auto            default_label = state.builder.AllocateId();
 		const auto            merge_label   = state.builder.AllocateId();

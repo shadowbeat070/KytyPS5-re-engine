@@ -309,8 +309,10 @@ void ValidateStorageTexture(const ShaderRecompiler::IR::ImageResource& resource,
 	const bool descriptor_ok = IsSupportedStorageTextureDescriptor(resource, descriptor);
 	const bool encoding_ok   = IsSupportedStorageTextureEncoding(resource, descriptor);
 	const bool uint_resource    = resource.numeric_class == Prospero::TextureNumericClass::Uint;
+	// The storage view of a k32SInt image is R32_UINT, so its 32-bit atomics are the same bits.
 	const bool raw_sint_storage = format == Prospero::BufferFormat::k32SInt && uint_resource &&
-	                              resource.written && !resource.read && !resource.atomic;
+	                              !resource.atomic64 &&
+	                              (resource.atomic || (resource.written && !resource.read));
 	const auto numeric_class = Prospero::SampledTextureNumericClass(format);
 	const bool raw_float_atomic = format == Prospero::BufferFormat::k32Float && uint_resource &&
 	                              resource.atomic && !resource.atomic64;
@@ -851,6 +853,10 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 				}
 			}
 			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			if (size == 0) {
+				prepared.buffer_sources.push_back({});
+				continue;
+			}
 			prepared.buffer_sources.push_back({address, size, cache.FindBuffer(address, size)});
 		}
 	}
@@ -885,6 +891,12 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
 		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		for (const auto& feedback: snapshot.key_feedback) {
+			m_context.GetIndirectKeyFeedback().Queue(
+			    feedback.signature, prepared.flattened_srt.buffer,
+			    prepared.flattened_srt.offset + feedback.srt_offset * sizeof(uint32_t),
+			    feedback.words);
+		}
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {

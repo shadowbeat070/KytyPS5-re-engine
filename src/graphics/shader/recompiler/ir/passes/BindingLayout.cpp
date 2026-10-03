@@ -85,9 +85,6 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
 				EXIT_IF(memory.resource >= program.info.buffers.size());
 				live_buffers.at(memory.resource) = true;
-				for (const auto child: program.info.buffers[memory.resource].indirect_resources) {
-					live_buffers.at(child) = true;
-				}
 			}
 		}
 	}
@@ -100,15 +97,15 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 }
 
 bool UsesFlattenedSrt(const Program& program) {
-	const auto uses_mapping = [](const auto& resource) {
-		return resource.indirect_search_iterations != 0u;
-	};
 	return std::ranges::any_of(program.blocks, [](const Block* block) {
 		return std::ranges::any_of(*block, [](const Inst& inst) {
 			return inst.GetOpcode() == ValueOpcode::ReadConst;
 		});
-	}) || std::ranges::any_of(program.info.buffers, uses_mapping) ||
-	       std::ranges::any_of(program.info.images, uses_mapping);
+	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
+		return image.indirect_search_iterations != 0u;
+	}) || std::ranges::any_of(program.info.buffers, [](const BufferResource& buffer) {
+		return buffer.indirect_search_iterations != 0u;
+	});
 }
 
 void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds_storage) {

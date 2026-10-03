@@ -676,11 +676,13 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				})) {
 					continue;
 				}
+				// A buffer table's root carries the runtime key in arg 0, as an image table's does.
 				const auto resource = inst.Flags<uint32_t>();
-				first               = resource < ir.info.buffers.size() &&
-				                              ir.info.buffers[resource].indirect_root == resource
-				                          ? 1u
-				                          : 0u;
+				first = resource < ir.info.buffers.size() &&
+				                ir.info.buffers[resource].indirect_root == resource &&
+				                ir.info.buffers[resource].indirect_search_iterations != 0u
+				            ? 1u
+				            : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
 				first = resource < ir.info.images.size() &&

@@ -9,6 +9,7 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -64,8 +65,21 @@ struct DispatcherFunctionState {
 	uint32_t                                      merge_label        = 0;
 };
 
-void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                            const IR::Block* from, const IR::Block* to) {
+// Slot, value. A terminator's whole phi update is one parallel copy, so every value is read
+// before any slot is written - see CollectDispatcherPhiEdge.
+using DispatcherPhiCopies = std::vector<std::pair<uint32_t, uint32_t>>;
+
+// Taking an edge updates every phi of `to` at once, and the terminator takes exactly one of its
+// edges, so the whole terminator - not one target - is the parallel copy. Two things make the
+// distinction load-bearing. One phi's incoming value can be another phi of the same block. And
+// one target's phi can take a phi of the *other* target as its incoming value, which is what a
+// loop-exit edge reading the header's loop variable looks like: the header and the exit are the
+// two arms of the latch's conditional branch, and the exit's phi names the header's. Either way
+// the value must be read as it arrived at this block, not after a store has replaced it, so this
+// only collects; `StoreDispatcherPhiCopies` writes once the whole terminator has been read.
+void CollectDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
+                              const IR::Block* from, const IR::Block* to,
+                              DispatcherPhiCopies& copies) {
 	if (to == nullptr) {
 		return;
 	}
@@ -75,11 +89,16 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 		}
 		for (size_t index = 0; index < phi.NumArgs(); index++) {
 			if (phi.PhiBlock(index) == from) {
-				ctx.state.builder.AddFunction(spv::OpStore, dispatcher.spills[ctx.half].at(&phi),
-				                              ctx.Def(phi.Arg(index)));
+				copies.emplace_back(dispatcher.spills[ctx.half].at(&phi), ctx.Def(phi.Arg(index)));
 				break;
 			}
 		}
+	}
+}
+
+void StoreDispatcherPhiCopies(ValueEmitContext& ctx, const DispatcherPhiCopies& copies) {
+	for (const auto& [slot, value]: copies) {
+		ctx.state.builder.AddFunction(spv::OpStore, slot, value);
 	}
 }
 
@@ -146,36 +165,46 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 	}
 }
 
-void EmitDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                          const IR::Block* from, uint32_t target) {
+void CollectDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
+                             const IR::Block* from, uint32_t target,
+                             DispatcherPhiCopies& copies) {
 	const auto* block = TargetBlock(ctx.state.program, target);
 	if (block != nullptr) {
-		StoreDispatcherPhiEdge(ctx, dispatcher, from, block);
+		CollectDispatcherPhiEdge(ctx, dispatcher, from, block, copies);
 		if (ctx.other_half != nullptr) {
-			StoreDispatcherPhiEdge(*ctx.other_half, dispatcher, from, block);
+			CollectDispatcherPhiEdge(*ctx.other_half, dispatcher, from, block, copies);
 		}
 	}
 }
 
+// The pc this block hands the loop, and the phi stores that go with taking its edge. Every store
+// is emitted last, after the selection has read whatever it needs: the branch condition and the
+// indirect selector are themselves values this block may have to load out of a spill slot, and a
+// slot a target's phi is about to be given is not the value the terminator was reached with.
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
                               const IR::Block* block, const IR::BlockInfo& info) {
-	const auto& term = info.terminator;
+	const auto&         term = info.terminator;
+	DispatcherPhiCopies copies;
+	const auto          finish = [&](uint32_t selected) {
+		StoreDispatcherPhiCopies(ctx, copies);
+		return selected;
+	};
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
-			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
-			return ConstantU32(ctx.state, term.true_block);
+			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
+			return finish(ConstantU32(ctx.state, term.true_block));
 		case CFG::TerminatorKind::ConditionalBranch: {
-			EmitDispatcherTarget(ctx, dispatcher, block, term.true_block);
-			EmitDispatcherTarget(ctx, dispatcher, block, term.false_block);
+			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
+			CollectDispatcherTarget(ctx, dispatcher, block, term.false_block, copies);
 			const auto selected = ctx.state.builder.AllocateId();
 			ctx.state.builder.AddFunction(
 			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
 			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
-			return selected;
+			return finish(selected);
 		}
 		case CFG::TerminatorKind::IndirectBranch: {
 			for (const auto target: term.indirect_targets) {
-				EmitDispatcherTarget(ctx, dispatcher, block, target);
+				CollectDispatcherTarget(ctx, dispatcher, block, target, copies);
 			}
 			uint32_t selected = ConstantU32(ctx.state, UINT32_MAX);
 			if (!info.indirect_target.IsEmpty()) {
@@ -196,9 +225,9 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 					selected = next;
 				}
 			}
-			return selected;
+			return finish(selected);
 		}
-		default: return ConstantU32(ctx.state, UINT32_MAX);
+		default: return finish(ConstantU32(ctx.state, UINT32_MAX));
 	}
 }
 
