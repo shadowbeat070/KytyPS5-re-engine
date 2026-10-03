@@ -1008,12 +1008,8 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			    state, ctx.Def(handle->Arg(0)), static_cast<uint32_t>(samplers.size()),
 			    TypeU32(state), [&](uint32_t ordinal) { return ConstantU32(state, samplers[ordinal]); });
 		}
-		if (layout.offset != NoImageComponent &&
-		    !offset_value.IsImmediate()) {
-			ctx.Fail(inst, "has a nonconstant sample texel offset");
-		}
-		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler, sampler_index);
-		const auto EmitSample = [&](uint32_t resource, uint32_t array_index) {
+		const auto sampler_id = LoadSamplerDescriptor(state, mem.sampler);
+		const auto EmitSample = [&](uint32_t resource) {
 			const auto& candidate = state.program.info.images[resource];
 			auto sample_operands = operands;
 			auto sample_operand_count = operand_count;
@@ -1042,7 +1038,106 @@ void EmitImage(ValueEmitContext& ctx, const IR::Inst& inst) {
 			state.builder.AddFunction(opcode, sample_operands);
 			return sample;
 		};
-		auto result = EmitImageAccess(ctx, inst, result_type, EmitSample);
+		if (image.indirect_root != mem.resource) {
+			const auto sample = EmitSample(mem.resource);
+			auto       result = sample;
+			if (!dref) {
+				result = UnpackImageTexel(ctx, mem, sample);
+			}
+			ctx.Define(inst, ResultVector(ctx, result, numeric_class, dref, mem));
+			return;
+		}
+		const auto* handle = image_arg.ResolveInstruction();
+		const auto* source = image.source < state.program.descriptor_sources.size()
+		                         ? &state.program.descriptor_sources[image.source]
+		                         : nullptr;
+		if (handle == nullptr || source == nullptr || !source->indirect_descriptor.has_value() ||
+		    handle->NumArgs() == 0u) {
+			ctx.Fail(inst, "has invalid indirect image key provenance");
+			return;
+		}
+		const auto key = ctx.Def(handle->Arg(0));
+		if (state.flattened_srt_variable == 0 || image.indirect_search_iterations == 0u ||
+		    image.indirect_resources.size() < 2u) {
+			ctx.Fail(inst, "has no indirect image runtime mapping");
+			return;
+		}
+		const auto LoadMapping = [&](uint32_t index) {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+			                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+			                          index);
+			const auto value = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+			return value;
+		};
+		const auto mapping  = ConstantU32(state, image.indirect_mapping_offset);
+		auto       low      = ConstantU32(state, 0u);
+		auto       high     = LoadMapping(mapping);
+		auto       selected = ConstantU32(state, 0u);
+		for (uint32_t iteration = 0; iteration < image.indirect_search_iterations;
+		     iteration++) {
+			const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
+			const auto mid    = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+			                           Binary(state, spv::OpIAdd, TypeU32(state), low, high),
+			                           ConstantU32(state, 1u));
+			const auto probe  = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), probe, active, mid,
+			                          ConstantU32(state, 0u));
+			const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), mapping,
+			                          Binary(state, spv::OpIAdd, TypeU32(state),
+			                                 Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+			                                        probe, ConstantU32(state, 1u)),
+			                                 ConstantU32(state, 1u)));
+			const auto mapped_key = LoadMapping(entry);
+			const auto candidate  = LoadMapping(
+			    Binary(state, spv::OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+			const auto equal = Binary(state, spv::OpIEqual, TypeBool(state), mapped_key, key);
+			const auto match = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, equal);
+			const auto next_selected = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_selected, match,
+			                          candidate, selected);
+			selected              = next_selected;
+			const auto less = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
+			const auto take_upper = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less);
+			const auto take_lower = Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
+			                               Unary(state, spv::OpLogicalNot, TypeBool(state), less));
+			const auto next_low   = state.builder.AllocateId();
+			state.builder.AddFunction(
+			    spv::OpSelect, TypeU32(state), next_low, take_upper,
+			    Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
+			low                  = next_low;
+			const auto next_high = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_high, take_lower, mid,
+			                          high);
+			high = next_high;
+		}
+		const auto            default_label = state.builder.AllocateId();
+		const auto            merge_label   = state.builder.AllocateId();
+		std::vector<uint32_t> labels(image.indirect_resources.size() - 1u);
+		std::vector<uint32_t> switch_words {spv::OpSwitch, selected, default_label};
+		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
+			labels[candidate - 1u] = state.builder.AllocateId();
+			switch_words.push_back(candidate);
+			switch_words.push_back(labels[candidate - 1u]);
+		}
+		state.builder.AddFunction(spv::OpSelectionMerge, merge_label,
+		                          spv::SelectionControlMaskNone);
+		state.builder.AddFunction(switch_words);
+		std::vector<uint32_t> phi_words {spv::OpPhi, result_type, state.builder.AllocateId()};
+		EmitLabel(state, default_label);
+		phi_words.push_back(EmitSample(image.indirect_resources[0]));
+		phi_words.push_back(default_label);
+		state.builder.AddFunction(spv::OpBranch, merge_label);
+		for (uint32_t candidate = 1; candidate < image.indirect_resources.size(); candidate++) {
+			EmitLabel(state, labels[candidate - 1u]);
+			phi_words.push_back(EmitSample(image.indirect_resources[candidate]));
+			phi_words.push_back(labels[candidate - 1u]);
+			state.builder.AddFunction(spv::OpBranch, merge_label);
+		}
+		EmitLabel(state, merge_label);
+		state.builder.AddFunction(phi_words);
+		auto result = phi_words[2];
 		if (!dref) {
 			result = UnpackImageTexel(ctx, mem, result);
 		}

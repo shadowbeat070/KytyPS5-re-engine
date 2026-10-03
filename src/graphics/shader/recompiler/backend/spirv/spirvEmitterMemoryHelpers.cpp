@@ -32,6 +32,45 @@ uint32_t EmitShaderDataDwordLoad(EmitterState& state, uint32_t dword_index) {
 	return ConstantU32(state, 0);
 }
 
+uint32_t EmitShaderDataDwordLoadDynamic(EmitterState& state, uint32_t dword_index) {
+	const auto Load = [&](uint32_t variable, uint32_t pointer_type, uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		const auto value   = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, pointer_type, pointer, variable,
+		                          ConstantU32(state, 0), index);
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	if (state.program.bindings.UsesPushData()) {
+		return Load(state.push_constant_variable, TypePushConstantElementPointer(state),
+		            EmitBinaryU32(state, spv::OpIAdd, dword_index,
+		                          ConstantU32(state, state.program.bindings.push_data_start_dword)));
+	}
+	if (state.shader_data_storage_variable != 0) {
+		return Load(state.shader_data_storage_variable, TypeStorageBufferElementPointer(state),
+		            dword_index);
+	}
+	return ConstantU32(state, 0);
+}
+
+uint32_t EmitDynamicMemoryByteOffset(EmitterState& state, uint32_t resource_index) {
+	if (state.program.bindings
+	        .descriptor_counts[static_cast<size_t>(IR::DescriptorBindingKind::Buffers)] == 0) {
+		return ConstantU32(state, 0);
+	}
+	const auto word_index = EmitBinaryU32(
+	    state, spv::OpIAdd, ConstantU32(state, state.program.bindings.memory_offset_dword),
+	    EmitBinaryU32(state, spv::OpShiftRightLogical, resource_index, ConstantU32(state, 2u)));
+	const auto word  = EmitShaderDataDwordLoadDynamic(state, word_index);
+	const auto shift = EmitBinaryU32(
+	    state, spv::OpShiftLeftLogical,
+	    EmitBinaryU32(state, spv::OpBitwiseAnd, resource_index, ConstantU32(state, 3u)),
+	    ConstantU32(state, 3u));
+	return EmitBinaryU32(state, spv::OpBitwiseAnd,
+	                     EmitBinaryU32(state, spv::OpShiftRightLogical, word, shift),
+	                     ConstantU32(state, 0xffu));
+}
+
 uint32_t EmitBinaryU32(EmitterState& state, spv::Op opcode, uint32_t lhs, uint32_t rhs) {
 	const auto ret = state.builder.AllocateId();
 	state.builder.AddFunction(opcode, TypeU32(state), ret, lhs, rhs);
@@ -51,16 +90,6 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 	};
 	const auto mapping = ConstantU32(state, mapping_offset);
 	const auto count = LoadMapping(mapping);
-	if (search_iterations == 0u) {
-		const auto index = Binary(state, spv::OpShiftRightLogical, TypeU32(state), key,
-		                          ConstantU32(state, 2u));
-		const auto valid = Binary(state, spv::OpULessThan, TypeBool(state), index, count);
-		const auto safe = Select(state, TypeU32(state), valid, index, ConstantU32(state, 0u));
-		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), safe,
-		                          ConstantU32(state, mapping_offset + 1u));
-		return Select(state, TypeU32(state), valid, LoadMapping(entry),
-		              ConstantU32(state, default_resource));
-	}
 	const auto entry_at = [&](uint32_t index) {
 		return Binary(state, spv::OpIAdd, TypeU32(state), mapping,
 		              Binary(state, spv::OpIAdd, TypeU32(state),
@@ -177,13 +206,24 @@ MemoryResourceAccess PrepareStorageBufferResourceAccess(EmitterState& state,
 	}
 	const auto array_index =
 	    state.program.info.buffers.at(mem.resource).descriptor_index;
+	// An indirect buffer table resolves one access against whichever candidate its key search
+	// picked, so the slot is an id rather than a literal. The index is only wave-uniform, which is
+	// what NonUniform states; the decoration on the index is placed where the index is computed.
+	const bool dynamic =
+	    state.dynamic_buffer_index != 0 && mem.resource == state.dynamic_buffer_resource;
 	MemoryResourceAccess access {
 	    .kind = mem.kind,
 	    .memory_access = mem.coherent ? spv::MemoryAccessVolatileMask : spv::MemoryAccessMaskNone};
 	access.object_pointer = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpAccessChain, buffer.pointer_type, access.object_pointer,
-	                          buffer.variable, ConstantU32(state, array_index));
-	access.byte_offset = state.memory_byte_offsets[array_index];
+	state.builder.AddFunction(
+	    spv::OpAccessChain, buffer.pointer_type, access.object_pointer, buffer.variable,
+	    dynamic ? state.dynamic_buffer_index : ConstantU32(state, array_index));
+	if (dynamic) {
+		state.builder.AddAnnotation(spv::OpDecorate, access.object_pointer,
+		                            spv::DecorationNonUniform);
+	}
+	access.byte_offset =
+	    dynamic ? state.dynamic_buffer_byte_offset : state.memory_byte_offsets[array_index];
 	access.length      = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpArrayLength, TypeU32(state), access.length,
 	                          access.object_pointer, 0);
@@ -224,15 +264,19 @@ MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::
 		case IR::ResourceKind::Buffer: {
 			// glc=1 takes the Coherent alias as whole dwords; glc=0 its element width's variable.
 			const auto coherent =
-			    CoherentBufferAccess(mem) && state.storage_buffer_coherent_variable != 0;
-			const auto bits = coherent || mem.kind != IR::ResourceKind::Buffer
-			                      ? 32u : StorageBufferElementBits(state.program, mem);
-			const auto variable = coherent      ? state.storage_buffer_coherent_variable
-			                      : bits == 8u  ? state.storage_buffer_u8_variable
-			                      : bits == 16u ? state.storage_buffer_u16_variable
-			                                    : state.storage_buffer_variable;
-			access = PrepareStorageBufferResourceAccess(
-			    state, mem, variable, TypeStorageBufferPointer(state, bits));
+			    CoherentBufferAccess(mem) && state.coherent_storage_buffer.variable != 0;
+			const auto bits   = coherent || mem.kind != IR::ResourceKind::Buffer
+			                        ? 32u
+			                        : IR::StorageBufferElementBits(state.program, mem);
+			auto* buffer = &state.storage_buffers[2];
+			if (coherent) {
+				buffer = &state.coherent_storage_buffer;
+			} else if (bits == 8u) {
+				buffer = &state.storage_buffers[0];
+			} else if (bits == 16u) {
+				buffer = &state.storage_buffers[1];
+			}
+			access = PrepareStorageBufferResourceAccess(state, mem, *buffer);
 			access.element_bits = bits;
 			access.coherent     = CoherentBufferAccess(mem);
 			return access;
@@ -744,6 +788,59 @@ uint32_t EmitDsSwizzleTargetLane(EmitterState& state, uint32_t subid, uint32_t c
 	                          ConstantU32(state, 0xffffffe0u));
 	state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), target, base, xored);
 	return target;
+}
+
+uint32_t EmitIndirectCandidateSearch(EmitterState& state, uint32_t mapping_offset,
+                                     uint32_t iterations, uint32_t key) {
+	const auto LoadMapping = [&](uint32_t index) {
+		const auto pointer = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
+		                          pointer, state.flattened_srt_variable, ConstantU32(state, 0),
+		                          index);
+		const auto value = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+		return value;
+	};
+	const auto mapping  = ConstantU32(state, mapping_offset);
+	auto       low      = ConstantU32(state, 0u);
+	auto       high     = LoadMapping(mapping);
+	auto       selected = ConstantU32(state, 0u);
+	for (uint32_t iteration = 0; iteration < iterations; iteration++) {
+		const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
+		const auto mid    = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+		                           Binary(state, spv::OpIAdd, TypeU32(state), low, high),
+		                           ConstantU32(state, 1u));
+		const auto probe  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), probe, active, mid,
+		                          ConstantU32(state, 0u));
+		const auto entry = Binary(state, spv::OpIAdd, TypeU32(state), mapping,
+		                          Binary(state, spv::OpIAdd, TypeU32(state),
+		                                 Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
+		                                        probe, ConstantU32(state, 1u)),
+		                                 ConstantU32(state, 1u)));
+		const auto mapped_key = LoadMapping(entry);
+		const auto candidate  = LoadMapping(
+		    Binary(state, spv::OpIAdd, TypeU32(state), entry, ConstantU32(state, 1u)));
+		const auto equal = Binary(state, spv::OpIEqual, TypeBool(state), mapped_key, key);
+		const auto match = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, equal);
+		const auto next_selected = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_selected, match, candidate,
+		                          selected);
+		selected              = next_selected;
+		const auto less = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
+		const auto take_upper = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less);
+		const auto take_lower = Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
+		                               Unary(state, spv::OpLogicalNot, TypeBool(state), less));
+		const auto next_low   = state.builder.AllocateId();
+		state.builder.AddFunction(
+		    spv::OpSelect, TypeU32(state), next_low, take_upper,
+		    Binary(state, spv::OpIAdd, TypeU32(state), mid, ConstantU32(state, 1u)), low);
+		low                  = next_low;
+		const auto next_high = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_high, take_lower, mid, high);
+		high = next_high;
+	}
+	return selected;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
