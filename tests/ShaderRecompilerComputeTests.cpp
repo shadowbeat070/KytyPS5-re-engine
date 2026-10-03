@@ -8144,6 +8144,32 @@ public:
           texture_cache.IsMetaCleared(base + metadata_b, 0),
           "BufferCache fill did not publish an exact-address metadata clear");
 
+      constexpr uint64_t switch_data = 0x12900;
+      constexpr uint64_t switch_stencil = 0x12a00;
+      constexpr uint64_t switch_meta = 0x13800;
+      auto switch_d32s8 = MakeMetadataDepth(switch_data, switch_meta);
+      switch_d32s8.info.pixel_format = vk::Format::eD32SfloatS8Uint;
+      switch_d32s8.info.stencil = {base + switch_stencil, 0x80};
+      switch_d32s8.info.htile_clear_mask = 0;
+      switch_d32s8.view_info.format = vk::Format::eD32SfloatS8Uint;
+      switch_d32s8.view_info.aspect =
+          vk::ImageAspectFlagBits::eDepth | vk::ImageAspectFlagBits::eStencil;
+      const auto switch_d32s8_id = texture_cache.FindImage(switch_d32s8);
+      (void)texture_cache.FindDepthTarget(switch_d32s8_id, switch_d32s8);
+      Require(name, "depth format switch setup",
+              !texture_cache.IsMetaCleared(base + switch_meta, 0) &&
+                  texture_cache.ClearMeta(base + switch_meta) &&
+                  texture_cache.IsMetaCleared(base + switch_meta, 0),
+              "the D32S8 binding did not register its HTile clear state");
+      auto switch_d32 = MakeMetadataDepth(switch_data, switch_meta);
+      switch_d32.info.htile_clear_mask = 0;
+      const auto switch_d32_id = texture_cache.FindImage(switch_d32);
+      (void)texture_cache.FindDepthTarget(switch_d32_id, switch_d32);
+      Require(name, "HTile clear survives a depth format switch",
+              switch_d32_id != switch_d32s8_id &&
+                  texture_cache.IsMetaCleared(base + switch_meta, 0),
+              "replacing the D32S8 image for a D32 binding dropped the pending HTile clear");
+
       // A view spans only up to its last bound layer; same slice size keeps the
       // widest footprint.
       constexpr uint64_t atlas_data = 0x12700;
