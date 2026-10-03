@@ -323,6 +323,7 @@ public:
 		EliminateDeadCode(m_program.blocks);
 		PlanIndirectDescriptors();
 		PlanIndirectBuffers();
+		DemoteRefusedTables();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (!Collect(inst)) {
@@ -2470,6 +2471,57 @@ private:
 		}
 	}
 
+	void DemoteRefusedTables() {
+		if (m_program.unfoldable_pcs.empty() || m_indirect_buffers.empty()) {
+			return;
+		}
+		for (auto* block: m_program.blocks) {
+			for (auto& inst: *block) {
+				if (BufferAccessOf(inst.GetOpcode()) == BufferAccess::None ||
+				    inst.NumArgs() == 0u ||
+				    std::ranges::find(m_program.unfoldable_pcs, inst.Flags<MemoryFlags>().pc) ==
+				        m_program.unfoldable_pcs.end()) {
+					continue;
+				}
+				const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+				if (const auto* plan = handle != nullptr ? FindIndirectBuffer(*handle) : nullptr;
+				    plan != nullptr) {
+					m_demoted_tables.insert(plan->source);
+				}
+			}
+		}
+	}
+
+	bool IsDemotedTable(const IndirectBufferPlan& plan) const {
+		return m_demoted_tables.contains(plan.source);
+	}
+
+	bool RejectFormattedDemotion(uint32_t pc) const {
+		return Reject(pc, "a refused buffer table's formatted access has no in-shader format "
+		                  "decode");
+	}
+
+	bool TakeDynamicBuffer(const Inst* root, const MemoryInfo& memory, uint32_t index,
+	                       BufferAccess buffer, uint32_t pc) {
+		if (root == nullptr || root->GetOpcode() != ValueOpcode::GetBufferResource) {
+			return false;
+		}
+		DescriptorSource descriptor;
+		MakeSource(*root, 4u, false, false, memory.resource * 4u, descriptor, pc);
+		if (!IsDynamicDescriptor(descriptor)) {
+			return false;
+		}
+		m_program.memory_info[index].dynamic_buffer = true;
+		m_info.uses_dma                             = true;
+		if (buffer != BufferAccess::Read) {
+			// The store-pointer helper is only emitted, and its writable set only published,
+			// when the program declares that it writes through DMA.
+			m_program.has_address_writes = true;
+			m_info.writes_dma            = true;
+		}
+		return true;
+	}
+
 	bool GetHandle(Value value, ValueOpcode expected, uint32_t width, uint32_t pc,
 	               uint32_t base_reg, Inst*& handle, uint32_t& source, bool sampler = false,
 	               bool sample_adjust = false) {
@@ -2750,23 +2802,14 @@ private:
 				}
 				auto*       root     = inst.Arg(0).Resolve().TryInstruction();
 				const auto* indirect = root != nullptr ? FindIndirectBuffer(*root) : nullptr;
-				if (indirect == nullptr) {
+				if (indirect == nullptr || IsDemotedTable(*indirect)) {
+					if (indirect != nullptr && (memory.formatted || memory.typed)) {
+						return RejectFormattedDemotion(flags.pc);
+					}
 					// 3. Any other descriptor sourced from memory: decode the V# with full addressing,
 					// reaching the stores, atomics, subword and formatted accesses 1 and 2 cannot.
-					if (root != nullptr && root->GetOpcode() == ValueOpcode::GetBufferResource) {
-						DescriptorSource descriptor;
-						MakeSource(*root, 4u, false, false, memory.resource * 4u, descriptor, flags.pc);
-						if (IsDynamicDescriptor(descriptor)) {
-							m_program.memory_info[flags.index].dynamic_buffer = true;
-							m_info.uses_dma                                   = true;
-							if (buffer != BufferAccess::Read) {
-								// The store-pointer helper is only emitted, and its writable set only
-								// published, when the program declares that it writes through DMA.
-								m_program.has_address_writes = true;
-								m_info.writes_dma            = true;
-							}
-							return true;
-						}
+					if (TakeDynamicBuffer(root, memory, flags.index, buffer, flags.pc)) {
+						return true;
 					}
 					if (indirect == nullptr && take_indirect_load()) {
 						return true;
@@ -2790,6 +2833,16 @@ private:
 				// entered with and left the evaluator to prove a fixpoint a cursor never reaches,
 				// so bind the table rather than the one record the first iteration selects.
 				if (const auto* planned = FindIndirectBuffer(*carried); planned != nullptr) {
+					if (IsDemotedTable(*planned)) {
+						if (memory.formatted || memory.typed) {
+							return RejectFormattedDemotion(flags.pc);
+						}
+						if (TakeDynamicBuffer(carried, memory, flags.index, buffer, flags.pc)) {
+							return true;
+						}
+						return Reject(flags.pc, "a refused buffer table's descriptor is not "
+						                        "sourced from memory");
+					}
 					handle = carried;
 					source = planned->source;
 					m_applied_indirect_buffers.insert(carried);
@@ -2938,6 +2991,7 @@ private:
 	bool                                       m_shader_writes = false;
 	std::vector<IndirectBufferPlan> m_indirect_buffers;
 	std::unordered_set<const Inst*> m_applied_indirect_buffers;
+	std::unordered_set<uint32_t>               m_demoted_tables;
 	// Why the last descriptor fold failed, kept only across the reclassification attempt that
 	// the failure hands off to.
 	std::string                     m_deferred_reject;

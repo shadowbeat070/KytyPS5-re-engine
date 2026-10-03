@@ -1487,6 +1487,7 @@ struct TestCase {
   std::optional<std::vector<u32>> expected_buffer_resources;
   // Lets specialization read `initial` too, as an indirect table's enumeration must.
   bool specialization_memory = false;
+  std::vector<u32> unfoldable_pcs;
   // Binds the one sampled image in every sampled binding, for shape arms no key reaches.
   bool shared_sampled_image = false;
 };
@@ -1763,6 +1764,7 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
   compute_info.host_subgroup_size = host_subgroup_size;
   options.input_info.compute = &compute_info;
   options.user_data = user_data;
+  options.unfoldable_pcs = test.unfoldable_pcs;
 
   if (test.has_compute_info) {
     options.wave_size = test.compute_info.wave_size;
@@ -1782,8 +1784,21 @@ CompiledShader CompileCase(const TestCase &test, u32 host_subgroup_size = 64) {
       .userdata = const_cast<std::vector<u32> *>(&test.initial),
       .read_specialization_memory = ReadTestMemory,
   };
-  const bool materialized = ShaderRecompiler::IR::MaterializeResources(
-      resource_plan, runtime, resources, specialization);
+  std::vector<uint32_t> learned_unfoldable;
+  bool materialized = ShaderRecompiler::IR::MaterializeResources(
+      resource_plan, runtime, resources, specialization, &learned_unfoldable);
+  if (!materialized && options.unfoldable_pcs.empty() && !learned_unfoldable.empty()) {
+    // The pipeline cache learns the refused tables and rebuilds with them demoted.
+    options.unfoldable_pcs = learned_unfoldable;
+    translated = ShaderRecompiler::TranslateProgram(test.code, options);
+    Require(test.name, "unfoldable translation", translated.status.ok,
+            "pc " + Hex(translated.status.pc) + ": " + translated.status.reason);
+    resource_plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    resources = {};
+    specialization = {};
+    materialized = ShaderRecompiler::IR::MaterializeResources(resource_plan, runtime,
+                                                              resources, specialization);
+  }
   Require(test.name, "resource materialization", materialized,
           "translated resources could not be materialized: " +
               std::string(ShaderRecompiler::IR::LastMaterializeFailure()));
@@ -30945,7 +30960,7 @@ TestCase DynamicBufferLoadStore() {
       static_cast<u32>(GuestBase),
       static_cast<u32>((GuestBase >> 32u) & 0xffffu),
       0x00010000u,
-      0u,
+      0x30020000u, // OOB_SELECT=3 (raw), DATA_FORMAT=32
       0x12345678u,
       0u,
       0u,
@@ -30957,7 +30972,7 @@ TestCase DynamicBufferLoadStore() {
       static_cast<u32>(GuestBase),
       static_cast<u32>((GuestBase >> 32u) & 0xffffu),
       0x00010000u,
-      0u,
+      0x30020000u,
       0x12345678u,
       0x12345679u,
       0x0000ab00u,
@@ -31143,7 +31158,7 @@ TestCase DynamicBufferStoreAddTid() {
   test.initial[0] = static_cast<u32>(GuestBase);
   test.initial[1] = static_cast<u32>((GuestBase >> 32u) & 0xffffu) | (4u << 16u); // stride = 4 bytes
   test.initial[2] = 32u; // num_records = 32
-  test.initial[3] = (1u << 23u); // add_tid = 1
+  test.initial[3] = (1u << 28u) | (0x20u << 12u) | (1u << 23u); // OOB_SELECT=1, add_tid
 
   test.expected = test.initial;
   for (u32 i = 0; i < 32; ++i) {
@@ -31197,7 +31212,7 @@ TestCase DynamicBufferLoadStoreSwizzle() {
   test.initial[0] = static_cast<u32>(GuestBase);
   test.initial[1] = static_cast<u32>((GuestBase >> 32u) & 0xffffu) | (16u << 16u) | (1u << 31u); // stride=16, swizzle=1
   test.initial[2] = 64u;
-  test.initial[3] = 0u; // index_stride enum = 0
+  test.initial[3] = 0x20u << 12u; // OOB_SELECT=0, index_stride enum = 0
   test.initial[41] = 0xdeadbeefu;
 
   test.expected = test.initial;
@@ -31352,6 +31367,262 @@ TestCase DynamicBufferAtomicOr64AndFMax() {
       O::S_ENDPGM,
   };
   test.required_spirv = {"OpAtomicOr", "OpAtomicCompareExchange"};
+  return test;
+}
+
+constexpr u32 RangeData(u32 dword) { return 0xa0005500u | (dword << 16u) | dword; }
+
+constexpr u32 RangeDescriptorWord3(u32 oob_select, u32 format = 0x20u) {
+  return (oob_select << 28u) | (format << 12u);
+}
+
+void AppendUnfoldableDescriptorAt(std::vector<u32> *code, u32 sgpr, u32 dword_base) {
+  for (u32 dword = 0; dword < 4; dword++) {
+    AppendVMovU32(code, 20, (dword_base + dword) * 4u);
+    AppendBufferLoadDword(code, sgpr + dword, 20);
+  }
+  for (u32 dword = 0; dword < 4; dword++) {
+    code->push_back(EncodeVop1(0x02, sgpr + dword, Vgpr(sgpr + dword)));
+  }
+}
+
+void AppendRangeAccess(std::vector<u32> *code, u32 opcode, u32 vdata, u32 srsrc, bool idxen,
+                       u32 index, u32 offset, bool glc = false, u32 soffset = 128) {
+  AppendVMovU32(code, 20, index);
+  AppendVMovU32(code, 21, offset);
+  code->push_back(EncodeMubuf0(opcode, 0, idxen, true, glc));
+  code->push_back(EncodeMubuf1(vdata, srsrc, idxen ? 20 : 21, soffset));
+}
+
+constexpr u32 RangeLoadUbyte   = 0x08u;
+constexpr u32 RangeLoadUshort  = 0x0au;
+constexpr u32 RangeLoadSbyte   = 0x09u;
+constexpr u32 RangeLoadDword   = 0x0cu;
+constexpr u32 RangeStoreByte   = 0x18u;
+constexpr u32 RangeStoreShort  = 0x1au;
+constexpr u32 RangeStoreDword  = 0x1cu;
+constexpr u32 RangeStoreDwordX2 = 0x1du;
+constexpr u32 RangeStoreDwordX4 = 0x1eu;
+constexpr u32 RangeAtomicAdd   = 0x32u;
+
+TestCase DynamicBufferRangeCheck(u32 oob_select) {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x00000001d0000000ull;
+  constexpr u32      DataDword = 16u;
+  constexpr u32      Result    = 112u;
+  const uint64_t     data_base = GuestBase + DataDword * 4u;
+
+  TestCase test;
+  test.initial = std::vector<u32>(128, 0);
+  for (u32 dword = DataDword; dword < Result; dword++) {
+    test.initial[dword] = RangeData(dword - DataDword);
+  }
+  test.expected = test.initial;
+  const auto descriptor = [&](u32 slot, u32 stride, u32 records, u32 word3) {
+    test.initial[slot + 0] = static_cast<u32>(data_base);
+    test.initial[slot + 1] = static_cast<u32>((data_base >> 32u) & 0xffffu) | (stride << 16u);
+    test.initial[slot + 2] = records;
+    test.initial[slot + 3] = word3;
+    std::copy_n(test.initial.begin() + slot, 4, test.expected.begin() + slot);
+  };
+  auto &expected = test.expected;
+  const auto data = [&](u32 dword) -> u32 & { return expected[DataDword + dword]; };
+
+  std::vector<u32> code;
+  AppendUnfoldableDescriptor(&code);
+  u32 result = Result;
+  const auto load = [&](u32 opcode, u32 srsrc, bool idxen, u32 index, u32 offset, u32 value,
+                        u32 soffset = 128) {
+    AppendRangeAccess(&code, opcode, 1, srsrc, idxen, index, offset, false, soffset);
+    AppendStoreVgpr(&code, 1, result);
+    expected[result++] = value;
+  };
+  const auto store = [&](u32 opcode, u32 srsrc, bool idxen, u32 index, u32 offset, u32 value) {
+    AppendVMovLiteral(&code, 2, value);
+    AppendRangeAccess(&code, opcode, 2, srsrc, idxen, index, offset);
+  };
+  const auto byte_of = [](u32 word, u32 byte) { return (word >> (byte * 8u)) & 0xffu; };
+
+  switch (oob_select) {
+    case 3: {
+      descriptor(0, 0, 24, RangeDescriptorWord3(3));
+      descriptor(8, 0, 24, RangeDescriptorWord3(3, 0)); // a zero DATA_FORMAT
+      AppendUnfoldableDescriptorAt(&code, 8, 8);
+      AppendSMovLiteral(&code, 40, 8);
+      load(RangeLoadDword, 1, false, 0, 20, data(5));
+      load(RangeLoadDword, 1, false, 0, 24, 0);
+      load(RangeLoadUbyte, 1, false, 0, 23, byte_of(data(5), 3));
+      load(RangeLoadUbyte, 1, false, 0, 24, 0);
+      load(RangeLoadUshort, 1, false, 0, 22, data(5) >> 16u);
+      load(RangeLoadSbyte, 1, false, 0, 25, 0);
+      load(RangeLoadDword, 1, false, 0, 12, data(5), 40);
+      load(RangeLoadDword, 1, false, 0, 16, 0, 40);
+      load(RangeLoadDword, 2, false, 0, 0, 0);
+      store(RangeStoreDword, 1, false, 0, 24, 0x11111111u);
+      store(RangeStoreDword, 1, false, 0, 20, 0x22222222u);
+      data(5) = 0x22222222u;
+      store(RangeStoreByte, 1, false, 0, 24, 0x5au);
+      store(RangeStoreByte, 1, false, 0, 4, 0x5au);
+      data(1) = (data(1) & ~0xffu) | 0x5au;
+      store(RangeStoreShort, 1, false, 0, 23, 0x6b6bu);
+      store(RangeStoreDword, 2, false, 0, 8, 0x33333333u);
+      AppendVMovU32(&code, 1, 7);
+      AppendRangeAccess(&code, RangeAtomicAdd, 1, 1, false, 0, 0, true);
+      AppendStoreVgpr(&code, 1, result);
+      expected[result++] = data(0);
+      data(0) += 7u;
+      AppendVMovU32(&code, 1, 7);
+      AppendRangeAccess(&code, RangeAtomicAdd, 1, 1, false, 0, 24, true);
+      AppendStoreVgpr(&code, 1, result);
+      expected[result++] = 0u;
+      for (u32 component = 0; component < 4; component++) {
+        AppendVMovLiteral(&code, 10 + component, 0xc0c0c000u + component);
+      }
+      AppendRangeAccess(&code, RangeStoreDwordX4, 10, 1, false, 0, 16);
+      data(4) = 0xc0c0c000u;
+      data(5) = 0xc0c0c001u;
+      break;
+    }
+    case 2: {
+      descriptor(0, 0, 4, RangeDescriptorWord3(2));
+      descriptor(8, 0, 0, RangeDescriptorWord3(2));
+      AppendUnfoldableDescriptorAt(&code, 8, 8);
+      load(RangeLoadDword, 1, false, 0, 40, data(10));
+      load(RangeLoadUbyte, 1, false, 0, 41, byte_of(data(10), 1));
+      load(RangeLoadDword, 2, false, 0, 0, 0);
+      store(RangeStoreDword, 1, false, 0, 44, 0x44444444u);
+      data(11) = 0x44444444u;
+      store(RangeStoreDword, 2, false, 0, 4, 0x55555555u);
+      AppendVMovU32(&code, 1, 7);
+      AppendRangeAccess(&code, RangeAtomicAdd, 1, 2, false, 0, 8, true);
+      AppendStoreVgpr(&code, 1, result);
+      expected[result++] = 0u;
+      break;
+    }
+    case 1: {
+      descriptor(0, 8, 3, RangeDescriptorWord3(1));
+      load(RangeLoadDword, 1, true, 2, 4, data(5));
+      load(RangeLoadDword, 1, true, 3, 0, 0);
+      load(RangeLoadDword, 1, true, 1, 12, data(5));
+      load(RangeLoadUbyte, 1, true, 2, 7, byte_of(data(5), 3));
+      load(RangeLoadUbyte, 1, true, 3, 0, 0);
+      store(RangeStoreDword, 1, true, 3, 0, 0x66666666u);
+      store(RangeStoreDword, 1, true, 0, 4, 0x77777777u);
+      data(1) = 0x77777777u;
+      AppendVMovU32(&code, 1, 7);
+      AppendRangeAccess(&code, RangeAtomicAdd, 1, 1, true, 3, 0, true);
+      AppendStoreVgpr(&code, 1, result);
+      expected[result++] = 0u;
+      break;
+    }
+    default: {
+      descriptor(0, 8, 3, RangeDescriptorWord3(0));
+      load(RangeLoadDword, 1, true, 2, 4, data(5));
+      load(RangeLoadDword, 1, true, 1, 8, 0);
+      load(RangeLoadDword, 1, true, 3, 0, 0);
+      load(RangeLoadUbyte, 1, true, 2, 7, byte_of(data(5), 3));
+      load(RangeLoadUbyte, 1, true, 2, 8, 0);
+      store(RangeStoreDword, 1, true, 1, 8, 0x88888888u);
+      store(RangeStoreDword, 1, true, 0, 4, 0x99999999u);
+      data(1) = 0x99999999u;
+      AppendVMovU32(&code, 1, 7);
+      AppendRangeAccess(&code, RangeAtomicAdd, 1, 1, true, 1, 8, true);
+      AppendStoreVgpr(&code, 1, result);
+      expected[result++] = 0u;
+      AppendVMovLiteral(&code, 10, 0xd0d0d000u);
+      AppendVMovLiteral(&code, 11, 0xd0d0d001u);
+      AppendRangeAccess(&code, RangeStoreDwordX2, 10, 1, true, 2, 4);
+      data(5) = 0xd0d0d000u;
+      break;
+    }
+  }
+  AppendEnd(&code);
+
+  static const char *const names[] = {
+      "DynamicBufferRangeCheckStructuredOffset", "DynamicBufferRangeCheckStructured",
+      "DynamicBufferRangeCheckDisabled", "DynamicBufferRangeCheckRaw"};
+  test.name = names[oob_select & 3u];
+  test.code = std::move(code);
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_bda_fault_word0 = 0u;
+  test.opcodes = {O::BUFFER_LOAD_DWORD, O::V_READFIRSTLANE_B32, O::V_MOV_B32, O::S_ENDPGM};
+  return test;
+}
+
+TestCase DynamicBufferCarriedWideLoad(u32 variant) {
+  using O = ShaderOpcode;
+
+  constexpr uint64_t GuestBase = 0x00000001e0000000ull;
+  constexpr u32      DataDword = 16u;
+  constexpr u32      Result    = 112u;
+  const uint64_t     data_base = GuestBase + DataDword * 4u;
+
+  TestCase test;
+  test.initial = std::vector<u32>(128, 0);
+  for (u32 dword = DataDword; dword < Result; dword++) {
+    test.initial[dword] = RangeData(dword - DataDword);
+  }
+  u32  stride = 0, records = 24, word3 = RangeDescriptorWord3(3), index = 0, offset = 16;
+  bool idxen = false, swizzle = false;
+  std::array<u32, 4> values {};
+  const auto data = [&](u32 dword) { return test.initial[DataDword + dword]; };
+  switch (variant) {
+    case 0:
+      values = {data(4), data(5), 0, 0};
+      break;
+    case 1:
+      stride = 8, records = 3, word3 = RangeDescriptorWord3(0), index = 2, offset = 0, idxen = true;
+      values = {data(4), data(5), 0, 0};
+      break;
+    default:
+      stride = 16, records = 64, word3 = RangeDescriptorWord3(1), index = 9, offset = 0,
+      idxen = true, swizzle = true;
+      values = {data(33), data(41), data(49), data(57)};
+      break;
+  }
+  test.initial[4] = static_cast<u32>(data_base);
+  test.initial[5] = static_cast<u32>((data_base >> 32u) & 0xffffu) | (stride << 16u) |
+                    (swizzle ? (1u << 31u) : 0u);
+  test.initial[6] = records;
+  test.initial[7] = word3;
+  test.expected = test.initial;
+  for (u32 component = 0; component < 4; component++) {
+    test.expected[Result + component] = values[component];
+  }
+
+  std::vector<u32> code;
+  AppendVMovU32(&code, 20, index);
+  AppendVMovU32(&code, 21, offset);
+  code.push_back(EncodeSMovB32(10, InlineU32(0)));
+  const auto loop = static_cast<u32>(code.size());
+  code.push_back(EncodeSop2(0x26, 11, 10, 255u)); // s_mul_i32 s11, s10, 16
+  code.push_back(16u);
+  code.push_back(EncodeSmem0(0x0a, 4, 0)); // s_buffer_load_dwordx4 s[4:7], s[0:3], s11 + 16
+  code.push_back(EncodeSmem1(16, 11));
+  const auto load_pc = static_cast<u32>(code.size()) * 4u;
+  code.push_back(EncodeMubuf0(0x0eu, 0, idxen, true));
+  code.push_back(EncodeMubuf1(1, 1, idxen ? 20 : 21));
+  code.push_back(EncodeSop2(0x02, 10, 10, InlineU32(1))); // s_add_i32 s10, s10, 1
+  code.push_back(EncodeSopc(0x0a, 10, InlineU32(1)));     // s_cmp_lt_u32 s10, 1
+  code.push_back(EncodeSopp(0x05, (loop - static_cast<u32>(code.size()) - 1u) & 0xffffu));
+  for (u32 component = 0; component < 4; component++) {
+    AppendStoreVgpr(&code, 1 + component, Result + component);
+  }
+  AppendEnd(&code);
+
+  static const char *const names[] = {"DynamicBufferCarriedWideLoadRaw",
+                                      "DynamicBufferCarriedWideLoadStructuredOffset",
+                                      "DynamicBufferCarriedWideLoadSwizzled"};
+  test.name = names[variant > 2u ? 2u : variant];
+  test.code = std::move(code);
+  test.unfoldable_pcs = {load_pc};
+  test.specialization_memory = true;
+  test.bda_mappings = {{GuestBase, 0}};
+  test.expected_bda_fault_word0 = 0u;
+  test.required_spirv = {"OpConvertUToPtr"};
+  test.opcodes = {O::S_MOV_B32, O::S_MUL_I32, O::S_BUFFER_LOAD_DWORDX4, O::BUFFER_LOAD_DWORDX4,
+                  O::S_ADD_I32, O::S_CMP_LT_U32, O::S_CBRANCH_SCC1, O::S_ENDPGM};
   return test;
 }
 
@@ -40089,6 +40360,12 @@ std::vector<TestCase> MakeCases() {
   AddCase(DynamicBufferLoadStoreSwizzle);
   AddCase(DynamicBufferScalarLoad);
   AddCase(DynamicBufferAtomicOr64AndFMax);
+  for (u32 oob_select = 0; oob_select < 4; oob_select++) {
+    AddMade(DynamicBufferRangeCheck(oob_select));
+  }
+  for (u32 variant = 0; variant < 3; variant++) {
+    AddMade(DynamicBufferCarriedWideLoad(variant));
+  }
   AddCase(BufferLoadDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferStoreDwordOffenIdxenUsesVaddrPlusOneOffset);
   AddCase(BufferLoadDwordNoAddressFlagsIgnoresVaddr);

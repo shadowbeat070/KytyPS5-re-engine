@@ -355,7 +355,8 @@ MakeIndirectImageFixture(bool malformed, uint32_t material_immediate = 4,
 }
 
 std::unique_ptr<Fixture> MakeIndirectBufferFixture(uint32_t record_stride,
-                                                   bool broken_offset) {
+                                                   bool broken_offset,
+                                                   bool formatted = false) {
   auto fixture = std::make_unique<Fixture>();
   std::array<Value, 4> heap_words;
   for (uint32_t dword = 0; dword < 4; dword++) {
@@ -388,6 +389,7 @@ std::unique_ptr<Fixture> MakeIndirectBufferFixture(uint32_t record_stride,
   const auto table = fixture->Buffer(table_words, 0x0270);
   MemoryInfo load;
   load.kind = ResourceKind::Buffer;
+  load.formatted = formatted;
   const auto value =
       fixture->Emit(ValueOpcode::LoadBufferU32,
                     {table, Value(0u), Value(0u), Value(0u), Value(true)},
@@ -504,6 +506,113 @@ void TestIndirectBufferMaterialization() {
       [](const auto &memory) { return memory.dynamic_buffer; });
   Check(dynamic,
         "a non-consecutive table read was accepted without the dynamic mark");
+}
+
+void TestRefusedIndirectBufferTableDemotes() {
+  constexpr uint32_t kStride = 48u;
+  constexpr uint32_t kRecords = ShaderInfo::MaxDenseBuffers + 2u;
+  auto fixture = MakeIndirectBufferFixture(kStride, false);
+  fixture->PlanAndTrack();
+  auto resource_plan = ExtractResourcePlan(fixture->program);
+  Check(fixture->program.info.buffers.size() == 2 &&
+            fixture->program.descriptor_sources[fixture->program.info.buffers[1].source]
+                .indirect_buffer.has_value(),
+        "the table fixture was not recognized as a table");
+  const auto table_pc = fixture->program.info.buffers[1].first_use_pc;
+
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, kRecords * kStride, 0u};
+  LinearTestMemory memory;
+  const auto word = [&](uint64_t address) { return (address - memory.base) / 4u; };
+  for (uint32_t record = 0; record < kRecords; record++) {
+    const std::array<uint32_t, 4> descriptor{0x4000u + record * 0x100u, 0u, 64u,
+                                             Libs::Graphics::DstSel(4, 5, 6, 7)};
+    for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+      memory.words[word(0x1000u + record * kStride + 8u) + dword] = descriptor[dword];
+    }
+  }
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization),
+        "a table past the dense buffer limit was held");
+  for (uint32_t pass = 0; pass < 2u; pass++) {
+    std::vector<uint32_t> refused;
+    Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization, &refused) &&
+              refused == std::vector<uint32_t>{table_pc},
+          "a refused table was not named by its first use");
+  }
+
+  user_data[1] = (kStride + 8u) << 16u;
+  std::vector<uint32_t> foreign;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization, &foreign) &&
+            foreign == std::vector<uint32_t>{table_pc},
+        "a table with a foreign stride was not named");
+  user_data[1] = 0u;
+
+  memory.fail_address = 0x1000u + 8u;
+  std::vector<uint32_t> transient;
+  Check(!MaterializeResources(resource_plan, runtime, snapshot, specialization, &transient) &&
+            transient.empty(),
+        "a failed table read was taken for a refusal");
+  memory.fail_address = UINT64_MAX;
+
+  auto demoted = MakeIndirectBufferFixture(kStride, false);
+  demoted->program.unfoldable_pcs = {table_pc};
+  demoted->PlanAndTrack();
+  Check(demoted->program.info.buffers.size() == 1 &&
+            !demoted->program.descriptor_sources[demoted->program.info.buffers[0].source]
+                 .indirect_buffer.has_value(),
+        "the refused table is still bound as a table");
+  Check(std::ranges::count_if(demoted->program.memory_info,
+                              [](const auto &memory_info) {
+                                return memory_info.dynamic_buffer;
+                              }) == 1 &&
+            demoted->program.info.uses_dma && !demoted->program.info.writes_dma,
+        "the refused table's access was not moved onto the in-shader decode");
+  const auto handle = std::ranges::find_if(*demoted->block, [](const Inst &inst) {
+    return inst.GetOpcode() == ValueOpcode::GetBufferResource &&
+           inst.Arg(0).Resolve().TryInstruction() != nullptr &&
+           inst.Arg(0).Resolve().TryInstruction()->GetOpcode() == ValueOpcode::ReadConstBuffer;
+  });
+  Check(handle != demoted->block->end(),
+        "the decoded descriptor no longer reads the selected record's first dword");
+  auto demoted_plan = ExtractResourcePlan(demoted->program);
+  std::vector<uint32_t> none;
+  Check(MaterializeResources(demoted_plan, runtime, snapshot, specialization, &none) &&
+            none.empty(),
+        "the re-translation with the table decoded in the shader did not materialize");
+
+  auto unrelated = MakeIndirectBufferFixture(kStride, false);
+  unrelated->program.unfoldable_pcs = {0x0264u};
+  unrelated->PlanAndTrack();
+  Check(unrelated->program.info.buffers.size() == 2 &&
+            unrelated->program.descriptor_sources[unrelated->program.info.buffers[1].source]
+                .indirect_buffer.has_value() &&
+            std::ranges::none_of(unrelated->program.memory_info,
+                                 [](const auto &memory_info) {
+                                   return memory_info.dynamic_buffer;
+                                 }),
+        "a pc that names no table moved one");
+
+  auto formatted = MakeIndirectBufferFixture(kStride, false, true);
+  formatted->PlanAndTrack();
+  Check(formatted->program.info.buffers.size() == 2,
+        "a formatted access through a table was not bound as a table");
+  auto formatted_demoted = MakeIndirectBufferFixture(kStride, false, true);
+  formatted_demoted->program.unfoldable_pcs = {table_pc};
+  const auto formatted_status = formatted_demoted->TryPlanAndTrack();
+  // A formatted X load decodes its format in the shader; any other formatted access is refused.
+  const bool format_decoded =
+      formatted_status.ok &&
+      std::ranges::any_of(formatted_demoted->program.memory_info, [](const auto &memory_info) {
+        return memory_info.kind == ResourceKind::IndirectBuffer && memory_info.formatted;
+      });
+  Check(format_decoded ||
+            (!formatted_status.ok &&
+             formatted_status.reason.find("formatted access") != std::string::npos),
+        "a formatted access through a refused table was decoded as raw dwords");
 }
 
 void TestInvariantIndirectImageMaterialization() {
@@ -3603,15 +3712,26 @@ void TestBoundedRelativeRegisterWrites() {
     fixture.Emit(ValueOpcode::StoreBufferU32,
         {handle, Value(0u), Value(0u), Value(0u), Value(1u), Value(true)},
         fixture.AddMemory(memory, 0x3e8), exit);
-    if (variant != Variant::Bounded) {
-      CheckFatal([&] { fixture.PlanAndTrack(); }, "not a valid runtime value",
-                 "relative register proof discarded a possible loop clobber");
-      continue;
-    }
-    fixture.PlanAndTrack();
     const std::array<uint32_t, 3> user_data{0x1000u, 0u, 72u};
     SrtRuntime runtime{.user_data = user_data};
     DescriptorValue descriptor;
+    if (variant != Variant::Bounded) {
+      // A possible clobber must not reach a host descriptor: tracking refuses it, the store
+      // decodes its V# in the shader, or the descriptor never evaluates.
+      const auto status = fixture.TryPlanAndTrack();
+      Check(!status.ok
+                ? status.reason.find("not a valid runtime value") != std::string::npos
+                : std::ranges::any_of(fixture.program.memory_info,
+                                      [](const auto &memory_info) {
+                                        return memory_info.dynamic_buffer;
+                                      }) ||
+                      !SrtWalker(fixture.program, runtime)
+                           .EvaluateDescriptor(fixture.program.info.buffers[0].source,
+                                               descriptor),
+            "relative register proof discarded a possible loop clobber");
+      continue;
+    }
+    fixture.PlanAndTrack();
     Check(SrtWalker(fixture.program, runtime).EvaluateDescriptor(
               fixture.program.info.buffers[0].source, descriptor) &&
               descriptor.dwords[2] == 72u,
@@ -5460,6 +5580,7 @@ int main() {
     Run("image descriptor fields", TestImageDescriptorFields);
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("indirect buffer table", TestIndirectBufferMaterialization);
+    Run("refused buffer table demotes", TestRefusedIndirectBufferTableDemotes);
     Run("decoded buffer control flow", TestDecodedBufferControlFlow);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

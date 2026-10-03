@@ -882,8 +882,9 @@ struct PipelineCache::ProgramCache {
 			// Call unconditionally: EXIT_IF drops its argument under KYTY_FINAL.
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
-			        entry->second.specialization)) {
+			        entry->second.specialization, &reported_unfoldable)) {
 				ReportUnmaterialized(stage, params.hash);
+				Learn(proven, reported_unfoldable);
 				return {};
 			}
 			KYTY_PROFILER_BLOCK("ProgramCache permutation search");
@@ -983,8 +984,9 @@ struct PipelineCache::ProgramCache {
 			// draws take the cheap cached path instead of re-translating the shader every time.
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
-			        entry->second.specialization)) {
+			        entry->second.specialization, &reported_unfoldable)) {
 				ReportUnmaterialized(stage, params.hash);
+				Learn(proven, reported_unfoldable);
 				return {};
 			}
 		}

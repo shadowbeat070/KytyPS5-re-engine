@@ -152,11 +152,23 @@ TestCompileResult RecompileForTest(
       .userdata = read_memory_data,
       .read_specialization_memory = ReadHostTestMemory,
   };
-  Check(ShaderRecompiler::IR::MaterializeResources(
-            plan, runtime, resources, specialization),
-        "test shader resources did not materialize");
+  std::vector<uint32_t> learned_unfoldable;
+  bool materialized = ShaderRecompiler::IR::MaterializeResources(
+      plan, runtime, resources, specialization, &learned_unfoldable);
+  auto relearned = options;
+  if (!materialized && options.unfoldable_pcs.empty() && !learned_unfoldable.empty()) {
+    // The pipeline cache learns the refused tables and rebuilds with them demoted.
+    relearned.unfoldable_pcs = learned_unfoldable;
+    translated = ShaderRecompiler::TranslateProgram(code, relearned);
+    plan = ShaderRecompiler::IR::ExtractResourcePlan(translated.program);
+    resources = {};
+    specialization = {};
+    materialized = ShaderRecompiler::IR::MaterializeResources(plan, runtime, resources,
+                                                              specialization);
+  }
+  Check(materialized, "test shader resources did not materialize");
   auto compiled = ShaderRecompiler::CompileProgram(
-      std::move(translated), options, specialization, push_data_start_dword);
+      std::move(translated), relearned, specialization, push_data_start_dword);
   return {std::move(compiled.spirv), std::move(compiled.decoded_dump),
           std::move(compiled.ir_dump), std::move(compiled.program),
           std::move(resources)};
@@ -9405,6 +9417,16 @@ void TestBoundedMaterialBufferStores(bool scalar_key) {
     return ShaderRecompiler::IR::MaterializeResources(plan, runtime, snapshot, specialization);
   };
   Check(materialize(), "bounded material range failed to materialize");
+  if (std::ranges::any_of(translated.program.memory_info,
+                          [](const auto &memory) { return memory.dynamic_buffer; })) {
+    // The stores decode the selected V# in the shader: no host table to inspect, but the
+    // module still has to compile and validate.
+    auto dynamic = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization, 0u);
+    CheckSpirvBinaryValidates(dynamic.spirv);
+    return;
+  }
+  // The buffer table binds every valid record of the descriptor table and the store selects
+  // among them at runtime, so the material batch's bounds and type are not consulted on the host.
   const auto& buffers = specialization.buffers;
   const auto root = std::ranges::find_if(buffers, [](const auto& resource) {
     return resource.indirect_root != ShaderRecompiler::IR::BufferResource::NoIndirectBuffer;

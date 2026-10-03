@@ -56,7 +56,8 @@ ResourcePlan ExtractResourcePlan(const Program& program);
 std::string_view LastMaterializeFailure();
 
 bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime,
-                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization);
+                          ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
+                          std::vector<uint32_t>* refused_tables = nullptr);
 
 // Applies an already-derived specialization to native IR before layout and emission.
 // Names the first field two specializations differ in, or nullptr when they match. Reporting
