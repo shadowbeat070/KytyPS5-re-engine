@@ -96,6 +96,27 @@ enum class CollectorVerdict : uint32_t {
 	return CollectorVerdict::Evict;
 }
 
+inline constexpr uint64_t ReleaseMinIdleFrames       = 8;
+inline constexpr uint64_t ReleaseMinIdleFramesOver   = 2;
+inline constexpr uint64_t EvictMinIdleFrames         = 120;
+inline constexpr uint64_t EvictMinIdleFramesCritical = 30;
+inline constexpr uint64_t EvictBackoffFrames         = 600;
+inline constexpr uint32_t MaxEvictionsPerCollection  = 2;
+
+[[nodiscard]] constexpr bool CollectionAllowed(CollectorVerdict verdict, uint64_t current_frame,
+                                               uint64_t last_used_frame, uint64_t backoff_until,
+                                               bool critical, bool over_budget = false) noexcept {
+	const uint64_t idle =
+	    current_frame - (last_used_frame < current_frame ? last_used_frame : current_frame);
+	if (verdict == CollectorVerdict::Free) {
+		return idle >= (over_budget ? ReleaseMinIdleFramesOver : ReleaseMinIdleFrames);
+	}
+	if (verdict != CollectorVerdict::Evict || current_frame < backoff_until) {
+		return false;
+	}
+	return idle >= (critical ? EvictMinIdleFramesCritical : EvictMinIdleFrames);
+}
+
 // The emergency pass runs part-way through building a draw, so it may only release images guest
 // memory can already reproduce - never an eviction. `frame_abandoned` is the interlock that keeps
 // it from freeing an image whose id its own caller is still holding.
