@@ -1045,7 +1045,8 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 			const auto descriptor =
 			    DecodeNativeDescriptor<ShaderBufferResource>(snapshot.buffers[resource]);
 			const auto address = descriptor.Base48();
-			auto       size    = descriptor.GetSize();
+			// Sub-dword accesses are checked as whole dwords; keep a ragged tail readable.
+			auto size = Common::AlignUp(descriptor.GetSize(), sizeof(uint32_t));
 			if (address == 0 || size == 0) {
 				source = {};
 				continue;
