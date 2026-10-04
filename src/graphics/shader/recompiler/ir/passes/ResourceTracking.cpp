@@ -443,6 +443,11 @@ private:
 		Value    key;
 	};
 
+	struct MemoryAccessors {
+		uint32_t    count = 0;
+		const Inst* only  = nullptr;
+	};
+
 	// An emulator invariant: the IR reached tracking in a shape this pass must never see.
 	[[noreturn]] void Fail(uint32_t pc, const std::string& reason) const {
 		const auto message =
@@ -1125,14 +1130,20 @@ private:
 		           : nullptr;
 	}
 
+	static bool IsMemoryAccess(ValueOpcode op) {
+		return BufferAccessOf(op) != BufferAccess::None ||
+		       AddressOpcodeInfoOf(op).access != AddressAccess::None ||
+		       ImageOpcodeInfoOf(op).access != ImageAccess::None;
+	}
+
 	bool MemoryIndexBelongsTo(uint32_t index, const Inst& owner) const {
+		if (!m_memory_accessors.empty()) {
+			const auto& accessors = m_memory_accessors[index];
+			return accessors.count == 0u || (accessors.count == 1u && accessors.only == &owner);
+		}
 		for (const auto* block: m_program.blocks) {
 			for (const auto& inst: *block) {
-				const auto op = inst.GetOpcode();
-				if ((BufferAccessOf(op) == BufferAccess::None &&
-				     AddressOpcodeInfoOf(op).access == AddressAccess::None &&
-				     ImageOpcodeInfoOf(op).access == ImageAccess::None) ||
-				    &inst == &owner) {
+				if (!IsMemoryAccess(inst.GetOpcode()) || &inst == &owner) {
 					continue;
 				}
 				if (inst.Flags<MemoryFlags>().index == index) {
@@ -1141,6 +1152,23 @@ private:
 			}
 		}
 		return true;
+	}
+
+	// Image planning neither adds nor renumbers memory accesses, so this holds while it runs.
+	void IndexMemoryAccessors() {
+		m_memory_accessors.assign(m_program.memory_info.size(), {});
+		for (const auto* block: m_program.blocks) {
+			for (const auto& inst: *block) {
+				if (!IsMemoryAccess(inst.GetOpcode())) {
+					continue;
+				}
+				const auto index = inst.Flags<MemoryFlags>().index;
+				if (index < m_memory_accessors.size()) {
+					m_memory_accessors[index].count++;
+					m_memory_accessors[index].only = &inst;
+				}
+			}
+		}
 	}
 
 	bool MakeRuntimeTableSource(const Inst& read, DescriptorSource& descriptor) {
@@ -2428,6 +2456,7 @@ private:
 	}
 
 	void PlanIndirectDescriptors() {
+		IndexMemoryAccessors();
 		for (auto* block: m_program.blocks) {
 			for (auto& inst: *block) {
 				if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
@@ -2444,6 +2473,7 @@ private:
 				}
 			}
 		}
+		m_memory_accessors.clear();
 	}
 
 	// Recognizes a buffer V# assembled from four consecutive scalar reads of one descriptor table
@@ -3088,7 +3118,8 @@ private:
 	std::vector<DescriptorSource>              m_sources;
 	std::vector<HandlePatch>                   m_handle_patches;
 	std::vector<MemoryPatch>                   m_memory_patches;
-	std::vector<IndirectDescriptorPlan>             m_indirect_descriptors;
+	std::vector<MemoryAccessors>               m_memory_accessors;
+	std::vector<IndirectDescriptorPlan>        m_indirect_descriptors;
 	std::vector<std::pair<const Inst*, Value>> m_descriptor_selections;
 	bool                                       m_shader_writes = false;
 	std::vector<IndirectBufferPlan>            m_indirect_buffers;
