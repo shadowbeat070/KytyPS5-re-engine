@@ -42,7 +42,7 @@ struct SrtRuntime {
 	SrtBlockReader            read_specialization_block  = nullptr;
 	SrtBlockHasher            hash_specialization_block  = nullptr;
 	// Reads a branch condition's memory without draining the GPU; a refusal visits both arms.
-	SrtMemoryReader           read_condition_memory      = nullptr;
+	SrtMemoryReader read_condition_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 };
 
@@ -85,9 +85,9 @@ struct RuntimeValueFailure {
 	// what separates "two spellings of one descriptor" from "two genuinely different buffers".
 	// Void stands for a leaf with no instruction behind it, which for a descriptor dword is an
 	// immediate.
-	ValueOpcode        entry_opcode      = ValueOpcode::Void;
-	ValueOpcode        other_opcode      = ValueOpcode::Void;
-	bool               has_entry_opcodes = false;
+	ValueOpcode entry_opcode      = ValueOpcode::Void;
+	ValueOpcode other_opcode      = ValueOpcode::Void;
+	bool        has_entry_opcodes = false;
 };
 
 [[nodiscard]] std::string_view RuntimeValueRejectName(RuntimeValueReject reason);
@@ -144,14 +144,14 @@ struct FlatRefreshFailure {
 	bool                value_is_expressible = false;
 	// The guest address the walk could not read, and why - asked for after the fact, so it can
 	// legitimately answer that the range reads back now.
-	uint64_t            read_address     = 0;
-	bool                has_read_address = false;
-	const char*         read_refusal     = nullptr;
-	RawReadReject       raw_read         = RawReadReject::None;
+	uint64_t            read_address      = 0;
+	bool                has_read_address  = false;
+	const char*         read_refusal      = nullptr;
+	RawReadReject       raw_read          = RawReadReject::None;
 	ValueOpcode         first_refusal     = ValueOpcode::Void;
 	bool                has_first_refusal = false;
 	PhiReject           phi               = PhiReject::None;
-	const char*         raw_read_operand = nullptr;
+	const char*         raw_read_operand  = nullptr;
 	RuntimeValueFailure raw_read_operand_failure;
 };
 
@@ -166,7 +166,6 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
 uint32_t CurrentSrtReadSlot();
-
 
 // One pass of the per-lane sweep a readfirstlane runs. `dependent` stays clear for an operand
 // that never asks for the lane, which is every shader that does not go through the mask model,
@@ -245,15 +244,15 @@ public:
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
-	static float Float32(uint64_t bits);
-	bool EvaluateWide(Value value, uint64_t& result);
-	bool Arg(const Inst& inst, size_t index, uint64_t& result);
-	bool EvaluatePhi(const Inst& inst, uint64_t& result);
-	bool EvaluateExtract(const Inst& inst, uint64_t& result);
-	bool EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result);
-	bool EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes = 0u);
-	bool EvaluateInst(const Inst& inst, uint64_t& result);
-	bool EvaluateInstRule(const Inst& inst, uint64_t& result);
+	static float                            Float32(uint64_t bits);
+	bool                                    EvaluateWide(Value value, uint64_t& result);
+	bool                                    Arg(const Inst& inst, size_t index, uint64_t& result);
+	bool                                    EvaluatePhi(const Inst& inst, uint64_t& result);
+	bool                                    EvaluateExtract(const Inst& inst, uint64_t& result);
+	bool        EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result);
+	bool        EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes = 0u);
+	bool        EvaluateInst(const Inst& inst, uint64_t& result);
+	bool        EvaluateInstRule(const Inst& inst, uint64_t& result);
 	bool        EvaluateChain(const Inst& root, uint64_t& result);
 	const Inst* ColdPlainOperand(Value value, uint32_t& index);
 	static bool LaneSweepSharing();
@@ -265,32 +264,32 @@ private:
 	}
 
 	const ResourcePlan&              m_program;
-	SrtRuntime                      m_runtime;
+	SrtRuntime                       m_runtime;
 	std::span<const uint8_t>         m_clean_flat_slots;
-	SrtWalker*                      m_clean_evaluator = nullptr;
-	Value                           m_active_mask;
+	SrtWalker*                       m_clean_evaluator = nullptr;
+	Value                            m_active_mask;
 	ResourcePlan::EvaluationContext& m_context;
 	// Loop-carried phi values taken on trust, inherited by any trial this walk starts.
 	InstValueMap m_assumed;
 	InstSet      m_barred;
 	// Non-null only inside the per-lane sweep a readfirstlane runs, which is the one place a
 	// lane index has a value. Owned by the sweep, shared with any walk it starts.
-	LaneScope*                                m_lane = nullptr;
-	LaneScope*                                m_suspended_lane = nullptr;
-	bool                                      m_shares_lanes   = false;
-	std::vector<uint32_t>                     m_lane_entries;
+	LaneScope*            m_lane           = nullptr;
+	LaneScope*            m_suspended_lane = nullptr;
+	bool                  m_shares_lanes   = false;
+	std::vector<uint32_t> m_lane_entries;
 	// The last guest read this walk refused, kept so a flat refresh can name the address rather
 	// than only the slot.
-	uint64_t                                  m_refused_read     = 0;
-	bool                                      m_has_refused_read = false;
-	RawReadReject                             m_raw_read_reject  = RawReadReject::None;
-	const char*                               m_raw_read_operand = nullptr;
+	uint64_t      m_refused_read     = 0;
+	bool          m_has_refused_read = false;
+	RawReadReject m_raw_read_reject  = RawReadReject::None;
+	const char*   m_raw_read_operand = nullptr;
 	// The first instruction to refuse after a flat refresh starts. Recursion unwinds innermost
 	// first, so the first refusal is the deepest one - the root, not its callers.
-	ValueOpcode                               m_first_refusal     = ValueOpcode::Void;
-	bool                                      m_has_first_refusal = false;
-	PhiReject                                 m_phi_reject        = PhiReject::None;
-	RuntimeValueFailure                       m_raw_read_operand_failure {};
+	ValueOpcode         m_first_refusal     = ValueOpcode::Void;
+	bool                m_has_first_refusal = false;
+	PhiReject           m_phi_reject        = PhiReject::None;
+	RuntimeValueFailure m_raw_read_operand_failure {};
 };
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

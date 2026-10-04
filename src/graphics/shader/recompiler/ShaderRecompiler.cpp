@@ -1,8 +1,8 @@
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
-#include "graphics/shader/recompiler/Tessellation.h"
 
 #include "common/assert.h"
 #include "common/logging/log.h"
+#include "graphics/shader/recompiler/Tessellation.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -21,8 +21,8 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <fmt/format.h>
 #include <filesystem>
+#include <fmt/format.h>
 #include <fstream>
 #include <list>
 #include <map>
@@ -90,8 +90,8 @@ uint64_t HashCodeWords(std::span<const uint32_t> front, std::span<const uint32_t
 	// FNV-1a over both bodies, with the front length folded in so that moving a word from one span
 	// to the other cannot land on the same bucket. Only a bucket selector: every hit is confirmed
 	// by comparing the words themselves, so a collision costs a comparison, never a wrong graph.
-	uint64_t hash = 0xcbf29ce484222325ull;
-	const auto mix = [&hash](uint64_t value) {
+	uint64_t   hash = 0xcbf29ce484222325ull;
+	const auto mix  = [&hash](uint64_t value) {
 		for (uint32_t byte = 0; byte < sizeof(value); byte++) {
 			hash ^= (value >> (byte * 8u)) & 0xffu;
 			hash *= 0x100000001b3ull;
@@ -268,11 +268,11 @@ bool DeserializeGraph(Reader& in, CFG::Graph& graph) {
 	}
 	graph.blocks.resize(count);
 	for (auto& block: graph.blocks) {
-		block.id         = in.U32();
-		block.start_pc   = in.U32();
-		block.end_pc     = in.U32();
-		block.inst_begin = in.U32();
-		block.inst_end   = in.U32();
+		block.id             = in.U32();
+		block.start_pc       = in.U32();
+		block.end_pc         = in.U32();
+		block.inst_begin     = in.U32();
+		block.inst_end       = in.U32();
 		uint32_t assignments = 0;
 		if (!in.Count(assignments, 8u)) {
 			return false;
@@ -325,9 +325,9 @@ bool DeserializeGraph(Reader& in, CFG::Graph& graph) {
 	}
 	graph.components.resize(count);
 	for (auto& component: graph.components) {
-		component.blocks      = in.Words();
+		component.blocks       = in.Words();
 		component.entry_blocks = in.Words();
-		component.irreducible = in.U32() != 0u;
+		component.irreducible  = in.U32() != 0u;
 		if (!in.ok) {
 			return false;
 		}
@@ -438,21 +438,21 @@ public:
 		while (m_bytes + bytes > Budget && !m_entries.empty()) {
 			Evict();
 		}
-		m_entries.push_front(Entry {.code      = {code.begin(), code.end()},
-		                            .back_code = {back_code.begin(), back_code.end()},
+		m_entries.push_front(Entry {.code       = {code.begin(), code.end()},
+		                            .back_code  = {back_code.begin(), back_code.end()},
 		                            .native     = native,
 		                            .structured = structured,
 		                            .outcome    = outcome,
-		                            .hash      = hash,
-		                            .bytes     = bytes,
-		                            .cost_us   = cost_us,
-		                            .from_file = false});
+		                            .hash       = hash,
+		                            .bytes      = bytes,
+		                            .cost_us    = cost_us,
+		                            .from_file  = false});
 		m_index.emplace(hash, m_entries.begin());
 		m_bytes += bytes;
 	}
 
-	static constexpr uint64_t FileMagic = 0x3343464759544b53ull; // "SKTYFC3"
-	static constexpr size_t FileBudget = Budget;
+	static constexpr uint64_t FileMagic  = 0x3343464759544b53ull; // "SKTYFC3"
+	static constexpr size_t   FileBudget = Budget;
 
 	void OpenFile(const std::string& path, uint64_t stamp) {
 		const std::lock_guard<std::mutex> lock(m_mutex);
@@ -491,12 +491,12 @@ public:
 
 	CfgCacheStats Stats() {
 		const std::lock_guard<std::mutex> lock(m_mutex);
-		return {.hits     = m_hits,
-		        .misses   = m_misses,
-		        .evicted  = m_evicted,
-		        .refused  = m_refused,
-		        .entries  = static_cast<uint64_t>(m_entries.size()),
-		        .bytes    = static_cast<uint64_t>(m_bytes),
+		return {.hits              = m_hits,
+		        .misses            = m_misses,
+		        .evicted           = m_evicted,
+		        .refused           = m_refused,
+		        .entries           = static_cast<uint64_t>(m_entries.size()),
+		        .bytes             = static_cast<uint64_t>(m_bytes),
 		        .loaded            = m_loaded,
 		        .stored            = m_stored,
 		        .rejected          = m_rejected,
@@ -506,15 +506,15 @@ public:
 	}
 
 	void Report(const char* label) {
-		uint64_t hits = 0;
-		uint64_t misses = 0;
-		uint64_t evicted = 0;
-		uint64_t refused = 0;
-		uint64_t hits_from_file = 0;
-		uint64_t avoided_file_ms = 0;
+		uint64_t hits              = 0;
+		uint64_t misses            = 0;
+		uint64_t evicted           = 0;
+		uint64_t refused           = 0;
+		uint64_t hits_from_file    = 0;
+		uint64_t avoided_file_ms   = 0;
 		uint64_t avoided_memory_ms = 0;
-		size_t   bytes = 0;
-		size_t   entries = 0;
+		size_t   bytes             = 0;
+		size_t   entries           = 0;
 		{
 			const std::lock_guard<std::mutex> lock(m_mutex);
 			const auto                        total = m_hits + m_misses;
@@ -522,13 +522,13 @@ public:
 			if (total == 0u || (total & (total - 1u)) != 0u || total == m_reported) {
 				return;
 			}
-			m_reported = total;
-			hits       = m_hits;
-			misses     = m_misses;
-			evicted    = m_evicted;
-			refused    = m_refused;
-			bytes      = m_bytes;
-			entries    = m_entries.size();
+			m_reported        = total;
+			hits              = m_hits;
+			misses            = m_misses;
+			evicted           = m_evicted;
+			refused           = m_refused;
+			bytes             = m_bytes;
+			entries           = m_entries.size();
 			hits_from_file    = m_hits_from_file;
 			avoided_file_ms   = m_avoided_file_us / 1000u;
 			avoided_memory_ms = m_avoided_memory_us / 1000u;
@@ -537,8 +537,8 @@ public:
 		     " bytes=%" PRIu64 " evicted=%" PRIu64 " refused=%" PRIu64 " avoided_ms=%" PRIu64
 		     " (file %" PRIu64 ")\n",
 		     label, hits, hits_from_file, misses, static_cast<uint64_t>(entries),
-		     static_cast<uint64_t>(bytes), evicted, refused,
-		     avoided_file_ms + avoided_memory_ms, avoided_file_ms);
+		     static_cast<uint64_t>(bytes), evicted, refused, avoided_file_ms + avoided_memory_ms,
+		     avoided_file_ms);
 	}
 
 private:
@@ -547,10 +547,10 @@ private:
 		std::vector<uint32_t> back_code;
 		CFG::Graph            native;
 		CFG::Graph            structured;
-		CfgOutcome            outcome = CfgOutcome::Structured;
-		uint64_t              hash    = 0;
-		size_t                bytes   = 0;
-		uint64_t              cost_us = 0;
+		CfgOutcome            outcome   = CfgOutcome::Structured;
+		uint64_t              hash      = 0;
+		size_t                bytes     = 0;
+		uint64_t              cost_us   = 0;
 		bool                  from_file = false;
 	};
 
@@ -643,7 +643,8 @@ private:
 			blob.insert(blob.end(), payload.begin(), payload.end());
 			stored++;
 		}
-		// Written beside the target and renamed over it, so the live file is only ever replaced whole.
+		// Written beside the target and renamed over it, so the live file is only ever replaced
+		// whole.
 		std::error_code error;
 		const auto      target = std::filesystem::path(m_path);
 		if (target.has_parent_path()) {
@@ -687,23 +688,23 @@ private:
 		m_evicted++;
 	}
 
-	std::mutex                                                     m_mutex;
-	std::list<Entry>                                               m_entries;
-	std::unordered_multimap<uint64_t, std::list<Entry>::iterator>  m_index;
-	size_t                                                         m_bytes    = 0;
-	uint64_t                                                       m_hits     = 0;
-	uint64_t                                                       m_misses   = 0;
-	uint64_t                                                       m_evicted  = 0;
-	uint64_t                                                       m_refused  = 0;
-	uint64_t                                                       m_reported = 0;
-	std::string                                                    m_path;
-	uint64_t                                                       m_stamp    = 0;
-	uint64_t                                                       m_loaded   = 0;
-	uint64_t                                                       m_stored   = 0;
-	uint64_t                                                       m_rejected = 0;
-	uint64_t                                                       m_hits_from_file    = 0;
-	uint64_t                                                       m_avoided_file_us   = 0;
-	uint64_t                                                       m_avoided_memory_us = 0;
+	std::mutex                                                    m_mutex;
+	std::list<Entry>                                              m_entries;
+	std::unordered_multimap<uint64_t, std::list<Entry>::iterator> m_index;
+	size_t                                                        m_bytes    = 0;
+	uint64_t                                                      m_hits     = 0;
+	uint64_t                                                      m_misses   = 0;
+	uint64_t                                                      m_evicted  = 0;
+	uint64_t                                                      m_refused  = 0;
+	uint64_t                                                      m_reported = 0;
+	std::string                                                   m_path;
+	uint64_t                                                      m_stamp             = 0;
+	uint64_t                                                      m_loaded            = 0;
+	uint64_t                                                      m_stored            = 0;
+	uint64_t                                                      m_rejected          = 0;
+	uint64_t                                                      m_hits_from_file    = 0;
+	uint64_t                                                      m_avoided_file_us   = 0;
+	uint64_t                                                      m_avoided_memory_us = 0;
 };
 
 CfgCache& StructurizedCfgCache() {
@@ -734,7 +735,8 @@ const char* StageName(ShaderType stage) {
 	}
 }
 
-void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg, const char* phase) {
+void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
+                           const char* phase) {
 	const auto* block        = cfg.FindBlock(cfg.failure_block);
 	const auto  start        = block != nullptr ? block->start_pc : UINT32_MAX;
 	const auto  end          = block != nullptr ? block->end_pc : UINT32_MAX;
@@ -751,14 +753,7 @@ void LogDispatcherFallback(const CompileOptions& options, const CFG::Graph& cfg,
 	     static_cast<uint64_t>(cfg.back_edges.size()), cfg.unsupported_reason.c_str());
 }
 
-enum class EmbeddedFetchValueType {
-	Unknown,
-	Constant,
-	AttribTable,
-	Attrib,
-	BufferTable,
-	Buffer
-};
+enum class EmbeddedFetchValueType { Unknown, Constant, AttribTable, Attrib, BufferTable, Buffer };
 
 struct EmbeddedFetchSgprInfo {
 	EmbeddedFetchValueType type      = EmbeddedFetchValueType::Unknown;
@@ -885,11 +880,11 @@ int BufferTableAttribFromOffset(uint32_t raw_offset, int dword) {
 	return static_cast<int>((raw_offset + static_cast<uint32_t>(dword) * 4u) / 16u);
 }
 
-Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
-    const Decoder::Program& decoded, const ShaderVertexInputInfo* input_info,
-    uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
-	const uint32_t    vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
-	const uint32_t    instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
+Frontend::EmbeddedFetchPlan
+DetectEmbeddedVertexFetch(const Decoder::Program& decoded, const ShaderVertexInputInfo* input_info,
+                          uint32_t user_data_base, uint32_t user_data_count, uint32_t wave_size) {
+	const uint32_t vertex_index_reg   = input_info->logical_stage == ShaderType::Local ? 2u : 5u;
+	const uint32_t instance_index_reg = input_info->logical_stage == ShaderType::Local ? 5u : 8u;
 	Frontend::EmbeddedFetchPlan data;
 	data.loads.reserve(input_info->resources_num);
 	int32_t vertex_offset_candidate   = -1;
@@ -902,14 +897,13 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 	const int buffer_reg = input_info->fetch_buffer_reg + shift_regs;
 
 	std::array<EmbeddedFetchSgprInfo, 108> sgprs {};
-	std::array<bool, 256>                 vgpr_is_index {};
+	std::array<bool, 256>                  vgpr_is_index {};
 	EmbeddedFetchVectorLanes               vector_lanes;
-	const bool                             track_vector_lanes =
-	    std::none_of(decoded.instructions.begin(), decoded.instructions.end(),
-	                 [](const auto& inst) {
-		                 return Decoder::IsDirectBranch(inst.opcode) ||
-		                        inst.opcode == Decoder::Opcode::S_SETPC_B64;
-	                 });
+	const bool                             track_vector_lanes = std::none_of(
+	    decoded.instructions.begin(), decoded.instructions.end(), [](const auto& inst) {
+		    return Decoder::IsDirectBranch(inst.opcode) ||
+		           inst.opcode == Decoder::Opcode::S_SETPC_B64;
+	    });
 
 	if (attrib_reg >= 0 && attrib_reg < static_cast<int>(sgprs.size())) {
 		sgprs[attrib_reg].type = EmbeddedFetchValueType::AttribTable;
@@ -947,10 +941,10 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 		if (data.loads.empty() && index_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
 			if (reg >= user_data_base && reg - user_data_base < user_data_count) {
-				auto& candidate = vertex_index_accumulator ? vertex_offset_candidate
-				                                           : instance_offset_candidate;
-				auto& conflict  = vertex_index_accumulator ? vertex_offset_conflict
-				                                           : instance_offset_conflict;
+				auto& candidate =
+				    vertex_index_accumulator ? vertex_offset_candidate : instance_offset_candidate;
+				auto& conflict =
+				    vertex_index_accumulator ? vertex_offset_conflict : instance_offset_conflict;
 				if (candidate >= 0 && candidate != static_cast<int32_t>(reg)) {
 					conflict = true;
 				} else {
@@ -1022,9 +1016,9 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 							const int  index       = static_cast<int>(raw_offset / 4u);
 							for (uint32_t i = 0;
 							     i < DecodedDstSize(inst) && register_id + i < sgprs.size(); i++) {
-								auto& dst        = sgprs[register_id + i];
-								dst.type         = EmbeddedFetchValueType::Attrib;
-								dst.attrib_id    = index + static_cast<int>(i);
+								auto& dst     = sgprs[register_id + i];
+								dst.type      = EmbeddedFetchValueType::Attrib;
+								dst.attrib_id = index + static_cast<int>(i);
 							}
 						} else {
 							ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
@@ -1050,9 +1044,9 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 						           (inst.offset & 0x3u) == 0) {
 							for (uint32_t i = 0;
 							     i < DecodedDstSize(inst) && register_id + i < sgprs.size(); i++) {
-								auto& dst        = sgprs[register_id + i];
-								dst.type         = EmbeddedFetchValueType::Buffer;
-								dst.attrib_id    = sgprs[DecodedSgprReg(inst.src1)].attrib_id;
+								auto& dst     = sgprs[register_id + i];
+								dst.type      = EmbeddedFetchValueType::Buffer;
+								dst.attrib_id = sgprs[DecodedSgprReg(inst.src1)].attrib_id;
 							}
 						} else {
 							ClearEmbeddedFetchSgprs(sgprs, inst.dst, DecodedDstSize(inst));
@@ -1097,8 +1091,8 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 					}
 				} else if (IsEmbeddedFetchBufferLoad(inst)) {
 					if (IsDecodedVgpr(inst.src0) && inst.src0.reg < vgpr_is_index.size() &&
-					    vgpr_is_index[inst.src0.reg] &&
-					    IsDecodedSgpr(inst.src1) && DecodedSgprReg(inst.src1) < sgprs.size() &&
+					    vgpr_is_index[inst.src0.reg] && IsDecodedSgpr(inst.src1) &&
+					    DecodedSgprReg(inst.src1) < sgprs.size() &&
 					    sgprs[DecodedSgprReg(inst.src1)].type == EmbeddedFetchValueType::Buffer) {
 						const auto& buffer = sgprs[DecodedSgprReg(inst.src1)];
 						if (data.loads.empty()) {
@@ -1109,10 +1103,10 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 								data.instance_offset_sgpr = instance_offset_candidate;
 							}
 						}
-						auto& load        = data.loads.emplace_back();
-						load.pc           = inst.pc;
-						load.attrib_id    = buffer.attrib_id;
-						load.components   = DecodedDstSize(inst);
+						auto& load      = data.loads.emplace_back();
+						load.pc         = inst.pc;
+						load.attrib_id  = buffer.attrib_id;
+						load.components = DecodedDstSize(inst);
 					}
 				}
 				break;
@@ -1121,8 +1115,7 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 			vector_lanes.clear();
 		} else if (inst.opcode != Decoder::Opcode::V_WRITELANE_B32 && IsDecodedVgpr(inst.dst)) {
 			for (uint32_t i = 0;
-			     i < EmbeddedFetchDstSize(inst) && inst.dst.reg + i < vgpr_is_index.size();
-			     i++) {
+			     i < EmbeddedFetchDstSize(inst) && inst.dst.reg + i < vgpr_is_index.size(); i++) {
 				ClearEmbeddedFetchVectorLanes(&vector_lanes, inst.dst.reg + i);
 			}
 		}
@@ -1182,7 +1175,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
-	Decoder::Program decoded;
+	Decoder::Program      decoded;
 	std::vector<uint32_t> joined_code;
 	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
@@ -1263,12 +1256,12 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 			     static_cast<uint64_t>(selected.blocks.size()),
 			     static_cast<uint64_t>(selected.natural_loops.size()), phase_ms());
 		}
-		const auto cfg_cost_us = static_cast<uint64_t>(
-		    std::chrono::duration_cast<std::chrono::microseconds>(
-		        std::chrono::steady_clock::now() - cfg_begin)
-		        .count());
-		StructurizedCfgCache().Put(code, options.back_code, native_cfg, structured_cfg,
-		                           cfg_outcome, cfg_cost_us);
+		const auto cfg_cost_us =
+		    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+		                              std::chrono::steady_clock::now() - cfg_begin)
+		                              .count());
+		StructurizedCfgCache().Put(code, options.back_code, native_cfg, structured_cfg, cfg_outcome,
+		                           cfg_cost_us);
 	}
 	StructurizedCfgCache().Report(GetDumpLabel(options));
 	const auto* selected_cfg =
@@ -1294,7 +1287,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		                      cfg_outcome == CfgOutcome::Irreducible ? "build" : "structurize");
 	}
 
-	const auto& cfg = *selected_cfg;
+	const auto&                 cfg = *selected_cfg;
 	Frontend::EmbeddedFetchPlan embedded_fetch;
 	if ((options.stage == ShaderType::Vertex || options.stage == ShaderType::Local) &&
 	    options.input_info.vertex != nullptr && options.input_info.vertex->fetch_embedded) {
@@ -1307,14 +1300,14 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage            = options.stage,
-	    .wave_size        = options.wave_size,
+	    .stage              = options.stage,
+	    .wave_size          = options.wave_size,
 	    .host_subgroup_size = options.host_subgroup_size,
-	    .shader_hash      = options.shader_hash,
-	    .user_data_base   = options.user_data_base,
-	    .user_data_count  = static_cast<uint32_t>(options.user_data.size()),
-	    .input_info       = options.input_info,
-	    .embedded_fetch   = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .shader_hash        = options.shader_hash,
+	    .user_data_base     = options.user_data_base,
+	    .user_data_count    = static_cast<uint32_t>(options.user_data.size()),
+	    .input_info         = options.input_info,
+	    .embedded_fetch     = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
@@ -1355,7 +1348,7 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	// is the only pass that reads it: it is what lets a recognizer drop the guards that exist
 	// solely to avoid moving a descriptor that still resolves.
 	ir.unfoldable_pcs.assign(options.unfoldable_pcs.begin(), options.unfoldable_pcs.end());
-	auto tracking = IR::TrackResources(ir, decoded, native_cfg);
+	auto            tracking = IR::TrackResources(ir, decoded, native_cfg);
 	TranslateResult result;
 	if (!tracking.ok) {
 		LOGF("%s resource tracking rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32
@@ -1394,9 +1387,9 @@ void ResetCfgCacheForTest() {
 
 CompileResult CompileProgram(TranslateResult translated, const CompileOptions& options,
                              const IR::ResourceSpecialization& specialization,
-                             uint32_t push_data_start_dword) {
+                             uint32_t                          push_data_start_dword) {
 	const auto emit_begin = std::chrono::steady_clock::now();
-	auto& ir = translated.program;
+	auto&      ir         = translated.program;
 	if (!IR::ApplyResourceSpecialization(ir, specialization)) {
 		// Derived from a different tracking of this shader; refuse the permutation the way the
 		// backend refuses one it cannot express.
@@ -1414,14 +1407,16 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 	}
 	for (auto* block: ir.blocks) {
 		for (auto& inst: *block) {
-			const auto op = inst.GetOpcode();
-			uint32_t first = 0;
+			const auto op    = inst.GetOpcode();
+			uint32_t   first = 0;
 			if (op == IR::ValueOpcode::GetBufferResource) {
 				// A descriptor the shader decodes for itself keeps every dword it decodes.
 				if (std::ranges::any_of(inst.Uses(), [&](const IR::Use& use) {
-					const auto& memory = ir.memory_info[use.user->Flags<IR::MemoryFlags>().index];
-					return memory.kind == IR::ResourceKind::IndirectBuffer || memory.dynamic_buffer;
-				})) {
+					    const auto& memory =
+					        ir.memory_info[use.user->Flags<IR::MemoryFlags>().index];
+					    return memory.kind == IR::ResourceKind::IndirectBuffer ||
+					           memory.dynamic_buffer;
+				    })) {
 					continue;
 				}
 				// A buffer table's root carries the runtime key in arg 0, as an image table's does.
@@ -1433,8 +1428,10 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 				            : 0u;
 			} else if (op == IR::ValueOpcode::GetImageResource) {
 				const auto resource = inst.Flags<uint32_t>();
-				first = resource < ir.info.images.size() &&
-				                ir.info.images[resource].indirect_root == resource ? 1u : 0u;
+				first               = resource < ir.info.images.size() &&
+				                              ir.info.images[resource].indirect_root == resource
+				                          ? 1u
+				                          : 0u;
 			} else if (op != IR::ValueOpcode::GetSamplerResource) {
 				continue;
 			}

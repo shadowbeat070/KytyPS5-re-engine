@@ -84,20 +84,19 @@ uint32_t DescriptorLoadDwords(ValueOpcode op) {
 // in a buffer reaches the scalar registers; each component is then taken apart by a
 // CompositeExtract.
 bool IsUniformBufferRead(const ResourcePlan& values, const Inst& inst) {
-	const auto op = inst.GetOpcode();
+	const auto op    = inst.GetOpcode();
 	const auto multi = DescriptorLoadDwords(op);
 	if ((op != ValueOpcode::LoadBufferU32 && multi == 0u) || inst.NumArgs() != 5) {
 		return false;
 	}
 	const auto dwords = multi == 0u ? 1u : multi;
-	const auto flags = inst.Flags<MemoryFlags>();
+	const auto flags  = inst.Flags<MemoryFlags>();
 	if (flags.index >= values.memory_info.size()) {
 		return false;
 	}
 	const auto& mem = values.memory_info[flags.index];
-	if (mem.kind != ResourceKind::Buffer || mem.idxen || mem.offen || mem.typed ||
-	    mem.formatted || mem.data_bits != 32u || mem.data_dwords != dwords ||
-	    mem.component_index != 0u) {
+	if (mem.kind != ResourceKind::Buffer || mem.idxen || mem.offen || mem.typed || mem.formatted ||
+	    mem.data_bits != 32u || mem.data_dwords != dwords || mem.component_index != 0u) {
 		return false;
 	}
 	// The translator plants literal zeroes for the index and offset operands when the
@@ -147,9 +146,7 @@ size_t RawReadOffsetArg(ValueOpcode op) {
 // of the address, and walking it would reject the read for depending on lane identity.
 size_t RawReadAddressArgs(const Inst& inst) {
 	const auto op = inst.GetOpcode();
-	return op == ValueOpcode::LoadBufferU32 || DescriptorLoadDwords(op) != 0u
-	           ? 4u
-	           : inst.NumArgs();
+	return op == ValueOpcode::LoadBufferU32 || DescriptorLoadDwords(op) != 0u ? 4u : inst.NumArgs();
 }
 
 bool IsRawRead(const ResourcePlan& values, const Inst& inst) {
@@ -707,15 +704,14 @@ private:
 		return std::nullopt;
 	}
 
-	const ResourcePlan&             m_program;
-	RuntimeValueType                m_type;
-	RuntimeValueFailure*            m_failure = nullptr;
+	const ResourcePlan&                                 m_program;
+	RuntimeValueType                                    m_type;
+	RuntimeValueFailure*                                m_failure = nullptr;
 	std::unordered_map<const Inst*, std::vector<Value>> m_validated_uniform;
-	Value                           m_active_mask;
-	std::unordered_set<const Inst*> m_visiting;
-	std::unordered_set<const Inst*> m_validated_dependencies;
+	Value                                               m_active_mask;
+	std::unordered_set<const Inst*>                     m_visiting;
+	std::unordered_set<const Inst*>                     m_validated_dependencies;
 };
-
 
 } // namespace
 
@@ -726,8 +722,9 @@ SrtWalker::SrtWalker(const ResourcePlan& program, const SrtRuntime& runtime,
       m_clean_evaluator(clean_evaluator), m_active_mask(active_mask.Resolve()),
       m_context(AcquireContext(program)) {}
 
-
-SrtWalker::~SrtWalker() { --m_program.evaluation_depth; }
+SrtWalker::~SrtWalker() {
+	--m_program.evaluation_depth;
+}
 
 bool SrtWalker::LaneSweepSharing() {
 	static const bool enabled = [] {
@@ -864,8 +861,8 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	if (inst == nullptr) {
 		return false;
 	}
-	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) &&
-	    inst->NumArgs() == 3 && inst->Arg(0).Resolve() == m_active_mask) {
+	if (!m_active_mask.IsEmpty() && IsRuntimeSelect(inst->GetOpcode()) && inst->NumArgs() == 3 &&
+	    inst->Arg(0).Resolve() == m_active_mask) {
 		return EvaluateWide(inst->Arg(1), result);
 	}
 	// A value assumed by the fixpoint trial answers before the memo: the whole phi web has to
@@ -1035,7 +1032,7 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	// Loop-carried: assume the entry value and require every operand to reproduce it, which
 	// makes it the value the phi holds on every iteration.
 	std::vector<const Inst*> web;
-	const auto entry = ResolveCyclicPhiEntry(m_program, Value(const_cast<Inst*>(&inst)), &web);
+	const auto entry     = ResolveCyclicPhiEntry(m_program, Value(const_cast<Inst*>(&inst)), &web);
 	uint64_t   candidate = 0;
 	if (entry.IsEmpty()) {
 		return refuse_phi(PhiReject::NoEntry);
@@ -1109,15 +1106,13 @@ bool SrtWalker::EvaluateExtract(const Inst& inst, uint64_t& result) {
 		}
 		const auto sum =
 		    static_cast<uint64_t>(static_cast<uint32_t>(lhs)) + static_cast<uint32_t>(rhs);
-		result =
-		    component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
+		result = component == 0u ? static_cast<uint32_t>(sum) : static_cast<uint32_t>(sum >> 32u);
 		return true;
 	}
 	return false;
 }
 
-bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component,
-                                     uint64_t& result) {
+bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result) {
 	const auto* source = inst.Arg(0).ResolveInstruction();
 	if (source == nullptr || component >= 4u) {
 		return false;
@@ -1139,8 +1134,7 @@ bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component,
 	return false;
 }
 
-bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
-                               uint32_t component_bytes) {
+bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes) {
 	const auto RefuseRawRead = [&](RawReadReject reason) {
 		if (m_raw_read_reject == RawReadReject::None) {
 			m_raw_read_reject = reason;
@@ -1164,10 +1158,10 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 	if (handle == nullptr) {
 		return RefuseRawRead(RawReadReject::NoHandle);
 	}
-	uint64_t   low        = 0;
-	uint64_t   high       = 0;
-	uint64_t   offset     = 0;
-	const auto offset_arg = RawReadOffsetArg(inst.GetOpcode());
+	uint64_t   low            = 0;
+	uint64_t   high           = 0;
+	uint64_t   offset         = 0;
+	const auto offset_arg     = RawReadOffsetArg(inst.GetOpcode());
 	const auto refuse_operand = [&](const char* name, Value value) {
 		if (m_raw_read_reject == RawReadReject::None) {
 			m_raw_read_operand = name;
@@ -1185,10 +1179,9 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 	if (!Arg(inst, offset_arg, offset)) {
 		return refuse_operand("offset", inst.Arg(offset_arg));
 	}
-	const auto base = (high << 32u) | static_cast<uint32_t>(low);
-	const auto immediate =
-	    static_cast<int64_t>(static_cast<int32_t>(mem.offset)) + component_bytes;
-	uint64_t address = 0;
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset)) + component_bytes;
+	uint64_t   address   = 0;
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
 	    inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
 	    DescriptorLoadDwords(inst.GetOpcode()) != 0u) {
@@ -1211,17 +1204,16 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 			if (static_cast<uint32_t>(records) == 0u || element + sizeof(uint32_t) > stride) {
 				return RefuseRawRead(RawReadReject::SwizzledElementOutOfStride);
 			}
-			const auto index_stride = uint64_t {8}
-			                          << ((static_cast<uint32_t>(word3) >> 21u) & 3u);
-			const auto byte_offset = (element & ~uint64_t {3}) * index_stride + (element & 3u) +
-			                         static_cast<uint32_t>(offset);
-			address = ((base & AddressMask & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
+			const auto index_stride = uint64_t {8} << ((static_cast<uint32_t>(word3) >> 21u) & 3u);
+			const auto byte_offset  = (element & ~uint64_t {3}) * index_stride + (element & 3u) +
+			                          static_cast<uint32_t>(offset);
+			address = ((base & ~uint64_t {3}) + byte_offset) & ~uint64_t {3};
 		} else {
 			const auto byte_offset = (static_cast<uint64_t>(immediate) & ~uint64_t {3}) +
 			                         (static_cast<uint32_t>(offset) & ~3u);
-			const auto size =
-			    stride == 0u ? static_cast<uint64_t>(static_cast<uint32_t>(records))
-			                 : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
+			const auto size = stride == 0u
+			                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
+			                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 			// A descriptor chain that reads past its own descriptor is not trustworthy, so the
 			// walk refuses rather than substituting hardware's zero. shader_cfg_tests asserts
 			// this: "real S_BUFFER_LOAD walk ignored descriptor bounds".
@@ -1231,8 +1223,8 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result,
 			address = (base & ~uint64_t {3}) + byte_offset;
 		}
 	} else {
-		const auto relative = (immediate & ~int64_t {3}) +
-		                      static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
+		const auto relative =
+		    (immediate & ~int64_t {3}) + static_cast<int64_t>(static_cast<uint32_t>(offset) & ~3u);
 		if (!AddSignedAddress(base & ~uint64_t {3}, relative, address)) {
 			return RefuseRawRead(RawReadReject::AddressOverflow);
 		}
@@ -1267,10 +1259,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 	uint64_t   b       = 0;
 	uint64_t   c       = 0;
 	const auto binary  = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b); };
-	const auto ternary = [&]() {
-		return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c);
-	};
-	const auto s32 = [](uint64_t value) {
+	const auto ternary = [&]() { return Arg(inst, 0, a) && Arg(inst, 1, b) && Arg(inst, 2, c); };
+	const auto s32     = [](uint64_t value) {
 		return std::bit_cast<int32_t>(static_cast<uint32_t>(value));
 	};
 	switch (inst.GetOpcode()) {
@@ -1301,8 +1291,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 				SrtWalker active(m_program, m_runtime, m_clean_flat_slots, &clean_active,
 				                 inst.Arg(1));
 				active.m_lane = &scope;
-				// A select resolves its predicate through the clean evaluator, so the lane has to be
-				// the same there: it is a property of the walk, not of the memory being read.
+				// A select resolves its predicate through the clean evaluator, so the lane has to
+				// be the same there: it is a property of the walk, not of the memory being read.
 				clean_active.m_lane = &scope;
 				// A lane walk resolves selects on its own mask; outer assumptions need not hold.
 				active.m_barred = m_barred;
@@ -1372,7 +1362,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::FindUMsb32:
 			if (Arg(inst, 0, a)) {
 				const auto value = static_cast<uint32_t>(a);
-				result = value == 0u ? UINT32_MAX : static_cast<uint32_t>(31 - std::countl_zero(value));
+				result =
+				    value == 0u ? UINT32_MAX : static_cast<uint32_t>(31 - std::countl_zero(value));
 				return true;
 			}
 			return false;
@@ -1403,7 +1394,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::FPSaturate32:
 			if (Arg(inst, 0, a)) {
-				result = std::bit_cast<uint32_t>(static_cast<float>(std::clamp(Float32(a), 0.0F, 1.0F)));
+				result =
+				    std::bit_cast<uint32_t>(static_cast<float>(std::clamp(Float32(a), 0.0F, 1.0F)));
 				return true;
 			}
 			return false;
@@ -1427,7 +1419,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::FPFract32:
 			if (Arg(inst, 0, a)) {
-				result = std::bit_cast<uint32_t>(static_cast<float>(Float32(a) - std::floor(Float32(a))));
+				result = std::bit_cast<uint32_t>(
+				    static_cast<float>(Float32(a) - std::floor(Float32(a))));
 				return true;
 			}
 			return false;
@@ -1516,13 +1509,15 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::FPMin32:
 			if (binary()) {
-				result = std::bit_cast<uint32_t>(static_cast<float>(std::fmin(Float32(a), Float32(b))));
+				result =
+				    std::bit_cast<uint32_t>(static_cast<float>(std::fmin(Float32(a), Float32(b))));
 				return true;
 			}
 			return false;
 		case ValueOpcode::FPMax32:
 			if (binary()) {
-				result = std::bit_cast<uint32_t>(static_cast<float>(std::fmax(Float32(a), Float32(b))));
+				result =
+				    std::bit_cast<uint32_t>(static_cast<float>(std::fmax(Float32(a), Float32(b))));
 				return true;
 			}
 			return false;
@@ -1537,8 +1532,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			if (!binary()) {
 				return false;
 			}
-			result = static_cast<uint32_t>(a) |
-			         (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
+			result =
+			    static_cast<uint32_t>(a) | (static_cast<uint64_t>(static_cast<uint32_t>(b)) << 32u);
 			return true;
 		case ValueOpcode::ReadConst: {
 			const auto slot = inst.Arg(1).Resolve();
@@ -1554,11 +1549,10 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			m_suspended_lane = DependenceScope();
 			m_lane           = nullptr;
 			const SrtReadSlotScope scope(slot.U32());
-			const bool read =
-			    slot.U32() < m_clean_flat_slots.size() &&
-			            m_clean_flat_slots[slot.U32()] != 0u && m_clean_evaluator != nullptr
-			        ? m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value,
-			                                          result)
+			const bool             read =
+			    slot.U32() < m_clean_flat_slots.size() && m_clean_flat_slots[slot.U32()] != 0u &&
+			            m_clean_evaluator != nullptr
+			        ? m_clean_evaluator->EvaluateWide(m_program.srt_reads[slot.U32()].value, result)
 			        : EvaluateWide(m_program.srt_reads[slot.U32()].value, result);
 			m_lane           = lane;
 			m_suspended_lane = suspended;
@@ -1572,7 +1566,7 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			if (lanes == 0u || lanes > 64u) {
 				return false;
 			}
-			const auto wave = lanes == 64u ? ~uint64_t {0} : (uint64_t {1} << lanes) - 1u;
+			const auto     wave = lanes == 64u ? ~uint64_t {0} : (uint64_t {1} << lanes) - 1u;
 			const uint32_t closed_index =
 			    m_clean_evaluator == nullptr && m_program.frozen_values && ClosedBallotCaching()
 			        ? ClosedBallotIndex(inst)
@@ -1582,8 +1576,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 				result = m_program.closed_ballots[closed_index].mask;
 				return true;
 			}
-			LaneScope  scope;
-			uint64_t   mask = 0;
+			LaneScope                scope;
+			uint64_t                 mask = 0;
 			std::optional<SrtWalker> shared;
 			const auto               prepare = [&](SrtWalker& walker) {
 				walker.m_lane   = &scope;
@@ -1731,8 +1725,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::FPOrdNotEqual32:
 			if (binary()) {
-				result = !std::isnan(Float32(a)) && !std::isnan(Float32(b)) &&
-				         Float32(a) != Float32(b);
+				result =
+				    !std::isnan(Float32(a)) && !std::isnan(Float32(b)) && Float32(a) != Float32(b);
 				return true;
 			}
 			return false;
@@ -1766,8 +1760,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::FPUnordEqual32:
 			if (binary()) {
-				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
-				         Float32(a) == Float32(b);
+				result =
+				    std::isnan(Float32(a)) || std::isnan(Float32(b)) || Float32(a) == Float32(b);
 				return true;
 			}
 			return false;
@@ -1779,29 +1773,29 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::FPUnordLessThan32:
 			if (binary()) {
-				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
-				         Float32(a) < Float32(b);
+				result =
+				    std::isnan(Float32(a)) || std::isnan(Float32(b)) || Float32(a) < Float32(b);
 				return true;
 			}
 			return false;
 		case ValueOpcode::FPUnordGreaterThan32:
 			if (binary()) {
-				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
-				         Float32(a) > Float32(b);
+				result =
+				    std::isnan(Float32(a)) || std::isnan(Float32(b)) || Float32(a) > Float32(b);
 				return true;
 			}
 			return false;
 		case ValueOpcode::FPUnordLessThanEqual32:
 			if (binary()) {
-				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
-				         Float32(a) <= Float32(b);
+				result =
+				    std::isnan(Float32(a)) || std::isnan(Float32(b)) || Float32(a) <= Float32(b);
 				return true;
 			}
 			return false;
 		case ValueOpcode::FPUnordGreaterThanEqual32:
 			if (binary()) {
-				result = std::isnan(Float32(a)) || std::isnan(Float32(b)) ||
-				         Float32(a) >= Float32(b);
+				result =
+				    std::isnan(Float32(a)) || std::isnan(Float32(b)) || Float32(a) >= Float32(b);
 				return true;
 			}
 			return false;
@@ -1881,8 +1875,8 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			return false;
 		case ValueOpcode::ShiftRightArithmetic32:
 			if (binary()) {
-				result = static_cast<uint32_t>(
-				    std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >> (b & 31u));
+				result = static_cast<uint32_t>(std::bit_cast<int32_t>(static_cast<uint32_t>(a)) >>
+				                               (b & 31u));
 				return true;
 			}
 			return false;
@@ -1902,7 +1896,7 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 				const auto mask = width == 32u  ? UINT32_MAX
 				                  : width == 0u ? 0u
 				                                : (uint32_t {1} << width) - 1u;
-				result = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
+				result          = width == 0u ? 0u : (static_cast<uint32_t>(a) >> offset) & mask;
 				return true;
 			}
 			return false;
@@ -1940,10 +1934,9 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 				result = static_cast<uint32_t>(a);
 				return true;
 			}
-			const auto mask =
-			    width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
-			result = (static_cast<uint32_t>(a) & ~mask) |
-			         ((static_cast<uint32_t>(b) << offset) & mask);
+			const auto mask = width == 32u ? UINT32_MAX : ((uint32_t {1} << width) - 1u) << offset;
+			result =
+			    (static_cast<uint32_t>(a) & ~mask) | ((static_cast<uint32_t>(b) << offset) & mask);
 			return true;
 		}
 		case ValueOpcode::SelectU32:
@@ -1996,7 +1989,7 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 		case ValueOpcode::SMulHi:
 			if (binary()) {
 				const auto product = static_cast<int64_t>(s32(a)) * static_cast<int64_t>(s32(b));
-				result = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32u);
+				result             = static_cast<uint32_t>(static_cast<uint64_t>(product) >> 32u);
 				return true;
 			}
 			return false;
@@ -2004,7 +1997,7 @@ bool SrtWalker::EvaluateInstRule(const Inst& inst, uint64_t& result) {
 			if (binary()) {
 				const auto product = static_cast<uint64_t>(static_cast<uint32_t>(a)) *
 				                     static_cast<uint64_t>(static_cast<uint32_t>(b));
-				result = static_cast<uint32_t>(product >> 32u);
+				result             = static_cast<uint32_t>(product >> 32u);
 				return true;
 			}
 			return false;
@@ -2146,8 +2139,8 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 		return false;
 	}
 	const auto& descriptor = m_program.descriptor_sources[source];
-	result = {};
-	result.dword_count = descriptor.dword_count;
+	result                 = {};
+	result.dword_count     = descriptor.dword_count;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;
@@ -2168,14 +2161,14 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 	if (failure != nullptr) {
 		*failure = {};
 	}
-	m_has_refused_read = false;
-	m_raw_read_reject  = RawReadReject::None;
+	m_has_refused_read  = false;
+	m_raw_read_reject   = RawReadReject::None;
 	m_raw_read_operand  = nullptr;
 	m_has_first_refusal = false;
 	m_phi_reject        = PhiReject::None;
 	if (m_clean_evaluator != nullptr) {
-		m_clean_evaluator->m_has_refused_read = false;
-		m_clean_evaluator->m_raw_read_reject  = RawReadReject::None;
+		m_clean_evaluator->m_has_refused_read  = false;
+		m_clean_evaluator->m_raw_read_reject   = RawReadReject::None;
 		m_clean_evaluator->m_raw_read_operand  = nullptr;
 		m_clean_evaluator->m_has_first_refusal = false;
 		m_clean_evaluator->m_phi_reject        = PhiReject::None;
@@ -2189,8 +2182,9 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 		}
 		const auto& read  = m_program.srt_reads[slot];
 		const bool  clean = read.flat_offset < m_clean_flat_slots.size() &&
-		                   m_clean_flat_slots[read.flat_offset] != 0u;
-		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
+		                    m_clean_flat_slots[read.flat_offset] != 0u;
+		if (clean &&
+		    (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr)) {
 			return refuse(FlatRefreshFailure::Stage::CleanSlotUnreadable, read.flat_offset);
 		}
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
@@ -2202,8 +2196,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 			if (failure != nullptr) {
 				failure->value_is_expressible = ValidateRuntimeValue(
 				    m_program, read.value, RuntimeValueType::Any, &failure->value);
-				failure->raw_read         = evaluator.m_raw_read_reject;
-				failure->raw_read_operand = evaluator.m_raw_read_operand;
+				failure->raw_read                 = evaluator.m_raw_read_reject;
+				failure->raw_read_operand         = evaluator.m_raw_read_operand;
 				failure->raw_read_operand_failure = evaluator.m_raw_read_operand_failure;
 				failure->first_refusal            = evaluator.m_first_refusal;
 				failure->has_first_refusal        = evaluator.m_has_first_refusal;
@@ -2233,7 +2227,8 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 	flat.assign(m_program.srt_reads.size(), 0u);
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow) {
-		for (const auto source: block.sources) active.at(source) = 0u;
+		for (const auto source: block.sources)
+			active.at(source) = 0u;
 	}
 	auto& visited = m_program.visited_blocks;
 	auto& pending = m_program.pending_blocks;
@@ -2244,9 +2239,10 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailur
 		const auto index = pending.back();
 		pending.pop_back();
 		if (visited.at(index)) continue;
-		visited[index] = 1u;
+		visited[index]    = 1u;
 		const auto& block = m_program.control_flow[index];
-		for (const auto source: block.sources) active[source] = 1u;
+		for (const auto source: block.sources)
+			active[source] = 1u;
 		for (const auto slot: block.srt_reads) {
 			if (!refresh(slot)) return false;
 		}
@@ -2385,6 +2381,5 @@ bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValue
 	}
 	return RuntimeValidator(program, type, failure).Run(value);
 }
-
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR
