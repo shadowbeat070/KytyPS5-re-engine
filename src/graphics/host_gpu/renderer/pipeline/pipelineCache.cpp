@@ -1167,7 +1167,8 @@ struct PipelineCache::ProgramCache {
 	uint64_t   next_shader_id = 0;
 };
 
-FragmentLibraryCache::~FragmentLibraryCache() {
+template <typename Key, typename KeyHash>
+PipelineLibraryCache<Key, KeyHash>::~PipelineLibraryCache() {
 	Common::LockGuard lock(m_mutex);
 	LogHitRate();
 	for (const auto& [key, entry]: m_entries) {
@@ -1179,7 +1180,9 @@ FragmentLibraryCache::~FragmentLibraryCache() {
 	m_entries.clear();
 }
 
-const FragmentLibraryCache::Entry* FragmentLibraryCache::Find(const FragmentLibraryKey& key) {
+template <typename Key, typename KeyHash>
+const typename PipelineLibraryCache<Key, KeyHash>::Entry*
+PipelineLibraryCache<Key, KeyHash>::Find(const Key& key) {
 	Common::LockGuard lock(m_mutex);
 	const auto        iter = m_entries.find(key);
 	if (iter == m_entries.end()) {
@@ -1192,8 +1195,9 @@ const FragmentLibraryCache::Entry* FragmentLibraryCache::Find(const FragmentLibr
 	return iter->second.get();
 }
 
-const FragmentLibraryCache::Entry* FragmentLibraryCache::Insert(const FragmentLibraryKey& key,
-                                                                const Entry&              entry) {
+template <typename Key, typename KeyHash>
+const typename PipelineLibraryCache<Key, KeyHash>::Entry*
+PipelineLibraryCache<Key, KeyHash>::Insert(const Key& key, const Entry& entry) {
 	Common::LockGuard lock(m_mutex);
 	const auto        iter = m_entries.find(key);
 	if (iter != m_entries.end()) {
@@ -1210,7 +1214,8 @@ const FragmentLibraryCache::Entry* FragmentLibraryCache::Insert(const FragmentLi
 	return inserted_iter->second.get();
 }
 
-void FragmentLibraryCache::MaybeLogHitRateLocked() const {
+template <typename Key, typename KeyHash>
+void PipelineLibraryCache<Key, KeyHash>::MaybeLogHitRateLocked() const {
 	const auto total = m_hits + m_misses;
 	if (total == 0 || (total & (total - 1u)) != 0u || total == m_reported) {
 		return;
@@ -1219,7 +1224,8 @@ void FragmentLibraryCache::MaybeLogHitRateLocked() const {
 	LogHitRate();
 }
 
-void FragmentLibraryCache::LogHitRate() const {
+template <typename Key, typename KeyHash>
+void PipelineLibraryCache<Key, KeyHash>::LogHitRate() const {
 	const auto total = m_hits + m_misses;
 	if (total == 0) {
 		return;
@@ -1231,9 +1237,9 @@ void FragmentLibraryCache::LogHitRate() const {
 	m_reported_misses       = m_misses;
 	// Note 156 estimated 34-47 % of a run's fragment libraries would be repeats, from a static
 	// sweep of the dumped shader corpus. This is that estimate measured on the run that just ran.
-	std::printf("FragmentLibraries: built %" PRIu64 " | reused %" PRIu64 " | lookups %" PRIu64
+	std::printf("%s: built %" PRIu64 " | reused %" PRIu64 " | lookups %" PRIu64
 	            " | hit rate %.1f%% | since last: built %" PRIu64 " reused %" PRIu64 " (%.1f%%)\n",
-	            m_misses, m_hits, total,
+	            m_name, m_misses, m_hits, total,
 	            100.0 * static_cast<double>(m_hits) / static_cast<double>(total), since_built,
 	            since_reused,
 	            since_total == 0
@@ -1242,23 +1248,24 @@ void FragmentLibraryCache::LogHitRate() const {
 	std::fflush(stdout);
 }
 
+template class PipelineLibraryCache<FragmentLibraryKey, FragmentLibraryKeyHash>;
+template class PipelineLibraryCache<PreRasterLibraryKey, PreRasterLibraryKeyHash>;
+
 PipelineCache::PipelineCache(GraphicContext& graphics)
     : m_graphics(graphics),
       m_program_cache(std::make_unique<ProgramCache>(graphics.device, graphics.subgroup_size)) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	EnsurePipelineStallWatchdog();
 	InitializeDriverCache();
-	if (graphics.pipeline_library_enabled) {
-		m_fragment_libraries = std::make_unique<FragmentLibraryCache>(graphics);
+	if (graphics.pipeline_library_fast_linking) {
+		m_libraries = std::make_unique<PipelineLibraries>(graphics);
 	}
 }
 
 void PipelineCache::DestroyPipelineObjects(const Pipeline& pipeline) {
-	// The fragment library is owned by FragmentLibraryCache and shared, so it is not destroyed
-	// here; these three belong to this pipeline alone. Destroying a null handle is a no-op, which
-	// is what every monolithic pipeline hits.
+	// The pre-rasterization and fragment libraries are shared and owned by PipelineLibraries; these
+	// two belong to this pipeline alone. Destroying a null handle is a no-op.
 	m_graphics.device.destroyPipeline(pipeline.library_vertex_input, nullptr);
-	m_graphics.device.destroyPipeline(pipeline.library_pre_raster, nullptr);
 	m_graphics.device.destroyPipeline(pipeline.library_fragment_output, nullptr);
 	m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
 	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
@@ -1278,8 +1285,8 @@ PipelineCache::~PipelineCache() {
 	};
 	destroy(m_graphics_pipelines);
 	destroy(m_compute_pipelines);
-	// After the pipelines, because a linked pipeline references its fragment library.
-	m_fragment_libraries.reset();
+	// After the pipelines, because a linked pipeline references its shared libraries.
+	m_libraries.reset();
 	if (m_driver_cache != nullptr) {
 		m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	}
@@ -1726,8 +1733,8 @@ bool PipelineStaticParameters::operator==(const PipelineStaticParameters& other)
 // Field by field rather than memcmp: the struct has padding, and a library served on a padding
 // byte would be served on nothing at all.
 bool FragmentLibraryKey::operator==(const FragmentLibraryKey& other) const noexcept {
-	return ps_shader_id == other.ps_shader_id && samples == other.samples &&
-	       sample_shading_enable == other.sample_shading_enable &&
+	return ps_shader_id == other.ps_shader_id && push_stages == other.push_stages &&
+	       samples == other.samples && sample_shading_enable == other.sample_shading_enable &&
 	       stencil_test_enable == other.stencil_test_enable &&
 	       std::memcmp(&stencil_front, &other.stencil_front, sizeof(stencil_front)) == 0 &&
 	       std::memcmp(&stencil_back, &other.stencil_back, sizeof(stencil_back)) == 0 &&
@@ -1743,6 +1750,7 @@ static void MixFragmentKey(std::size_t& hash, std::size_t value) {
 std::size_t FragmentLibraryKeyHash::operator()(const FragmentLibraryKey& key) const noexcept {
 	std::size_t hash = 0;
 	MixFragmentKey(hash, static_cast<std::size_t>(key.ps_shader_id));
+	MixFragmentKey(hash, key.push_stages);
 	MixFragmentKey(hash, key.samples);
 	MixFragmentKey(hash, static_cast<std::size_t>(key.sample_shading_enable) |
 	                         (static_cast<std::size_t>(key.stencil_test_enable) << 1u));
@@ -1756,6 +1764,25 @@ std::size_t FragmentLibraryKeyHash::operator()(const FragmentLibraryKey& key) co
 	}
 	MixFragmentKey(hash, static_cast<std::size_t>(key.depth_format));
 	MixFragmentKey(hash, static_cast<std::size_t>(key.stencil_format));
+	return hash;
+}
+
+std::size_t PreRasterLibraryKeyHash::operator()(const PreRasterLibraryKey& key) const noexcept {
+	std::size_t hash = 0;
+	for (const auto id: key.vertex_shader_ids) {
+		MixFragmentKey(hash, static_cast<std::size_t>(id));
+	}
+	MixFragmentKey(hash, static_cast<std::size_t>(key.rect_list_ps_shader_id));
+	MixFragmentKey(hash, key.push_stages);
+	MixFragmentKey(hash, key.patch_control_points);
+	MixFragmentKey(hash, static_cast<std::size_t>(key.rect_list) |
+	                         (static_cast<std::size_t>(key.negative_one_to_one) << 1u) |
+	                         (static_cast<std::size_t>(key.depth_clip_enable) << 2u) |
+	                         (static_cast<std::size_t>(key.cull_front) << 3u) |
+	                         (static_cast<std::size_t>(key.cull_back) << 4u) |
+	                         (static_cast<std::size_t>(key.face) << 5u) |
+	                         (static_cast<std::size_t>(key.provoking_vtx_last) << 6u));
+	MixFragmentKey(hash, static_cast<std::size_t>(key.polygon_mode));
 	return hash;
 }
 
@@ -1950,7 +1977,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 		                            ps_active ? pixel_program.spirv_words : 0);
 		CreatePipelineInternal(m_graphics, *cached, rendering, key.vertex_input, vertex_info,
 		                       ps_input_info, programs, static_params, m_driver_cache,
-		                       m_fragment_libraries.get());
+		                       m_libraries.get());
 	}
 
 	LogPipelineTrace("CreatePipelineInternal done", vs_id, ps_id);

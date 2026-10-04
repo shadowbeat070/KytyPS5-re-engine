@@ -361,12 +361,14 @@ CreateGraphicsDescriptorLayouts(GraphicContext& graphics, PipelineCache::Pipelin
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(
-    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-    const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
-    std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info,
-    const PipelineCache::GraphicsPrograms& programs, const PipelineStaticParameters& static_params,
-    vk::PipelineCache driver_cache, FragmentLibraryCache* fragment_libraries) {
+void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+                            const PipelineRenderingState&          rendering,
+                            const PipelineVertexInputState&        vertex_input,
+                            std::span<const ShaderVertexInputInfo> vertex_info,
+                            const ShaderPixelInputInfo*            ps_input_info,
+                            const PipelineCache::GraphicsPrograms& programs,
+                            const PipelineStaticParameters&        static_params,
+                            vk::PipelineCache driver_cache, PipelineLibraries* libraries) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -382,15 +384,9 @@ void CreatePipelineInternal(
 	const bool rect_list =
 	    !mesh && !tessellation && static_params.topology == vk::PrimitiveTopology::ePatchList;
 
-	// Whether this pipeline is built from four libraries or as one monolithic pipeline.
-	//
-	// Declined for anything the measurement did not cover, because a wrongly partitioned pipeline
-	// links and draws *wrongly* rather than failing. A depth-only draw has no fragment library to
-	// share and is the case the whole change exists to exploit, so it is not worth the risk; mesh
-	// and rect-list pipelines put extra stages in the pre-rasterization subset, which was never
-	// probed. RE9 has no mesh shaders at all ("GS 0" in every run), so that exclusion costs it
-	// nothing.
-	const bool library_path = fragment_libraries != nullptr && ps_active && !mesh && !rect_list;
+	// Whether this pipeline is linked from libraries or built as one monolithic pipeline.
+	// Mesh pipelines stay monolithic: linked from libraries they lose the device in RE9.
+	const bool library_path = libraries != nullptr && !mesh;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
@@ -600,11 +596,13 @@ void CreatePipelineInternal(
 	std::vector<vk::DescriptorSetLayoutBinding> pixel_bindings;
 	std::vector<vk::DescriptorSetLayoutBinding> bindless_bindings;
 	vk::ShaderStageFlags graphics_stages = vk::ShaderStageFlagBits::eFragment;
+	bool                 vertex_bindless = false;
 	for (const auto& stage: vertex_info) {
 		const auto native_stage = NativeShaderStage(stage.logical_stage);
 		AddLayoutBindings(vertex_bindings, *stage.stage.program, native_stage);
 		AddBindlessLimitBindings(bindless_bindings, *stage.stage.program, native_stage);
 		graphics_stages |= native_stage;
+		vertex_bindless = vertex_bindless || stage.stage.program->bindings.uses_bindless;
 	}
 
 	bool pixel_bindless = false;
@@ -736,11 +734,13 @@ void CreatePipelineInternal(
 		result = graphics.device.createGraphicsPipelines(driver_cache, 1, &pipeline_info, nullptr,
 		                                                 &pipeline.pipeline);
 	} else {
-		// Four libraries, linked. Only the fragment one is shared; see FragmentLibraryCache.
-		EXIT_IF(shader_stage_count != 2);
-		const auto* vertex_stage_info   = &shader_stages[0];
-		const auto* fragment_stage_info = &shader_stages[1];
-		EXIT_IF(fragment_stage_info->stage != vk::ShaderStageFlagBits::eFragment);
+		// Four libraries, fast-linked. The pre-rasterization and fragment ones are shared; see
+		// PipelineLibraries. A depth-only pipeline's fragment library has no shader.
+		const uint32_t pre_raster_stage_count = shader_stage_count - (ps_active ? 1u : 0u);
+		const auto*    fragment_stage_info =
+		    ps_active ? &shader_stages[pre_raster_stage_count] : nullptr;
+		EXIT_IF(pre_raster_stage_count == 0);
+		EXIT_IF(ps_active && fragment_stage_info->stage != vk::ShaderStageFlagBits::eFragment);
 
 		// The dynamic state, partitioned. Every entry here was confirmed against the validation
 		// layer in its stated subset (note 159 §1.2); a state in the wrong library is dropped
@@ -780,69 +780,121 @@ void CreatePipelineInternal(
 		vk::PipelineRenderingCreateInfo fragment_rendering {};
 		fragment_rendering.depthAttachmentFormat   = rendering.depth_format;
 		fragment_rendering.stencilAttachmentFormat = rendering.stencil_format;
+		// Only the view mask reaches the pre-rasterization subset, and it is always zero here.
+		const vk::PipelineRenderingCreateInfo pre_raster_rendering {};
 
-		const auto build_library = [&](vk::GraphicsPipelineLibraryFlagsEXT      parts,
-		                               const std::vector<vk::DynamicState>&     dyn,
-		                               vk::PipelineLayout                       layout,
-		                               const vk::PipelineShaderStageCreateInfo* stage,
-		                               const vk::PipelineRenderingCreateInfo*   render) {
-			vk::PipelineDynamicStateCreateInfo dynamic {};
-			dynamic.dynamicStateCount = static_cast<uint32_t>(dyn.size());
-			dynamic.pDynamicStates    = dyn.data();
+		const auto build_library =
+		    [&](vk::GraphicsPipelineLibraryFlagsEXT parts, const std::vector<vk::DynamicState>& dyn,
+		        vk::PipelineLayout layout, const vk::PipelineShaderStageCreateInfo* stage,
+		        uint32_t stage_count, const vk::PipelineRenderingCreateInfo* render) {
+			    vk::PipelineDynamicStateCreateInfo dynamic {};
+			    dynamic.dynamicStateCount = static_cast<uint32_t>(dyn.size());
+			    dynamic.pDynamicStates    = dyn.data();
 
-			vk::GraphicsPipelineLibraryCreateInfoEXT library {};
-			library.pNext = render;
-			library.flags = parts;
+			    vk::GraphicsPipelineLibraryCreateInfoEXT library {};
+			    library.pNext = render;
+			    library.flags = parts;
 
-			vk::GraphicsPipelineCreateInfo info {};
-			info.pNext             = &library;
-			info.flags             = vk::PipelineCreateFlagBits::eLibraryKHR;
-			info.layout            = layout;
-			info.basePipelineIndex = -1;
-			info.pDynamicState     = dyn.empty() ? nullptr : &dynamic;
-			if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface) {
-				info.pVertexInputState   = &vertex_input_info;
-				info.pInputAssemblyState = &input_assembly;
-			}
-			if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders) {
-				info.stageCount          = 1;
-				info.pStages             = stage;
-				info.pViewportState      = &viewport_state;
-				info.pRasterizationState = &rasterizer;
-			}
-			if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader) {
-				info.stageCount = 1;
-				info.pStages    = stage;
-				// Always, unlike the monolithic path: a fragment-shader library without fragment
-				// output state has no render pass to infer from, so the structure is required
-				// (VUID-VkGraphicsPipelineCreateInfo-renderPass-09035).
-				info.pDepthStencilState = &depth_stencil_info;
-				info.pMultisampleState  = &multisampling;
-			}
-			if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface) {
-				info.pColorBlendState  = &color_blending;
-				info.pMultisampleState = &multisampling;
-			}
-			vk::Pipeline built = nullptr;
-			const auto   built_result =
-			    graphics.device.createGraphicsPipelines(driver_cache, 1, &info, nullptr, &built);
-			EXIT_NOT_IMPLEMENTED(built_result != vk::Result::eSuccess);
-			EXIT_NOT_IMPLEMENTED(built == nullptr);
-			return built;
-		};
+			    vk::GraphicsPipelineCreateInfo info {};
+			    info.pNext             = &library;
+			    info.flags             = vk::PipelineCreateFlagBits::eLibraryKHR;
+			    info.layout            = layout;
+			    info.basePipelineIndex = -1;
+			    info.pDynamicState     = dyn.empty() ? nullptr : &dynamic;
+			    if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface) {
+				    info.pVertexInputState   = &vertex_input_info;
+				    info.pInputAssemblyState = &input_assembly;
+			    }
+			    if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders) {
+				    info.stageCount          = stage_count;
+				    info.pStages             = stage;
+				    info.pViewportState      = &viewport_state;
+				    info.pRasterizationState = &rasterizer;
+				    info.pTessellationState =
+				        (rect_list || tessellation) ? &tessellation_state : nullptr;
+			    }
+			    if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader) {
+				    info.stageCount = stage_count;
+				    info.pStages    = stage_count != 0 ? stage : nullptr;
+				    // Always, unlike the monolithic path: a fragment-shader library without
+				    // fragment output state has no render pass to infer from, so the structure is
+				    // required (VUID-VkGraphicsPipelineCreateInfo-renderPass-09035).
+				    info.pDepthStencilState = &depth_stencil_info;
+				    info.pMultisampleState  = &multisampling;
+			    }
+			    if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface) {
+				    info.pColorBlendState  = &color_blending;
+				    info.pMultisampleState = &multisampling;
+			    }
+			    vk::Pipeline built        = nullptr;
+			    const auto   built_result = graphics.device.createGraphicsPipelines(
+			        driver_cache, 1, &info, nullptr, &built);
+			    EXIT_NOT_IMPLEMENTED(built_result != vk::Result::eSuccess);
+			    EXIT_NOT_IMPLEMENTED(built == nullptr);
+			    return built;
+		    };
 
 		pipeline.library_vertex_input =
 		    build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface, {},
-		                  pipeline.pipeline_layout, nullptr, &rendering_info);
-		pipeline.library_pre_raster = build_library(
-		    vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders, pre_raster_dynamic,
-		    pipeline.pipeline_layout, vertex_stage_info, &rendering_info);
+		                  pipeline.pipeline_layout, nullptr, 0, &rendering_info);
 		pipeline.library_fragment_output =
 		    build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
-		                  output_dynamic, pipeline.pipeline_layout, nullptr, &rendering_info);
+		                  output_dynamic, pipeline.pipeline_layout, nullptr, 0, &rendering_info);
+
+		const auto push_stages =
+		    static_cast<uint32_t>(static_cast<vk::ShaderStageFlags::MaskType>(graphics_stages));
+
+		PreRasterLibraryKey pre_raster_key {};
+		for (uint32_t i = 0; i < vertex_info.size(); i++) {
+			pre_raster_key.vertex_shader_ids[i] = programs.vertex[i].id;
+		}
+		pre_raster_key.rect_list              = rect_list;
+		pre_raster_key.rect_list_ps_shader_id = rect_list && ps_active ? pixel_program.id : 0;
+		pre_raster_key.push_stages            = push_stages;
+		pre_raster_key.patch_control_points =
+		    (rect_list || tessellation) ? tessellation_state.patchControlPoints : 0u;
+		pre_raster_key.negative_one_to_one = static_params.negative_one_to_one;
+		pre_raster_key.depth_clip_enable   = static_params.depth_clip_enable;
+		pre_raster_key.cull_front          = static_params.cull_front;
+		pre_raster_key.cull_back           = static_params.cull_back;
+		pre_raster_key.face                = static_params.face;
+		pre_raster_key.provoking_vtx_last  = static_params.provoking_vtx_last;
+		pre_raster_key.polygon_mode        = static_params.polygon_mode;
+
+		const auto* pre_raster = libraries->pre_raster.Find(pre_raster_key);
+		if (pre_raster == nullptr) {
+			// Like the fragment entry, the cache owns its own set 0 layout; `vertex_bindings` and
+			// so the push-descriptor decision are a function of the vertex programs the key pins.
+			PreRasterLibraryCache::Entry fresh {};
+			fresh.set_layout = CreateOneDescriptorLayout(graphics, pipeline.uses_push_descriptors,
+			                                             vertex_bindings);
+
+			const vk::DescriptorSetLayout
+			    pre_raster_sets[ShaderRecompiler::IR::BindlessDescriptorSet + 1u] = {
+			        fresh.set_layout, nullptr,
+			        vertex_bindless ? BindlessImageHeap::SetLayout(graphics) : nullptr};
+			vk::PipelineLayoutCreateInfo pre_raster_layout_info {};
+			pre_raster_layout_info.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
+			pre_raster_layout_info.setLayoutCount =
+			    vertex_bindless ? ShaderRecompiler::IR::BindlessDescriptorSet + 1u : 1u;
+			pre_raster_layout_info.pSetLayouts            = pre_raster_sets;
+			pre_raster_layout_info.pushConstantRangeCount = 1;
+			pre_raster_layout_info.pPushConstantRanges    = &push_constants;
+			EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&pre_raster_layout_info,
+			                                                          nullptr, &fresh.layout) !=
+			                     vk::Result::eSuccess);
+
+			fresh.library =
+			    build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
+			                  pre_raster_dynamic, fresh.layout, shader_stages,
+			                  pre_raster_stage_count, &pre_raster_rendering);
+			pre_raster = libraries->pre_raster.Insert(pre_raster_key, fresh);
+		}
+		EXIT_IF(pre_raster == nullptr);
 
 		FragmentLibraryKey fragment_key {};
-		fragment_key.ps_shader_id          = pixel_program.id;
+		fragment_key.ps_shader_id          = ps_active ? pixel_program.id : 0;
+		fragment_key.push_stages           = push_stages;
 		fragment_key.samples               = static_params.samples;
 		fragment_key.sample_shading_enable = static_params.sample_shading_enable;
 		fragment_key.stencil_test_enable   = static_params.stencil_test_enable;
@@ -851,14 +903,15 @@ void CreatePipelineInternal(
 		fragment_key.depth_format          = rendering.depth_format;
 		fragment_key.stencil_format        = rendering.stencil_format;
 
-		const auto* entry = fragment_libraries->Find(fragment_key);
+		const auto* entry = libraries->fragment.Find(fragment_key);
 		if (entry == nullptr) {
 			// The cache owns its own copy of the set 1 layout rather than borrowing this
 			// pipeline's, because the library outlives any one pipeline. Vulkan defines layout
 			// compatibility by content, so the two are interchangeable at link time; they are built
 			// from the same `pixel_bindings`, which the key's ps_shader_id pins.
 			FragmentLibraryCache::Entry fresh {};
-			fresh.set_layout = CreateOneDescriptorLayout(graphics, false, pixel_bindings);
+			fresh.set_layout =
+			    ps_active ? CreateOneDescriptorLayout(graphics, false, pixel_bindings) : nullptr;
 
 			const vk::DescriptorSetLayout
 			    fragment_sets[ShaderRecompiler::IR::BindlessDescriptorSet + 1u] = {
@@ -868,7 +921,8 @@ void CreatePipelineInternal(
 			fragment_layout_info.flags = vk::PipelineLayoutCreateFlagBits::eIndependentSetsEXT;
 			fragment_layout_info.setLayoutCount =
 			    pixel_bindless ? ShaderRecompiler::IR::BindlessDescriptorSet + 1u
-			                   : ShaderRecompiler::IR::NativeDescriptorSetCount;
+			    : ps_active    ? ShaderRecompiler::IR::NativeDescriptorSetCount
+			                   : 0u;
 			fragment_layout_info.pSetLayouts            = fragment_sets;
 			fragment_layout_info.pushConstantRangeCount = 1;
 			fragment_layout_info.pPushConstantRanges    = &push_constants;
@@ -878,17 +932,16 @@ void CreatePipelineInternal(
 
 			fresh.library = build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader,
 			                              fragment_dynamic, fresh.layout, fragment_stage_info,
-			                              &fragment_rendering);
-			entry         = fragment_libraries->Insert(fragment_key, fresh);
+			                              ps_active ? 1u : 0u, &fragment_rendering);
+			entry         = libraries->fragment.Insert(fragment_key, fresh);
 		}
 		EXIT_IF(entry == nullptr);
 
-		const vk::Pipeline libraries[4] = {pipeline.library_vertex_input,
-		                                   pipeline.library_pre_raster, entry->library,
-		                                   pipeline.library_fragment_output};
+		const vk::Pipeline linked[4] = {pipeline.library_vertex_input, pre_raster->library,
+		                                entry->library, pipeline.library_fragment_output};
 		vk::PipelineLibraryCreateInfoKHR link {};
 		link.libraryCount = 4;
-		link.pLibraries   = libraries;
+		link.pLibraries   = linked;
 
 		vk::GraphicsPipelineCreateInfo linked_info {};
 		linked_info.pNext             = &link;
