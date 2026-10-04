@@ -3,6 +3,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/Tessellation.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -1469,6 +1470,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		refused.status.reason = std::move(refusal);
 		refused.program       = std::move(ir);
 		return refused;
+	}
+	if (spirv.size() >= Spirv::DriverSimplifyMinWords()) {
+		Spirv::SimplifyForDriver(spirv);
 	}
 	LOGF("%s phase end: stage=%s hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " elapsed_ms=%" PRIu64 "\n",

@@ -11,6 +11,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
@@ -325,6 +326,15 @@ void CheckSpirvBinaryValidates(const std::vector<uint32_t> &binary) {
 
   if (!tools.Validate(binary)) {
     std::fprintf(stderr, "SPIR-V binary validation failed:\n%s\n",
+                 messages.c_str());
+    std::abort();
+  }
+  // Whatever the size threshold, the driver simplification of every module
+  // these tests build must validate too.
+  auto simplified = binary;
+  if (ShaderRecompiler::Spirv::SimplifyForDriver(simplified) &&
+      !tools.Validate(simplified)) {
+    std::fprintf(stderr, "driver-simplified SPIR-V validation failed:\n%s\n",
                  messages.c_str());
     std::abort();
   }
@@ -12508,6 +12518,124 @@ void TestTypedSpirvSerialization() {
                       0x80000000u);
 }
 
+// A guarded storage-buffer load and a guarded LDS load run unconditionally (the LDS index clamped
+// to element 0 when the guard is false), the exec-style select chain reads through, and a guarded
+// store and a guarded volatile load keep their branches.
+void TestDriverSimplifySpeculatesGuardedLoads() {
+  const char *text = R"(
+               OpCapability Shader
+               OpMemoryModel Logical GLSL450
+               OpEntryPoint GLCompute %main "main" %gid %buf %lds
+               OpExecutionMode %main LocalSize 64 1 1
+               OpDecorate %gid BuiltIn GlobalInvocationId
+               OpDecorate %arr ArrayStride 4
+               OpMemberDecorate %blk 0 Offset 0
+               OpDecorate %blk Block
+               OpDecorate %buf DescriptorSet 0
+               OpDecorate %buf Binding 0
+       %void = OpTypeVoid
+         %fn = OpTypeFunction %void
+        %u32 = OpTypeInt 32 0
+       %bool = OpTypeBool
+         %v3 = OpTypeVector %u32 3
+        %pv3 = OpTypePointer Input %v3
+        %gid = OpVariable %pv3 Input
+        %arr = OpTypeRuntimeArray %u32
+        %blk = OpTypeStruct %arr
+       %pblk = OpTypePointer StorageBuffer %blk
+        %buf = OpVariable %pblk StorageBuffer
+       %pu32 = OpTypePointer StorageBuffer %u32
+         %c0 = OpConstant %u32 0
+         %c1 = OpConstant %u32 1
+        %c64 = OpConstant %u32 64
+    %lds_arr = OpTypeArray %u32 %c64
+       %plds = OpTypePointer Workgroup %lds_arr
+        %lds = OpVariable %plds Workgroup
+      %pwu32 = OpTypePointer Workgroup %u32
+       %main = OpFunction %void None %fn
+      %entry = OpLabel
+          %g = OpLoad %v3 %gid
+          %x = OpCompositeExtract %u32 %g 0
+        %len = OpArrayLength %u32 %buf 0
+        %inb = OpULessThan %bool %x %len
+               OpSelectionMerge %m1 None
+               OpBranchConditional %inb %t1 %m1
+         %t1 = OpLabel
+         %p1 = OpAccessChain %pu32 %buf %c0 %x
+         %v1 = OpLoad %u32 %p1
+               OpBranch %m1
+         %m1 = OpLabel
+         %r1 = OpPhi %u32 %v1 %t1 %c0 %entry
+        %odd = OpBitwiseAnd %u32 %x %c1
+       %even = OpIEqual %bool %odd %c0
+               OpSelectionMerge %m2 None
+               OpBranchConditional %even %m2 %t2
+         %t2 = OpLabel
+         %p2 = OpAccessChain %pwu32 %lds %x
+         %v2 = OpLoad %u32 %p2
+               OpBranch %m2
+         %m2 = OpLabel
+         %r2 = OpPhi %u32 %c1 %m1 %v2 %t2
+         %s1 = OpSelect %u32 %even %r1 %r2
+         %a1 = OpIAdd %u32 %s1 %c1
+         %s2 = OpSelect %u32 %even %a1 %s1
+               OpSelectionMerge %m3 None
+               OpBranchConditional %inb %t3 %m3
+         %t3 = OpLabel
+         %p3 = OpAccessChain %pu32 %buf %c0 %x
+         %w3 = OpLoad %u32 %p3 Volatile
+               OpBranch %m3
+         %m3 = OpLabel
+         %r3 = OpPhi %u32 %w3 %t3 %c0 %m2
+         %s3 = OpIAdd %u32 %s2 %r3
+               OpSelectionMerge %m4 None
+               OpBranchConditional %inb %t4 %m4
+         %t4 = OpLabel
+         %p4 = OpAccessChain %pu32 %buf %c0 %x
+               OpStore %p4 %s3
+               OpBranch %m4
+         %m4 = OpLabel
+               OpReturn
+               OpFunctionEnd
+)";
+  spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+  std::vector<uint32_t> binary;
+  Check(tools.Assemble(text, &binary), "driver simplify fixture did not assemble");
+  CheckSpirvBinaryValidates(binary);
+
+  ShaderRecompiler::Spirv::DriverSimplifyStats stats;
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(binary, &stats),
+        "driver simplify refused a module it emitted the shape of");
+  CheckSpirvBinaryValidates(binary);
+  Check(stats.speculated_branches == 2,
+        "driver simplify: the two guarded loads were not both speculated");
+  Check(stats.clamped_loads == 1,
+        "driver simplify: the LDS load was not clamped, or the buffer load was");
+  Check(stats.forwarded_operands >= 1,
+        "driver simplify: the predicated add did not read through its select");
+
+  const auto source = DisassembleSpirvBinary(binary);
+  const auto count = [&](const char *needle) {
+    size_t n = 0;
+    for (auto at = source.find(needle); at != std::string::npos;
+         at = source.find(needle, at + 1)) {
+      n++;
+    }
+    return n;
+  };
+  Check(count("OpSelectionMerge") == 2,
+        "driver simplify: the volatile load or the store lost its branch");
+  Check(count("OpPhi") == 1, "driver simplify: a speculated merge kept its phi");
+  Check(count("Volatile") == 1, "driver simplify: the volatile load changed");
+  Check(count("OpStore") == 1, "driver simplify: the store changed");
+
+  // Running it again finds nothing more to speculate and changes nothing.
+  auto again = binary;
+  Check(ShaderRecompiler::Spirv::SimplifyForDriver(again, &stats) &&
+            stats.speculated_branches == 0 && again == binary,
+        "driver simplify is not idempotent");
+}
+
 void TestDeferredSpirvPhiPatching() {
   ShaderRecompiler::Spirv::Builder builder;
   const auto type = builder.Type(spv::OpTypeInt, 32u, 0u);
@@ -16159,6 +16287,7 @@ int main() {
   TestFunctionLdsIsSizedFromItsAddresses();
   TestTypedSpirvSerialization();
   TestDeferredSpirvPhiPatching();
+  TestDriverSimplifySpeculatesGuardedLoads();
   TestCompilerStageInputOwnership();
   TestSpirvEmissionOwnsRequirements();
   TestRepeatedExportsHaveOneInterface();
