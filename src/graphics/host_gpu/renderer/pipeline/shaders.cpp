@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <limits>
 #include <span>
 #include <vector>
@@ -179,15 +180,15 @@ static vk::BlendOp GetBlendOp(uint32_t op) {
 	return vk::BlendOp::eAdd;
 }
 
-static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descriptor_bindings,
+static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>&    descriptor_bindings,
                               const ShaderRecompiler::IR::CompiledShaderInfo& program,
-                              vk::ShaderStageFlagBits              stage) {
+                              vk::ShaderStageFlagBits                         stage) {
 	for (auto mask = program.bindings.descriptor_mask; mask != 0; mask &= mask - 1) {
 		const auto index = std::countr_zero(mask);
-		const auto kind = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
-		descriptor_bindings.push_back(
-		    {ShaderRecompiler::IR::NativeBinding(program.stage, kind), NativeDescriptorType(kind),
-		     program.bindings.descriptor_counts[index], stage, nullptr});
+		const auto kind  = static_cast<ShaderRecompiler::IR::DescriptorBindingKind>(index);
+		descriptor_bindings.push_back({ShaderRecompiler::IR::NativeBinding(program.stage, kind),
+		                               NativeDescriptorType(kind),
+		                               program.bindings.descriptor_counts[index], stage, nullptr});
 	}
 }
 
@@ -198,7 +199,7 @@ static void AddLayoutBindings(std::vector<vk::DescriptorSetLayoutBinding>& descr
 // name it here, where both counts are in hand. Every binding carries exactly one stage flag
 // (AddLayoutBindings sets it per program), so a per-stage total is a sum over the bindings of that
 // stage.
-static void CheckDescriptorLayoutLimits(GraphicContext&                                graphics,
+static void CheckDescriptorLayoutLimits(GraphicContext&                                 graphics,
                                         std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	const auto& limits = graphics.GetPhysicalDeviceProperties().limits;
 	struct Counts {
@@ -229,9 +230,15 @@ static void CheckDescriptorLayoutLimits(GraphicContext&                         
 		}
 		for (auto* entry: {counts, &whole_set}) {
 			switch (binding.descriptorType) {
-				case vk::DescriptorType::eSampledImage: entry->sampled_image += binding.descriptorCount; break;
-				case vk::DescriptorType::eStorageImage: entry->storage_image += binding.descriptorCount; break;
-				case vk::DescriptorType::eStorageBuffer: entry->storage_buffer += binding.descriptorCount; break;
+				case vk::DescriptorType::eSampledImage:
+					entry->sampled_image += binding.descriptorCount;
+					break;
+				case vk::DescriptorType::eStorageImage:
+					entry->storage_image += binding.descriptorCount;
+					break;
+				case vk::DescriptorType::eStorageBuffer:
+					entry->storage_buffer += binding.descriptorCount;
+					break;
 				case vk::DescriptorType::eSampler: entry->sampler += binding.descriptorCount; break;
 				default: break;
 			}
@@ -275,15 +282,14 @@ static uint32_t DescriptorCount(std::span<const vk::DescriptorSetLayoutBinding> 
 // One set layout. The push-descriptor flag is decided by the caller over *every* set the pipeline
 // will have, not per set: pushing is all-or-nothing for a pipeline here, and a layout created
 // without the flag cannot be pushed to.
-static vk::DescriptorSetLayout CreateOneDescriptorLayout(
-    GraphicContext& graphics, bool push_descriptors,
-    std::span<const vk::DescriptorSetLayoutBinding> bindings) {
+static vk::DescriptorSetLayout
+CreateOneDescriptorLayout(GraphicContext& graphics, bool push_descriptors,
+                          std::span<const vk::DescriptorSetLayoutBinding> bindings) {
 	vk::DescriptorSetLayoutCreateInfo create {};
-	create.flags        = push_descriptors
-	                          ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
-	                          : vk::DescriptorSetLayoutCreateFlags {};
-	create.bindingCount = static_cast<uint32_t>(bindings.size());
-	create.pBindings    = bindings.data();
+	create.flags = push_descriptors ? vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR
+	                                : vk::DescriptorSetLayoutCreateFlags {};
+	create.bindingCount            = static_cast<uint32_t>(bindings.size());
+	create.pBindings               = bindings.data();
 	vk::DescriptorSetLayout layout = nullptr;
 	EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &layout) !=
 	        vk::Result::eSuccess);
@@ -306,8 +312,7 @@ static void CreateDescriptorLayout(GraphicContext& graphics, PipelineCache::Pipe
 	std::vector<vk::DescriptorSetLayoutBinding> checked(bindings.begin(), bindings.end());
 	checked.insert(checked.end(), bindless.begin(), bindless.end());
 	CheckDescriptorLayoutLimits(graphics, checked);
-	pipeline.uses_push_descriptors =
-	    DescriptorCount(bindings) <= graphics.max_push_descriptors;
+	pipeline.uses_push_descriptors = DescriptorCount(bindings) <= graphics.max_push_descriptors;
 	pipeline.descriptor_set_layout =
 	    CreateOneDescriptorLayout(graphics, pipeline.uses_push_descriptors, bindings);
 }
@@ -343,8 +348,8 @@ CreateGraphicsDescriptorLayouts(GraphicContext& graphics, PipelineCache::Pipelin
 	    DescriptorCount(vertex_bindings) <= graphics.max_push_descriptors;
 
 	uint32_t   push_sets = 0;
-	const auto MakeSet   = [&](bool push,
-                             std::span<const vk::DescriptorSetLayoutBinding> set_bindings) {
+	const auto MakeSet   = [&](bool                                            push,
+	                           std::span<const vk::DescriptorSetLayoutBinding> set_bindings) {
 		push_sets += push ? 1u : 0u;
 		EXIT_IF(push_sets > 1);
 		return CreateOneDescriptorLayout(graphics, push, set_bindings);
@@ -359,15 +364,12 @@ CreateGraphicsDescriptorLayouts(GraphicContext& graphics, PipelineCache::Pipelin
 }
 
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
-void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
-                            const PipelineRenderingState&          rendering,
-                            const PipelineVertexInputState&        vertex_input,
-                            std::span<const ShaderVertexInputInfo> vertex_info,
-                            const ShaderPixelInputInfo*            ps_input_info,
-                            const PipelineCache::GraphicsPrograms& programs,
-                            const PipelineStaticParameters&        static_params,
-                            vk::PipelineCache                      driver_cache,
-                            FragmentLibraryCache*                  fragment_libraries) {
+void CreatePipelineInternal(
+    GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
+    const PipelineRenderingState& rendering, const PipelineVertexInputState& vertex_input,
+    std::span<const ShaderVertexInputInfo> vertex_info, const ShaderPixelInputInfo* ps_input_info,
+    const PipelineCache::GraphicsPrograms& programs, const PipelineStaticParameters& static_params,
+    vk::PipelineCache driver_cache, FragmentLibraryCache* fragment_libraries) {
 	const auto& vs_input_info  = vertex_info.front();
 	const auto& vertex_program = programs.vertex[0];
 	const auto& pixel_program  = programs.pixel;
@@ -391,8 +393,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	// and rect-list pipelines put extra stages in the pre-rasterization subset, which was never
 	// probed. RE9 has no mesh shaders at all ("GS 0" in every run), so that exclusion costs it
 	// nothing.
-	const bool library_path =
-	    fragment_libraries != nullptr && ps_active && !mesh && !rect_list;
+	const bool library_path = fragment_libraries != nullptr && ps_active && !mesh && !rect_list;
 
 	vk::ShaderModule tess_control_shader_module = nullptr;
 	vk::ShaderModule tess_eval_shader_module    = nullptr;
@@ -533,21 +534,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 #if !defined(__APPLE__)
 	// The DB clamps depth to the viewport range after polygon offset is applied.
 	rasterizer.depthClampEnable = VK_TRUE;
-	rasterizer.pNext = &clip_ext;
+	rasterizer.pNext            = &clip_ext;
 #endif
 	vk::PipelineRasterizationProvokingVertexStateCreateInfoEXT provoking_vertex {};
 	EXIT_NOT_IMPLEMENTED(static_params.provoking_vtx_last &&
 	                     !graphics.provoking_vertex_last_enabled);
 	if (graphics.provoking_vertex_last_enabled) {
 		provoking_vertex.provokingVertexMode = static_params.provoking_vtx_last
-		    ? vk::ProvokingVertexModeEXT::eLastVertex : vk::ProvokingVertexModeEXT::eFirstVertex;
-		provoking_vertex.pNext = rasterizer.pNext;
-		rasterizer.pNext = &provoking_vertex;
+		                                           ? vk::ProvokingVertexModeEXT::eLastVertex
+		                                           : vk::ProvokingVertexModeEXT::eFirstVertex;
+		provoking_vertex.pNext               = rasterizer.pNext;
+		rasterizer.pNext                     = &provoking_vertex;
 	}
-	rasterizer.cullMode  = cull_mode;
-	rasterizer.frontFace = front_face;
+	rasterizer.cullMode    = cull_mode;
+	rasterizer.frontFace   = front_face;
 	rasterizer.polygonMode = static_params.polygon_mode;
-	rasterizer.lineWidth = 1.0f;
+	rasterizer.lineWidth   = 1.0f;
 
 	vk::PipelineMultisampleStateCreateInfo multisampling {};
 	multisampling.sampleShadingEnable  = static_params.sample_shading_enable ? VK_TRUE : VK_FALSE;
@@ -712,15 +714,15 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	vk::PipelineTessellationStateCreateInfo tessellation_state {};
 	tessellation_state.patchControlPoints =
 	    tessellation ? vs_input_info.tess.input_control_points : 3u;
-	pipeline_info.pTessellationState = (rect_list || tessellation) ? &tessellation_state : nullptr;
-	pipeline_info.pViewportState          = &viewport_state;
-	pipeline_info.pRasterizationState     = &rasterizer;
-	pipeline_info.pMultisampleState       = &multisampling;
-	pipeline_info.pDepthStencilState      = (with_depth ? &depth_stencil_info : nullptr);
-	pipeline_info.pColorBlendState        = &color_blending;
-	pipeline_info.pDynamicState           = &dynamic_state;
-	pipeline_info.layout                  = pipeline.pipeline_layout;
-	pipeline_info.basePipelineIndex       = -1;
+	pipeline_info.pTessellationState  = (rect_list || tessellation) ? &tessellation_state : nullptr;
+	pipeline_info.pViewportState      = &viewport_state;
+	pipeline_info.pRasterizationState = &rasterizer;
+	pipeline_info.pMultisampleState   = &multisampling;
+	pipeline_info.pDepthStencilState  = (with_depth ? &depth_stencil_info : nullptr);
+	pipeline_info.pColorBlendState    = &color_blending;
+	pipeline_info.pDynamicState       = &dynamic_state;
+	pipeline_info.layout              = pipeline.pipeline_layout;
+	pipeline_info.basePipelineIndex   = -1;
 
 	EXIT_IF(pipeline.pipeline != nullptr);
 
@@ -782,9 +784,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		fragment_rendering.depthAttachmentFormat   = rendering.depth_format;
 		fragment_rendering.stencilAttachmentFormat = rendering.stencil_format;
 
-		const auto build_library = [&](vk::GraphicsPipelineLibraryFlagsEXT parts,
-		                               const std::vector<vk::DynamicState>& dyn,
-		                               vk::PipelineLayout                   layout,
+		const auto build_library = [&](vk::GraphicsPipelineLibraryFlagsEXT      parts,
+		                               const std::vector<vk::DynamicState>&     dyn,
+		                               vk::PipelineLayout                       layout,
 		                               const vk::PipelineShaderStageCreateInfo* stage,
 		                               const vk::PipelineRenderingCreateInfo*   render) {
 			vk::PipelineDynamicStateCreateInfo dynamic {};
@@ -796,7 +798,7 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			library.flags = parts;
 
 			vk::GraphicsPipelineCreateInfo info {};
-			info.pNext = &library;
+			info.pNext             = &library;
 			info.flags             = vk::PipelineCreateFlagBits::eLibraryKHR;
 			info.layout            = layout;
 			info.basePipelineIndex = -1;
@@ -812,8 +814,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 				info.pRasterizationState = &rasterizer;
 			}
 			if (parts & vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader) {
-				info.stageCount         = 1;
-				info.pStages            = stage;
+				info.stageCount = 1;
+				info.pStages    = stage;
 				// Always, unlike the monolithic path: a fragment-shader library without fragment
 				// output state has no render pass to infer from, so the structure is required
 				// (VUID-VkGraphicsPipelineCreateInfo-renderPass-09035).
@@ -835,23 +837,22 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 		pipeline.library_vertex_input =
 		    build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eVertexInputInterface, {},
 		                  pipeline.pipeline_layout, nullptr, &rendering_info);
-		pipeline.library_pre_raster =
-		    build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders,
-		                  pre_raster_dynamic, pipeline.pipeline_layout, vertex_stage_info,
-		                  &rendering_info);
+		pipeline.library_pre_raster = build_library(
+		    vk::GraphicsPipelineLibraryFlagBitsEXT::ePreRasterizationShaders, pre_raster_dynamic,
+		    pipeline.pipeline_layout, vertex_stage_info, &rendering_info);
 		pipeline.library_fragment_output =
 		    build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentOutputInterface,
 		                  output_dynamic, pipeline.pipeline_layout, nullptr, &rendering_info);
 
 		FragmentLibraryKey fragment_key {};
-		fragment_key.ps_shader_id             = pixel_program.id;
-		fragment_key.samples                  = static_params.samples;
-		fragment_key.sample_shading_enable    = static_params.sample_shading_enable;
-		fragment_key.stencil_test_enable      = static_params.stencil_test_enable;
-		fragment_key.stencil_front            = static_params.stencil_front;
-		fragment_key.stencil_back             = static_params.stencil_back;
-		fragment_key.depth_format             = rendering.depth_format;
-		fragment_key.stencil_format           = rendering.stencil_format;
+		fragment_key.ps_shader_id          = pixel_program.id;
+		fragment_key.samples               = static_params.samples;
+		fragment_key.sample_shading_enable = static_params.sample_shading_enable;
+		fragment_key.stencil_test_enable   = static_params.stencil_test_enable;
+		fragment_key.stencil_front         = static_params.stencil_front;
+		fragment_key.stencil_back          = static_params.stencil_back;
+		fragment_key.depth_format          = rendering.depth_format;
+		fragment_key.stencil_format        = rendering.stencil_format;
 
 		const auto* entry = fragment_libraries->Find(fragment_key);
 		if (entry == nullptr) {
@@ -874,14 +875,14 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 			fragment_layout_info.pSetLayouts            = fragment_sets;
 			fragment_layout_info.pushConstantRangeCount = 1;
 			fragment_layout_info.pPushConstantRanges    = &push_constants;
-			EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(
-			                         &fragment_layout_info, nullptr, &fresh.layout) !=
+			EXIT_NOT_IMPLEMENTED(graphics.device.createPipelineLayout(&fragment_layout_info,
+			                                                          nullptr, &fresh.layout) !=
 			                     vk::Result::eSuccess);
 
 			fresh.library = build_library(vk::GraphicsPipelineLibraryFlagBitsEXT::eFragmentShader,
 			                              fragment_dynamic, fresh.layout, fragment_stage_info,
 			                              &fragment_rendering);
-			entry = fragment_libraries->Insert(fragment_key, fresh);
+			entry         = fragment_libraries->Insert(fragment_key, fresh);
 		}
 		EXIT_IF(entry == nullptr);
 
@@ -928,8 +929,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 	comp_shader_stage_info.pName  = "main";
 	EXIT_IF(!input_info.stage);
 	const auto wave_size = input_info.stage.program->wave_size;
-	if (graphics.compute_subgroup_size_control_enabled &&
-	    wave_size >= graphics.min_subgroup_size && wave_size <= graphics.max_subgroup_size) {
+	if (graphics.compute_subgroup_size_control_enabled && wave_size >= graphics.min_subgroup_size &&
+	    wave_size <= graphics.max_subgroup_size) {
 		comp_subgroup_size.requiredSubgroupSize = wave_size;
 		comp_shader_stage_info.pNext            = &comp_subgroup_size;
 	}
@@ -960,10 +961,9 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	EXIT_IF(pipeline.pipeline_layout != nullptr);
 
-	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n",
-	     1u);
+	LOGF("PipelineTrace: vkCreatePipelineLayout CS begin set_layouts=1 push_constants=%u\n", 1u);
 	auto result = graphics.device.createPipelineLayout(&pipeline_layout_info, nullptr,
-	                                                  &pipeline.pipeline_layout);
+	                                                   &pipeline.pipeline_layout);
 	LOGF("PipelineTrace: vkCreatePipelineLayout CS done result=%s layout=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline_layout));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
@@ -979,8 +979,8 @@ void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& p
 
 	LOGF("PipelineTrace: vkCreateComputePipelines begin layout=%p\n",
 	     static_cast<void*>(pipeline.pipeline_layout));
-	result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr,
-	                                                &pipeline.pipeline);
+	result =
+	    graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
 	LOGF("PipelineTrace: vkCreateComputePipelines done result=%s pipeline=%p\n",
 	     vk::to_string(result).c_str(), static_cast<void*>(pipeline.pipeline));
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
