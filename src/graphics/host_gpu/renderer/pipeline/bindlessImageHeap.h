@@ -35,13 +35,18 @@ public:
 	void                 Prepare(const ShaderRecompiler::IR::BindlessImageTable& table);
 	[[nodiscard]] Region Lookup(const ShaderRecompiler::IR::BindlessImageTable& table) const;
 	[[nodiscard]] vk::DescriptorSet Commit(vk::CommandBuffer command);
+	void                            EnableIntegers();
+	[[nodiscard]] vk::DescriptorSet IntegerSet() const { return m_current.integer_set; }
 
 	[[nodiscard]] static vk::DescriptorSetLayout SetLayout(GraphicContext& graphics);
+	[[nodiscard]] static vk::DescriptorSetLayout IntegerSetLayout(GraphicContext& graphics);
 	[[nodiscard]] static vk::DescriptorSetLayout EmptySetLayout(GraphicContext& graphics);
-	[[nodiscard]] static std::array<
-	    vk::DescriptorSetLayoutBinding,
-	    1u + static_cast<size_t>(ShaderRecompiler::IR::BindlessShape::Count)>
+	[[nodiscard]] static std::array<vk::DescriptorSetLayoutBinding,
+	                                1u + ShaderRecompiler::IR::BindlessFloatShapes>
 	LayoutBindings(vk::ShaderStageFlags stages);
+	[[nodiscard]] static std::array<vk::DescriptorSetLayoutBinding,
+	                                ShaderRecompiler::IR::BindlessFloatShapes>
+	IntegerLayoutBindings(vk::ShaderStageFlags stages);
 
 private:
 	static constexpr uint32_t MaxHeapRecords     = 1u << 18u;
@@ -49,6 +54,7 @@ private:
 	static constexpr uint64_t HeapIdleFrames     = 600u;
 	static constexpr size_t   Arrays =
 	    static_cast<size_t>(ShaderRecompiler::IR::BindlessShape::Count);
+	static constexpr size_t FloatArrays = ShaderRecompiler::IR::BindlessFloatShapes;
 
 	struct HeapKey {
 		uint64_t base   = 0;
@@ -82,14 +88,17 @@ private:
 		bool                    live   = false;
 	};
 	struct Version {
-		vk::DescriptorSet       set  = nullptr;
-		vk::DescriptorPool      pool = nullptr;
+		vk::DescriptorSet       set          = nullptr;
+		vk::DescriptorPool      pool         = nullptr;
+		vk::DescriptorSet       integer_set  = nullptr;
+		vk::DescriptorPool      integer_pool = nullptr;
 		std::shared_ptr<Buffer> arena;
 		uint64_t                last_used = 0;
 	};
 
 	[[nodiscard]] static HeapKey KeyOf(const ShaderRecompiler::IR::BindlessImageTable& table);
 	void                         EnsureNullImages();
+	void                         CreateNullImages(size_t first, size_t last);
 	[[nodiscard]] bool           ElementAlive(const Element& element);
 	void                         Kill(ShaderRecompiler::IR::BindlessShape array, uint32_t slot);
 	void                         SweepDeadElements();
@@ -103,7 +112,8 @@ private:
 	void               BuildArena();
 	void               BuildVersion();
 	void               RetireVersions();
-	[[nodiscard]] vk::DescriptorSet AllocateSet(vk::DescriptorPool& pool);
+	[[nodiscard]] vk::DescriptorSet AllocateSet(vk::DescriptorPool& pool, bool integer);
+	[[nodiscard]] size_t ActiveArrays() const { return m_integer ? Arrays : FloatArrays; }
 
 	RenderContext&                                           m_context;
 	RenderExecutor&                                          m_executor;
@@ -114,6 +124,7 @@ private:
 	std::array<std::vector<vk::DescriptorImageInfo>, Arrays> m_infos;
 	std::array<Element, Arrays>                              m_null;
 	bool                                                     m_null_ready = false;
+	bool                                                     m_integer    = false;
 	std::shared_ptr<Buffer>                                  m_arena;
 	uint32_t                                                 m_arena_words     = 0;
 	bool                                                     m_arena_dirty     = true;
@@ -124,6 +135,7 @@ private:
 	Version                                                  m_current;
 	std::deque<Version>                                      m_retired;
 	std::vector<vk::DescriptorPool>                          m_pools;
+	std::vector<vk::DescriptorPool>                          m_integer_pools;
 	std::vector<vk::ImageMemoryBarrier2>                     m_barriers;
 };
 

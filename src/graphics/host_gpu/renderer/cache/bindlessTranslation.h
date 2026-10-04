@@ -22,15 +22,16 @@ struct TSharpHash {
 struct RecordShape {
 	ShaderRecompiler::Decoder::ImageDimension dimension =
 	    ShaderRecompiler::Decoder::ImageDimension::Dim2D;
-	bool                                cube  = false;
-	ShaderRecompiler::IR::BindlessShape array = ShaderRecompiler::IR::BindlessShape::Image2D;
+	bool                                cube    = false;
+	ShaderRecompiler::IR::BindlessShape array   = ShaderRecompiler::IR::BindlessShape::Image2D;
+	Prospero::TextureNumericClass       numeric = Prospero::TextureNumericClass::Float;
 
 	[[nodiscard]] uint32_t Code() const {
-		return ShaderRecompiler::IR::IndirectImageShape(dimension, cube);
+		return ShaderRecompiler::IR::BindlessShapeCode(dimension, cube, numeric);
 	}
 };
 
-[[nodiscard]] std::optional<RecordShape> ClassifyRecord(const TSharp& words);
+[[nodiscard]] std::optional<RecordShape> ClassifyRecord(const TSharp& words, bool integer = false);
 
 [[nodiscard]] uint32_t HeapRecordCount(uint64_t size, uint32_t stride, uint32_t offset,
                                        uint32_t max_records);
@@ -60,11 +61,12 @@ using RecordResolver = std::function<std::optional<uint32_t>(const TSharp&, cons
 
 void TranslateHeap(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset,
                    uint32_t records, TranslationCache& cache, const RecordResolver& resolve,
-                   std::span<uint32_t> words);
+                   std::span<uint32_t> words, bool integer = false);
 
 [[nodiscard]] std::vector<TSharp> MissingRecords(std::span<const uint32_t> heap, uint32_t stride,
                                                  uint32_t offset, uint32_t records,
-                                                 const TranslationCache& cache);
+                                                 const TranslationCache& cache,
+                                                 bool                    integer = false);
 
 } // namespace Libs::Graphics::Bindless
 

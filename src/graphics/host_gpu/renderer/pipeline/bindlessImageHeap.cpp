@@ -22,8 +22,9 @@ namespace {
 
 struct SharedLayouts {
 	std::mutex              mutex;
-	vk::DescriptorSetLayout set   = nullptr;
-	vk::DescriptorSetLayout empty = nullptr;
+	vk::DescriptorSetLayout set     = nullptr;
+	vk::DescriptorSetLayout integer = nullptr;
+	vk::DescriptorSetLayout empty   = nullptr;
 };
 
 SharedLayouts& Layouts() {
@@ -38,7 +39,10 @@ constexpr vk::PipelineStageFlags2 SampleStages =
 
 [[nodiscard]] std::optional<BindlessShape> ArrayOfWord(uint32_t word) {
 	const auto code = word >> 16u;
-	return IR::BindlessShapeFor(static_cast<ShaderRecompiler::Decoder::ImageDimension>(code >> 1u));
+	return IR::BindlessShapeFor(
+	    static_cast<ShaderRecompiler::Decoder::ImageDimension>((code & 0xfu) >> 1u),
+	    (code & IR::BindlessUintShapeCode) != 0u ? Prospero::TextureNumericClass::Uint
+	                                             : Prospero::TextureNumericClass::Float);
 }
 
 } // namespace
@@ -49,17 +53,42 @@ size_t BindlessImageHeap::HeapKeyHash::operator()(const HeapKey& key) const noex
 	return static_cast<size_t>(XXH3_64bits(words.data(), sizeof(words)));
 }
 
-std::array<vk::DescriptorSetLayoutBinding, 1u + BindlessImageHeap::Arrays>
+std::array<vk::DescriptorSetLayoutBinding, 1u + BindlessImageHeap::FloatArrays>
 BindlessImageHeap::LayoutBindings(vk::ShaderStageFlags stages) {
-	std::array<vk::DescriptorSetLayoutBinding, 1u + Arrays> bindings {};
+	std::array<vk::DescriptorSetLayoutBinding, 1u + FloatArrays> bindings {};
 	bindings[0] = {IR::BindlessArenaBinding, vk::DescriptorType::eStorageBuffer, 1, stages,
 	               nullptr};
-	for (uint32_t shape = 0; shape < Arrays; shape++) {
+	for (uint32_t shape = 0; shape < FloatArrays; shape++) {
 		bindings[1u + shape] = {IR::BindlessImageBinding(static_cast<BindlessShape>(shape)),
 		                        vk::DescriptorType::eSampledImage, IR::BindlessImageSlots, stages,
 		                        nullptr};
 	}
 	return bindings;
+}
+
+std::array<vk::DescriptorSetLayoutBinding, BindlessImageHeap::FloatArrays>
+BindlessImageHeap::IntegerLayoutBindings(vk::ShaderStageFlags stages) {
+	std::array<vk::DescriptorSetLayoutBinding, FloatArrays> bindings {};
+	for (uint32_t shape = 0; shape < FloatArrays; shape++) {
+		const auto kind = static_cast<BindlessShape>(FloatArrays + shape);
+		bindings[shape] = {IR::BindlessImageBinding(kind), vk::DescriptorType::eSampledImage,
+		                   IR::BindlessImageSlots, stages, nullptr};
+	}
+	return bindings;
+}
+
+vk::DescriptorSetLayout BindlessImageHeap::IntegerSetLayout(GraphicContext& graphics) {
+	auto&            layouts = Layouts();
+	std::scoped_lock lock(layouts.mutex);
+	if (layouts.integer == nullptr) {
+		const auto bindings = IntegerLayoutBindings(vk::ShaderStageFlagBits::eAll);
+		vk::DescriptorSetLayoutCreateInfo create {};
+		create.bindingCount = static_cast<uint32_t>(bindings.size());
+		create.pBindings    = bindings.data();
+		EXIT_IF(graphics.device.createDescriptorSetLayout(&create, nullptr, &layouts.integer) !=
+		        vk::Result::eSuccess);
+	}
+	return layouts.integer;
 }
 
 vk::DescriptorSetLayout BindlessImageHeap::SetLayout(GraphicContext& graphics) {
@@ -89,7 +118,7 @@ vk::DescriptorSetLayout BindlessImageHeap::EmptySetLayout(GraphicContext& graphi
 
 BindlessImageHeap::BindlessImageHeap(RenderContext& context, RenderExecutor& executor)
     : m_context(context), m_executor(executor) {
-	for (size_t array = 0; array < Arrays; array++) {
+	for (size_t array = 0; array < FloatArrays; array++) {
 		m_elements[array].resize(IR::BindlessImageSlots);
 		m_infos[array].resize(IR::BindlessImageSlots);
 	}
@@ -98,6 +127,9 @@ BindlessImageHeap::BindlessImageHeap(RenderContext& context, RenderExecutor& exe
 BindlessImageHeap::~BindlessImageHeap() {
 	auto& device = m_context.GetGraphics().device;
 	for (const auto pool: m_pools) {
+		device.destroyDescriptorPool(pool, nullptr);
+	}
+	for (const auto pool: m_integer_pools) {
 		device.destroyDescriptorPool(pool, nullptr);
 	}
 }
@@ -119,25 +151,62 @@ void BindlessImageHeap::EnsureNullImages() {
 	if (m_null_ready) {
 		return;
 	}
+	CreateNullImages(0, FloatArrays);
+	m_null_ready = true;
+	m_set_dirty  = true;
+}
+
+void BindlessImageHeap::EnableIntegers() {
+	if (m_integer) {
+		return;
+	}
+	EnsureNullImages();
+	for (size_t array = FloatArrays; array < Arrays; array++) {
+		m_elements[array].resize(IR::BindlessImageSlots);
+		m_infos[array].resize(IR::BindlessImageSlots);
+	}
+	CreateNullImages(FloatArrays, Arrays);
+	m_integer = true;
+	std::erase_if(m_cache, [](const auto& entry) {
+		const auto shape = Bindless::ClassifyRecord(entry.first, true);
+		return entry.second == 0u && shape.has_value() &&
+		       shape->numeric == Prospero::TextureNumericClass::Uint;
+	});
+	for (auto& [key, heap]: m_heaps) {
+		heap.stale = true;
+	}
+	m_set_dirty = true;
+}
+
+void BindlessImageHeap::CreateNullImages(size_t first, size_t last) {
 	auto& cache = m_context.GetTextureCache();
-	for (uint32_t shape = 0; shape < Arrays; shape++) {
-		const auto              kind = static_cast<BindlessShape>(shape);
+	for (size_t shape = first; shape < last; shape++) {
+		const auto kind      = static_cast<BindlessShape>(shape);
+		const auto dimension = IR::BindlessShapeDimension(kind);
+		const bool integer =
+		    IR::BindlessShapeNumericClass(kind) == Prospero::TextureNumericClass::Uint;
 		TextureCache::ImageDesc desc {};
-		desc.info.guest_format = Prospero::BufferFormat::k32Float;
-		desc.info.pixel_format = vk::Format::eR32Sfloat;
-		desc.info.type         = kind == BindlessShape::Image3D   ? Prospero::ImageType::kColor3D
-		                         : kind == BindlessShape::Image1D ? Prospero::ImageType::kColor1D
-		                                                          : Prospero::ImageType::kColor2D;
-		desc.info.extent       = {1, 1, 1};
-		desc.info.resources    = {1, 1};
+		desc.info.guest_format =
+		    integer ? Prospero::BufferFormat::k32UInt : Prospero::BufferFormat::k32Float;
+		desc.info.pixel_format    = integer ? vk::Format::eR32Uint : vk::Format::eR32Sfloat;
+		desc.info.type            = dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D
+		                                ? Prospero::ImageType::kColor3D
+		                            : dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D
+		                                ? Prospero::ImageType::kColor1D
+		                                : Prospero::ImageType::kColor2D;
+		desc.info.extent          = {1, 1, 1};
+		desc.info.resources       = {1, 1};
 		desc.info.bytes_per_block = 4;
 		desc.info.samples         = 1;
 		desc.info.mip_layout[0]   = {0, 0, 1, 1};
 		desc.view_info.format     = desc.info.pixel_format;
-		desc.view_info.type   = kind == BindlessShape::Image3D        ? vk::ImageViewType::e3D
-		                        : kind == BindlessShape::Image2DArray ? vk::ImageViewType::e2DArray
-		                        : kind == BindlessShape::Image1D      ? vk::ImageViewType::e1D
-		                                                              : vk::ImageViewType::e2D;
+		desc.view_info.type   = dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D
+		                            ? vk::ImageViewType::e3D
+		                        : dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+		                            ? vk::ImageViewType::e2DArray
+		                        : dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D
+		                            ? vk::ImageViewType::e1D
+		                            : vk::ImageViewType::e2D;
 		desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
 		desc.view_info.usage  = vk::ImageUsageFlagBits::eSampled;
 		desc.type             = TextureCache::BindingType::Texture;
@@ -156,8 +225,6 @@ void BindlessImageHeap::EnsureNullImages() {
 			}
 		}
 	}
-	m_null_ready = true;
-	m_set_dirty  = true;
 }
 
 bool BindlessImageHeap::ElementAlive(const Element& element) {
@@ -276,7 +343,7 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
                                const std::vector<uint32_t>& dwords) {
 	auto&      cache = m_context.GetTextureCache();
 	const auto missing =
-	    Bindless::MissingRecords(dwords, key.stride, key.offset, heap.records, m_cache);
+	    Bindless::MissingRecords(dwords, key.stride, key.offset, heap.records, m_cache, m_integer);
 	struct Pending {
 		Bindless::TSharp      tsharp;
 		Bindless::RecordShape shape;
@@ -285,7 +352,7 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 	const auto Resolve = [&](const Bindless::TSharp& tsharp, const Bindless::RecordShape& shape) {
 		IR::ImageResource resource;
 		resource.resource_class = IR::ImageResourceClass::Sampled;
-		resource.numeric_class  = Prospero::TextureNumericClass::Float;
+		resource.numeric_class  = shape.numeric;
 		resource.dimension      = shape.dimension;
 		resource.cube           = shape.cube;
 		resource.read           = true;
@@ -303,7 +370,7 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 	std::vector<Pending> pending;
 	pending.reserve(missing.size());
 	for (const auto& tsharp: missing) {
-		const auto shape   = Bindless::ClassifyRecord(tsharp);
+		const auto shape   = Bindless::ClassifyRecord(tsharp, m_integer);
 		auto       binding = Resolve(tsharp, *shape);
 		if (binding.desc.info.data.Empty()) {
 			m_cache[tsharp] = 0u;
@@ -360,7 +427,7 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 	    [](const Bindless::TSharp&, const Bindless::RecordShape&) -> std::optional<uint32_t> {
 		    return std::nullopt;
 	    },
-	    heap.words);
+	    heap.words, m_integer);
 	heap.scanned  = true;
 	heap.stale    = false;
 	m_arena_dirty = true;
@@ -370,7 +437,7 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 void BindlessImageHeap::ResetElements() {
 	m_slots.Reset();
 	m_cache.clear();
-	for (uint32_t array = 0; array < Arrays; array++) {
+	for (uint32_t array = 0; array < ActiveArrays(); array++) {
 		for (uint32_t slot = 0; slot < IR::BindlessImageSlots; slot++) {
 			m_elements[array][slot].live = false;
 			m_elements[array][slot].view = nullptr;
@@ -472,14 +539,16 @@ void BindlessImageHeap::BuildArena() {
 	m_set_dirty   = true;
 }
 
-vk::DescriptorSet BindlessImageHeap::AllocateSet(vk::DescriptorPool& pool) {
-	auto&                         device = m_context.GetGraphics().device;
-	const auto                    layout = SetLayout(m_context.GetGraphics());
+vk::DescriptorSet BindlessImageHeap::AllocateSet(vk::DescriptorPool& pool, bool integer) {
+	auto&      device = m_context.GetGraphics().device;
+	const auto layout =
+	    integer ? IntegerSetLayout(m_context.GetGraphics()) : SetLayout(m_context.GetGraphics());
+	auto&                         pools = integer ? m_integer_pools : m_pools;
 	vk::DescriptorSetAllocateInfo allocate {};
 	allocate.descriptorSetCount = 1;
 	allocate.pSetLayouts        = &layout;
 	vk::DescriptorSet set       = nullptr;
-	for (const auto candidate: m_pools) {
+	for (const auto candidate: pools) {
 		allocate.descriptorPool = candidate;
 		if (device.allocateDescriptorSets(&allocate, &set) == vk::Result::eSuccess) {
 			pool = candidate;
@@ -488,17 +557,18 @@ vk::DescriptorSet BindlessImageHeap::AllocateSet(vk::DescriptorPool& pool) {
 	}
 	const std::array sizes {
 	    vk::DescriptorPoolSize {vk::DescriptorType::eSampledImage,
-	                            PoolSets * static_cast<uint32_t>(Arrays) * IR::BindlessImageSlots},
+	                            PoolSets * static_cast<uint32_t>(FloatArrays) *
+	                                IR::BindlessImageSlots},
 	    vk::DescriptorPoolSize {vk::DescriptorType::eStorageBuffer, PoolSets},
 	};
 	vk::DescriptorPoolCreateInfo create {};
 	create.flags             = vk::DescriptorPoolCreateFlagBits::eFreeDescriptorSet;
 	create.maxSets           = PoolSets;
-	create.poolSizeCount     = static_cast<uint32_t>(sizes.size());
+	create.poolSizeCount     = integer ? 1u : static_cast<uint32_t>(sizes.size());
 	create.pPoolSizes        = sizes.data();
 	vk::DescriptorPool fresh = nullptr;
 	EXIT_IF(device.createDescriptorPool(&create, nullptr, &fresh) != vk::Result::eSuccess);
-	m_pools.push_back(fresh);
+	pools.push_back(fresh);
 	allocate.descriptorPool = fresh;
 	EXIT_IF(device.allocateDescriptorSets(&allocate, &set) != vk::Result::eSuccess);
 	pool = fresh;
@@ -513,6 +583,9 @@ void BindlessImageHeap::RetireVersions() {
 			return false;
 		}
 		(void)device.freeDescriptorSets(version.pool, 1, &version.set);
+		if (version.integer_set != nullptr) {
+			(void)device.freeDescriptorSets(version.integer_pool, 1, &version.integer_set);
+		}
 		return true;
 	});
 }
@@ -524,17 +597,17 @@ void BindlessImageHeap::BuildVersion() {
 	}
 	RetireVersions();
 	Version version;
-	version.set   = AllocateSet(version.pool);
+	version.set   = AllocateSet(version.pool, false);
 	version.arena = m_arena;
 	const vk::DescriptorBufferInfo arena_info {m_arena->Handle(), 0,
 	                                           static_cast<uint64_t>(m_arena_words) * 4u};
-	std::array<vk::WriteDescriptorSet, 1 + Arrays> writes {};
+	std::array<vk::WriteDescriptorSet, 1 + FloatArrays> writes {};
 	writes[0].dstSet          = version.set;
 	writes[0].dstBinding      = IR::BindlessArenaBinding;
 	writes[0].descriptorCount = 1;
 	writes[0].descriptorType  = vk::DescriptorType::eStorageBuffer;
 	writes[0].pBufferInfo     = &arena_info;
-	for (uint32_t array = 0; array < Arrays; array++) {
+	for (uint32_t array = 0; array < FloatArrays; array++) {
 		auto& write           = writes[1u + array];
 		write.dstSet          = version.set;
 		write.dstBinding      = IR::BindlessImageBinding(static_cast<BindlessShape>(array));
@@ -544,6 +617,21 @@ void BindlessImageHeap::BuildVersion() {
 	}
 	m_context.GetGraphics().device.updateDescriptorSets(static_cast<uint32_t>(writes.size()),
 	                                                    writes.data(), 0, nullptr);
+	if (m_integer) {
+		version.integer_set = AllocateSet(version.integer_pool, true);
+		std::array<vk::WriteDescriptorSet, Arrays - FloatArrays> integer_writes {};
+		for (uint32_t array = 0; array < integer_writes.size(); array++) {
+			const auto kind       = static_cast<BindlessShape>(FloatArrays + array);
+			auto&      write      = integer_writes[array];
+			write.dstSet          = version.integer_set;
+			write.dstBinding      = IR::BindlessImageBinding(kind);
+			write.descriptorCount = IR::BindlessImageSlots;
+			write.descriptorType  = vk::DescriptorType::eSampledImage;
+			write.pImageInfo      = m_infos[FloatArrays + array].data();
+		}
+		m_context.GetGraphics().device.updateDescriptorSets(
+		    static_cast<uint32_t>(integer_writes.size()), integer_writes.data(), 0, nullptr);
+	}
 	m_current   = std::move(version);
 	m_set_dirty = false;
 }
@@ -571,7 +659,7 @@ vk::DescriptorSet BindlessImageHeap::Commit(vk::CommandBuffer command) {
 		    image.GetBarriers(layout, vk::AccessFlagBits2::eShaderRead, SampleStages, range);
 		m_barriers.insert(m_barriers.end(), barriers.begin(), barriers.end());
 	};
-	for (uint32_t array = 0; array < Arrays; array++) {
+	for (uint32_t array = 0; array < ActiveArrays(); array++) {
 		const auto used = m_slots.Used(static_cast<BindlessShape>(array));
 		for (uint32_t slot = 0; slot < used; slot++) {
 			const auto& element = m_elements[array][slot];
