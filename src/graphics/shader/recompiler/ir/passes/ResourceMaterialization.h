@@ -3,6 +3,7 @@
 
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
+#include <span>
 #include <string_view>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -44,8 +45,12 @@ struct ResourceSpecialization {
 
 	std::vector<Buffer> buffers;
 	std::vector<Image>  images;
+	std::vector<bool>   unbound_buffers;
+	std::vector<bool>   unbound_images;
 
-	bool operator==(const ResourceSpecialization&) const = default;
+	bool operator==(const ResourceSpecialization& other) const {
+		return buffers == other.buffers && images == other.images;
+	}
 };
 
 // Extracts the descriptor/SRT value graph before resource specialization. The returned plan owns
@@ -65,6 +70,10 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 // only, but it is what tells a redundant permutation apart from a genuinely new one.
 [[nodiscard]] const char* FirstSpecializationDifference(const ResourceSpecialization& before,
                                                         const ResourceSpecialization& after);
+[[nodiscard]] bool        SpecializationServes(const ResourceSpecialization& built,
+                                               const ResourceSpecialization& wanted);
+void InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,
+                          ResourceSpecialization&                        wanted);
 // False when the specialization does not describe this translation of the program.
 [[nodiscard]] bool ApplyResourceSpecialization(Program&                      program,
                                                const ResourceSpecialization& specialization);
