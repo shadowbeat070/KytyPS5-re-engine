@@ -864,6 +864,142 @@ void TestShaderReadCache() {
         "the cache accepted a read the reader refuses");
 }
 
+// One raw or formatted buffer whose V# is user data s[0:3].
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan UserDataDescriptorPlan(bool unindexed,
+                                                                          bool formatted) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  DescriptorSource source;
+  for (uint32_t i = 0; i < 4; i++) {
+    source.dwords[i] = Value(&block.AppendNewInst(ValueOpcode::GetUserData,
+                                                  {Value(static_cast<ScalarReg>(i))}));
+  }
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back(
+      {.source = 0, .read = true, .formatted = formatted, .unindexed = unindexed});
+  return ExtractResourcePlan(program);
+}
+
+Libs::Graphics::ShaderRecompiler::IR::ResourceSpecialization
+MaterializedDescriptor(const Libs::Graphics::ShaderRecompiler::IR::ResourcePlan &plan,
+                       std::array<uint32_t, 4> words) {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, {.user_data = words}, snapshot, specialization) &&
+            specialization.buffers.size() == 1 && specialization.unbound_buffers.size() == 1,
+        "a user-data V# did not materialize");
+  return specialization;
+}
+
+void TestUnboundBufferSpecialization() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  const auto indexed = UserDataDescriptorPlan(false, false);
+  const auto null = MaterializedDescriptor(indexed, {0, 0, 0, 0});
+  Check(null.unbound_buffers[0] && null.buffers[0].packed_stride == 0 &&
+            !null.buffers[0].zero_stride_oob,
+        "a null raw V# was not unbound, or kept the folded out-of-bounds shape");
+  Check(MaterializedDescriptor(indexed, {0x1000u, 0, 0, 3u << 28u}).unbound_buffers[0] &&
+            MaterializedDescriptor(indexed, {0, 0, 8, 3u << 28u}).unbound_buffers[0],
+        "a V# with no records or no base was bound");
+  const auto structured = MaterializedDescriptor(indexed, {0x1000u, 16u << 16u, 8, 0});
+  Check(!structured.unbound_buffers[0] && structured.buffers[0].packed_stride == 16 &&
+            !structured.buffers[0].zero_stride_oob,
+        "an indexed structured V# lost its stride");
+  const auto folded = MaterializedDescriptor(indexed, {0x1000u, 0, 8, 0});
+  Check(!folded.unbound_buffers[0] && folded.buffers[0].zero_stride_oob,
+        "a bound zero-stride mode-0 V# stopped folding its reads");
+
+  const auto raw = UserDataDescriptorPlan(true, false);
+  Check(MaterializedDescriptor(raw, {0x1000u, 16u << 16u, 8, 0}).buffers[0].packed_stride == 0 &&
+            MaterializedDescriptor(raw, {0x1000u, 1u << 16u, 8, 3u << 28u}) ==
+                MaterializedDescriptor(raw, {0x2000u, 0, 64, 3u << 28u}),
+        "an unindexed buffer keyed a stride no access reads");
+  Check(MaterializedDescriptor(raw, {0x1000u, (16u << 16u) | (1u << 31u), 8, 0})
+                    .buffers[0]
+                    .packed_stride != 0 &&
+            MaterializedDescriptor(raw, {0x1000u, 16u << 16u, 8, 1u << 23u})
+                    .buffers[0]
+                    .packed_stride != 0,
+        "an unindexed buffer dropped the stride a swizzled or ADD_TID access reads");
+  const auto raw_null = MaterializedDescriptor(raw, {0, 0, 0, 0});
+  const auto raw_bound = MaterializedDescriptor(raw, {0x1000u, 1u << 16u, 8, 3u << 28u});
+  Check(raw_null == raw_bound && SpecializationServes(raw_bound, raw_null),
+        "a null raw V# keyed a shape no bound raw V# shares");
+
+  Check(SpecializationServes(structured, null) && !SpecializationServes(null, structured) &&
+            !SpecializationServes(structured, folded) &&
+            !SpecializationServes(folded, structured),
+        "an unbound slot did not take any shape, or a bound one took another's");
+
+  const auto formatted = UserDataDescriptorPlan(false, true);
+  const auto formatted_null = MaterializedDescriptor(formatted, {0, 0, 0, 0});
+  const auto typed = MaterializedDescriptor(formatted, {0x1000u, 4u << 16u, 8, (20u << 12u) | 4u});
+  const auto one = MaterializedDescriptor(formatted, {0x1000u, 4u << 16u, 8, (20u << 12u) | 0x204u});
+  Check(formatted_null.unbound_buffers[0] && formatted_null.buffers[0].zero_stride_oob &&
+            SpecializationServes(typed, formatted_null) &&
+            !SpecializationServes(one, formatted_null),
+        "a null formatted V# took a shape whose dst_sel reads it as one");
+  const auto one_null = MaterializedDescriptor(formatted, {0, 0, 0, (20u << 12u) | 0x204u});
+  Check(one_null.unbound_buffers[0] && SpecializationServes(one_null, one_null) &&
+            !SpecializationServes(typed, one_null) && !SpecializationServes(one, one_null),
+        "an unbound V# that reads one took another shape");
+
+  auto inherited = formatted_null;
+  const std::array<const ResourceSpecialization *, 2> donors{&one, &typed};
+  InheritUnboundShapes(donors, inherited);
+  Check(inherited == typed && !inherited.unbound_buffers[0],
+        "the newest compatible bound shape was not inherited");
+  auto kept = formatted_null;
+  const std::array<const ResourceSpecialization *, 2> unbound_donors{&formatted_null, &one};
+  InheritUnboundShapes(unbound_donors, kept);
+  Check(kept == formatted_null && kept.unbound_buffers[0],
+        "an unbound or incompatible donor shaped the slot");
+  auto bound = typed;
+  InheritUnboundShapes(unbound_donors, bound);
+  Check(bound == typed, "a bound slot took a donor shape");
+}
+
+void TestUnboundImageSpecialization() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  using Libs::Graphics::ShaderRecompiler::Decoder::ImageDimension;
+  ResourceSpecialization null;
+  null.images.resize(2);
+  null.images[0].numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+  null.images[0].dimension = ImageDimension::Dim2D;
+  null.images[1] = null.images[0];
+  null.unbound_images = {true, false};
+  auto volume = null;
+  volume.images[0].dimension = ImageDimension::Dim3D;
+  volume.unbound_images = {false, false};
+  Check(SpecializationServes(volume, null) && !SpecializationServes(null, volume),
+        "a null image did not take a bound image's dimension");
+  auto msaa = volume;
+  msaa.images[0].dimension = ImageDimension::Dim2DMsaa;
+  auto uint_volume = volume;
+  uint_volume.images[0].numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Uint;
+  auto other = volume;
+  other.images[1].dimension = ImageDimension::Dim3D;
+  Check(!SpecializationServes(msaa, null) && !SpecializationServes(uint_volume, null) &&
+            !SpecializationServes(other, null),
+        "a null image took a view the null texture cannot fill, another numeric class, or a "
+        "bound neighbour's shape");
+  auto inherited = null;
+  const std::array<const ResourceSpecialization *, 1> donors{&volume};
+  InheritUnboundShapes(donors, inherited);
+  Check(inherited == volume, "a null image did not inherit a bound dimension");
+
+  using Libs::Graphics::ShaderRecompiler::IR::PushData;
+  Check(PushData::StartServes(8, 8) && PushData::StartServes(12, 8) &&
+            !PushData::StartServes(4, 8) && PushData::StartServes(PushData::NoStart, 8),
+        "a push-data start overlapping an earlier stage was reusable, or a later one was not");
+}
+
 } // namespace
 
 namespace Common {
@@ -895,6 +1031,8 @@ int main() {
   TestBindlessSlotAllocation();
   TestBindlessHeapTranslation();
   TestShaderReadCache();
+  TestUnboundBufferSpecialization();
+  TestUnboundImageSpecialization();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

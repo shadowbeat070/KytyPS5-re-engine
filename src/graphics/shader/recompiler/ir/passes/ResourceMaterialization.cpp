@@ -1728,6 +1728,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 	KYTY_PROFILER_FUNCTION();
 	// In place over the snapshot: an expanded table has already appended a child per record here.
 	specialization.buffers.resize(snapshot.buffers.size());
+	specialization.unbound_buffers.assign(snapshot.buffers.size(), false);
+	specialization.unbound_images.assign(specialization.images.size(), false);
 	for (uint32_t i = 0; i < snapshot.buffers.size(); i++) {
 		const auto describes =
 		    i < program.info.buffers.size() ? i : specialization.buffers[i].indirect_root;
@@ -1749,14 +1751,21 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			packed_stride &= ~(3u << 16u);
 		}
 		// A child answers for the same access as the root, so only the descriptor words differ.
-		const bool formatted =
-		    describes < program.info.buffers.size() && program.info.buffers[describes].formatted;
-		auto& entry         = specialization.buffers[i];
-		entry.packed_stride = packed_stride;
+		const bool known     = describes < program.info.buffers.size();
+		const bool formatted = known && program.info.buffers[describes].formatted;
+		if (known && program.info.buffers[describes].unindexed &&
+		    (packed_stride & ((1u << 14u) | (1u << 20u))) == 0u) {
+			packed_stride = 0;
+		}
+		const bool unbound                = descriptor.Base48() == 0u || descriptor.GetSize() == 0u;
+		specialization.unbound_buffers[i] = unbound;
+		auto& entry                       = specialization.buffers[i];
+		entry.packed_stride               = packed_stride;
 		entry.descriptor_format =
 		    formatted ? descriptor.Format() : Prospero::BufferFormat::kInvalid;
 		entry.descriptor_swizzle = formatted ? descriptor.DstSelXYZW() : DstSel(4, 5, 6, 7);
-		entry.zero_stride_oob    = descriptor.OutOfBounds() == 0u && stride == 0u;
+		entry.zero_stride_oob =
+		    descriptor.OutOfBounds() == 0u && stride == 0u && !(unbound && !formatted);
 	}
 	for (uint32_t i = 0; i < specialization.images.size(); i++) {
 		const auto& descriptor = snapshot.images[i];
@@ -1791,6 +1800,9 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 				image.dimension = Decoder::ImageDimension::Dim2D;
 				image.cube      = false;
 			}
+			specialization.unbound_images[i] =
+			    !image.shape_padding && image.indirect_root == ImageResource::NoIndirectImage &&
+			    base.resource_class != ImageResourceClass::Storage && !base.written && !base.atomic;
 			continue;
 		}
 		const auto descriptor_dimension = DescriptorDimension(descriptor, base.dimension);
@@ -2903,6 +2915,92 @@ const char* FirstSpecializationDifference(const ResourceSpecialization& before,
 		return "image table offset";
 	}
 	return nullptr;
+}
+
+namespace {
+
+bool SelectsOne(uint32_t swizzle) {
+	for (uint32_t component = 0; component < 4; component++) {
+		if (GetDstSel(swizzle, component) == 1u) {
+			return true;
+		}
+	}
+	return false;
+}
+
+// Out of bounds, a read is zero except where dst_sel names the constant one.
+bool UnboundBufferServes(const ResourceSpecialization::Buffer& built,
+                         const ResourceSpecialization::Buffer& wanted) {
+	auto shape               = wanted;
+	shape.packed_stride      = built.packed_stride;
+	shape.descriptor_format  = built.descriptor_format;
+	shape.descriptor_swizzle = built.descriptor_swizzle;
+	shape.zero_stride_oob    = built.zero_stride_oob;
+	return shape == built && (built == wanted || (!SelectsOne(built.descriptor_swizzle) &&
+	                                              !SelectsOne(wanted.descriptor_swizzle)));
+}
+
+bool UnboundImageServes(const ResourceSpecialization::Image& built,
+                        const ResourceSpecialization::Image& wanted) {
+	auto shape      = wanted;
+	shape.dimension = built.dimension;
+	return shape == built && built.dimension != Decoder::ImageDimension::Unknown &&
+	       built.dimension != Decoder::ImageDimension::Dim2DMsaa &&
+	       built.dimension != Decoder::ImageDimension::Dim2DMsaaArray;
+}
+
+bool Unbound(const std::vector<bool>& flags, size_t index) {
+	return index < flags.size() && flags[index];
+}
+
+} // namespace
+
+bool SpecializationServes(const ResourceSpecialization& built,
+                          const ResourceSpecialization& wanted) {
+	if (built.buffers.size() != wanted.buffers.size() ||
+	    built.images.size() != wanted.images.size()) {
+		return false;
+	}
+	for (size_t index = 0; index < wanted.buffers.size(); index++) {
+		if (!(Unbound(wanted.unbound_buffers, index)
+		          ? UnboundBufferServes(built.buffers[index], wanted.buffers[index])
+		          : built.buffers[index] == wanted.buffers[index])) {
+			return false;
+		}
+	}
+	for (size_t index = 0; index < wanted.images.size(); index++) {
+		if (!(Unbound(wanted.unbound_images, index)
+		          ? UnboundImageServes(built.images[index], wanted.images[index])
+		          : built.images[index] == wanted.images[index])) {
+			return false;
+		}
+	}
+	return true;
+}
+
+void InheritUnboundShapes(std::span<const ResourceSpecialization* const> donors,
+                          ResourceSpecialization&                        wanted) {
+	for (auto donor = donors.rbegin(); donor != donors.rend(); ++donor) {
+		const auto& from = **donor;
+		if (from.buffers.size() != wanted.buffers.size() ||
+		    from.images.size() != wanted.images.size()) {
+			continue;
+		}
+		for (size_t index = 0; index < wanted.buffers.size(); index++) {
+			if (Unbound(wanted.unbound_buffers, index) && !Unbound(from.unbound_buffers, index) &&
+			    UnboundBufferServes(from.buffers[index], wanted.buffers[index])) {
+				wanted.buffers[index]         = from.buffers[index];
+				wanted.unbound_buffers[index] = false;
+			}
+		}
+		for (size_t index = 0; index < wanted.images.size(); index++) {
+			if (Unbound(wanted.unbound_images, index) && !Unbound(from.unbound_images, index) &&
+			    UnboundImageServes(from.images[index], wanted.images[index])) {
+				wanted.images[index]         = from.images[index];
+				wanted.unbound_images[index] = false;
+			}
+		}
+	}
 }
 
 void AddObservedIndirectKeys(uint64_t signature, std::span<const uint32_t> keys) {
