@@ -243,16 +243,42 @@ void BindlessImageHeap::Kill(BindlessShape array, uint32_t slot) {
 	element.view         = nullptr;
 	m_infos[index][slot] = {nullptr, m_null[index].view, vk::ImageLayout::eGeneral};
 	m_set_dirty          = true;
+	const auto killed    = static_cast<uint32_t>(index) * IR::BindlessImageSlots + slot;
+	if (m_killed_mask.empty()) {
+		m_killed_mask.resize(Arrays * IR::BindlessImageSlots);
+	}
+	if (!m_killed_mask[killed]) {
+		m_killed_mask[killed] = true;
+		m_killed.push_back(killed);
+	}
+}
+
+void BindlessImageHeap::ForgetKilled() {
+	if (m_killed.empty()) {
+		return;
+	}
 	std::erase_if(m_cache, [&](const auto& entry) {
-		return entry.second != 0u && (entry.second & 0xffffu) == slot &&
-		       ArrayOfWord(entry.second) == array;
+		const auto slot  = entry.second & 0xffffu;
+		const auto array = ArrayOfWord(entry.second);
+		return entry.second != 0u && slot < IR::BindlessImageSlots && array.has_value() &&
+		       m_killed_mask[static_cast<uint32_t>(*array) * IR::BindlessImageSlots + slot];
 	});
+	for (const auto killed: m_killed) {
+		m_killed_mask[killed] = false;
+	}
+	m_killed.clear();
 	for (auto& [key, heap]: m_heaps) {
 		heap.stale = true;
 	}
 }
 
 void BindlessImageHeap::SweepDeadElements() {
+	// An element only dies with its image, and every way an image dies advances the epoch.
+	const auto epoch = m_context.GetTextureCache().m_retire_epoch;
+	if (epoch == m_swept_epoch) {
+		return;
+	}
+	m_swept_epoch = epoch;
 	for (uint32_t array = 0; array < Arrays; array++) {
 		const auto kind = static_cast<BindlessShape>(array);
 		const auto used = m_slots.Used(kind);
@@ -263,6 +289,7 @@ void BindlessImageHeap::SweepDeadElements() {
 			}
 		}
 	}
+	ForgetKilled();
 }
 
 void BindlessImageHeap::TouchLiveElements() {
@@ -322,6 +349,7 @@ void BindlessImageHeap::RefreshLiveElements() {
 			}
 		}
 	}
+	ForgetKilled();
 }
 
 bool BindlessImageHeap::ReadHeap(const HeapKey& key, uint32_t records,
@@ -467,8 +495,9 @@ void BindlessImageHeap::Prepare(const ShaderRecompiler::IR::BindlessImageTable& 
 			heap.rescan_frame = frame;
 			heap.rescans      = 0;
 		}
+		const bool exhausted = heap.scanned && heap.rescans >= MaxRescansPerFrame;
 		static thread_local std::vector<uint32_t> dwords;
-		if (ReadHeap(key, heap.records, dwords)) {
+		if (!exhausted && ReadHeap(key, heap.records, dwords)) {
 			const auto hash  = XXH3_64bits(dwords.data(), dwords.size() * sizeof(uint32_t));
 			const bool moved = !heap.scanned || hash != heap.hash;
 			if ((moved || heap.stale) && (heap.rescans < MaxRescansPerFrame || !heap.scanned)) {

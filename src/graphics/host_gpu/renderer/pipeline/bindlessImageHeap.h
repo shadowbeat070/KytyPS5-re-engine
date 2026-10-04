@@ -101,6 +101,7 @@ private:
 	void                         CreateNullImages(size_t first, size_t last);
 	[[nodiscard]] bool           ElementAlive(const Element& element);
 	void                         Kill(ShaderRecompiler::IR::BindlessShape array, uint32_t slot);
+	void                         ForgetKilled();
 	void                         SweepDeadElements();
 	void                         TouchLiveElements();
 	void                         EvictIdleHeaps(uint64_t frame);
@@ -132,11 +133,16 @@ private:
 	uint64_t                                                 m_refreshed_frame = UINT64_MAX;
 	uint64_t                                                 m_evicted_frame   = 0;
 	uint64_t                                                 m_touched_gc_tick = UINT64_MAX;
+	uint64_t                                                 m_swept_epoch     = UINT64_MAX;
+	std::vector<uint32_t>                                    m_killed;
+	std::vector<bool>                                        m_killed_mask;
 	Version                                                  m_current;
 	std::deque<Version>                                      m_retired;
 	std::vector<vk::DescriptorPool>                          m_pools;
 	std::vector<vk::DescriptorPool>                          m_integer_pools;
 	std::vector<vk::ImageMemoryBarrier2>                     m_barriers;
+
+	friend struct BindlessImageHeapTestAccess;
 };
 
 } // namespace Libs::Graphics
