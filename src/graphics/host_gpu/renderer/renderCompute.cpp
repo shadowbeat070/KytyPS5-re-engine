@@ -55,7 +55,7 @@ static void PushThreadLimit(vk::CommandBuffer command, const PipelineCache::Pipe
 }
 
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
-                                 GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
+                                GuestRange destination, uint32_t output_buffer = UINT32_MAX) {
 	for (uint32_t i = 0; i < sources.size(); ++i) {
 		if (i == output_buffer) continue;
 		const auto source = DecodeNativeDescriptor<ShaderBufferResource>(sources[i]);
@@ -65,7 +65,6 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 	}
 	return true;
 }
-
 
 bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& input,
                                                 const CommandBuffer&          buffer) {
@@ -163,8 +162,9 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 }
 
 bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& input,
-                                                CommandBuffer& command, uint32_t group_x,
-                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+                                                 CommandBuffer& command, uint32_t group_x,
+                                                 uint32_t group_y, uint32_t group_z,
+                                                 uint32_t mode) {
 	const auto& program   = *input.stage.program;
 	const auto& resources = *input.stage.resources;
 	const auto& fill      = resources.uniform_fill;
@@ -192,7 +192,8 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 			// final workgroup may extend beyond the selected image view.
 			if (threads == 0 || threads != fill.group_stride[axis] ||
 			    groups[axis] != (extents[axis] + threads - 1) / threads ||
-			    groups[axis] * threads > UINT32_MAX) return false;
+			    groups[axis] * threads > UINT32_MAX)
+				return false;
 		}
 		const auto  binding     = ResolveTexture(resource, resources.images[0]);
 		const auto& destination = binding.desc.info.data;
@@ -205,10 +206,11 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 		    view.base_layer >= image.backing.layers || view.layer_count != extents[2] ||
 		    view.layer_count > image.backing.layers - view.base_layer ||
 		    std::max(1u, image.info.extent.width >> view.base_level) != extents[0] ||
-		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1]) return false;
+		    std::max(1u, image.info.extent.height >> view.base_level) != extents[1])
+			return false;
 		const vk::ImageSubresourceRange range {vk::ImageAspectFlagBits::eStencil, view.base_level,
 		                                       1, view.base_layer, view.layer_count};
-		vk::ClearValue clear {};
+		vk::ClearValue                  clear {};
 		clear.depthStencil = vk::ClearDepthStencilValue {0.0f, fill.value};
 		cache.ClearImage(command, binding.image_id, image.backing.format, range, clear);
 		return true;
@@ -235,12 +237,12 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 static void ReportOverLimitDispatch(RenderContext& context, uint64_t shader_hash,
                                     std::array<uint32_t, 3> counts, uint32_t mode,
                                     std::array<uint32_t, 3> local_size, const DispatchPlan& plan,
-                                    std::array<uint32_t, 3> max_groups,
-                                    uint64_t indirect_args_addr, uint64_t submit_id) {
+                                    std::array<uint32_t, 3> max_groups, uint64_t indirect_args_addr,
+                                    uint64_t submit_id) {
 	static std::atomic<uint64_t>        rejected {0};
 	static std::mutex                   reported_mutex;
 	static std::unordered_set<uint64_t> reported;
-	const auto                          total = rejected.fetch_add(1, std::memory_order_relaxed) + 1;
+	const auto total = rejected.fetch_add(1, std::memory_order_relaxed) + 1;
 	{
 		std::lock_guard lock(reported_mutex);
 		if (!reported.insert(shader_hash).second) {
@@ -252,8 +254,9 @@ static void ReportOverLimitDispatch(RenderContext& context, uint64_t shader_hash
 	if (indirect && GuestRange {indirect_args_addr, 12}.Valid()) {
 		registered = context.GetBufferCache().IsRegionRegistered(indirect_args_addr, 12) ? 1 : 0;
 	}
-	LOGF("GraphicsRenderDispatchDirect: skipping dispatch over the workgroup limit shader=0x%016"
-	     PRIx64 " source=%s args_addr=0x%016" PRIx64 " args_in_gpu_buffer=%d raw=%ux%ux%u "
+	LOGF("GraphicsRenderDispatchDirect: skipping dispatch over the workgroup limit "
+	     "shader=0x%016" PRIx64 " source=%s args_addr=0x%016" PRIx64
+	     " args_in_gpu_buffer=%d raw=%ux%ux%u "
 	     "(0x%08" PRIx32 ",0x%08" PRIx32 ",0x%08" PRIx32 ") mode=0x%08" PRIx32
 	     " thread_dimensions=%d local=%ux%ux%u groups=%ux%ux%u axis=%u max=%ux%ux%u submit=%" PRIu64
 	     " rejected_total=%" PRIu64 "\n",
@@ -363,7 +366,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& sh_regs = ctx.GetShaderRegisters();
 
 	ShaderComputeInputInfo input_info {};
-	const bool use_thread_dimensions = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
+	const bool use_thread_dimensions      = (mode & DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0;
 	input_info.dispatch_thread_dimensions = use_thread_dimensions;
 	input_info.workgroup_counts[0] = thread_group_x;
 	input_info.workgroup_counts[1] = thread_group_y;
@@ -386,21 +389,20 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		return;
 	}
 	if (use_thread_dimensions) {
-		input_info.dispatch_threads_num[0]    = thread_group_x;
-		input_info.dispatch_threads_num[1]    = thread_group_y;
-		input_info.dispatch_threads_num[2]    = thread_group_z;
+		input_info.dispatch_threads_num[0] = thread_group_x;
+		input_info.dispatch_threads_num[1] = thread_group_y;
+		input_info.dispatch_threads_num[2] = thread_group_z;
 	}
 
-	const auto& program   = *input_info.stage.program;
-	const auto& resources = *input_info.stage.resources;
+	const auto& program       = *input_info.stage.program;
+	const auto& resources     = *input_info.stage.resources;
 	const auto& device_limits = m_context.GetGraphics().physical_device_properties.limits;
 	const std::array<uint32_t, 3> max_groups {device_limits.maxComputeWorkGroupCount[0],
 	                                          device_limits.maxComputeWorkGroupCount[1],
 	                                          device_limits.maxComputeWorkGroupCount[2]};
 	const std::array<uint32_t, 3> counts {thread_group_x, thread_group_y, thread_group_z};
-	const std::array<uint32_t, 3> local_size {cs_regs.cs_regs.num_thread_x,
-	                                          cs_regs.cs_regs.num_thread_y,
-	                                          cs_regs.cs_regs.num_thread_z};
+	const std::array<uint32_t, 3> local_size {
+	    cs_regs.cs_regs.num_thread_x, cs_regs.cs_regs.num_thread_y, cs_regs.cs_regs.num_thread_z};
 	const auto plan = PlanComputeDispatch(counts, local_size, use_thread_dimensions, max_groups);
 	if (plan.action == DispatchPlanAction::SkipOverLimit) {
 		ReportOverLimitDispatch(m_context, program.shader_hash, counts, mode, local_size, plan,
@@ -513,10 +515,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	buffer.EndRendering();
 	// The probe state block is a few kilobytes, so it is only reset for the BVH shader set.
-	auto& pipeline =
-	    m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
+	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	StreamHold stream_hold(m_context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream));
-	auto& bindings = m_compute_bindings;
+	auto&      bindings = m_compute_bindings;
 	PrepareBindings(input_info.stage, bindings);
 	PreparedBindings* descriptor_stage = &bindings;
 	FindBuffers(std::span {&descriptor_stage, 1u});
@@ -529,7 +530,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	RebindBuffers(bindings);
 
-	auto              vk_buffer        = buffer.Handle();
+	auto                     vk_buffer = buffer.Handle();
 	ThreadDispatcher::Record thread_record {};
 	if (use_thread_dimensions) {
 		thread_record = ThreadDispatch().Write(vk_buffer, {input_info.dispatch_threads_num[0],
@@ -563,11 +564,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
-
 }
 
-void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
-                                      uint64_t args_addr, uint32_t mode) {
+void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer, uint64_t args_addr,
+                                      uint32_t mode) {
 	KYTY_PROFILER_FUNCTION();
 	EXIT_IF(buffer.IsInvalid() || args_addr == 0 || (args_addr & 3u) != 0);
 	const bool thread_dimensions =
@@ -589,7 +589,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	ShaderComputeInputInfo input_info {};
 	input_info.dispatch_thread_dimensions = thread_dimensions;
-	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
+	const auto compute_program            = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
@@ -632,8 +632,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-		    return image.written && image.resource_class ==
-		                                ShaderRecompiler::IR::ImageResourceClass::Storage;
+		    return image.written &&
+		           image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
 	if (has_storage_writes) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -641,11 +641,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	vk::MemoryBarrier barrier {};
 	barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
 	barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-	vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-	                              vk::PipelineStageFlagBits::eComputeShader |
-	                              vk::PipelineStageFlagBits::eTransfer,
-	                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-	                          1, &barrier, 0, nullptr, 0, nullptr);
+	vk_buffer.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
+	        vk::PipelineStageFlagBits::eTransfer,
+	    vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
 	if (thread_dimensions) {
 		PushThreadLimit(vk_buffer, pipeline, dispatch_record);
