@@ -478,6 +478,7 @@ void TextureCache::UnregisterImage(ImageId id) {
 	}
 	m_total_used_memory -= accounted;
 	image.registered = false;
+	m_retire_epoch++;
 }
 
 void TextureCache::DeleteImage(ImageId id) {
@@ -1050,6 +1051,7 @@ bool TextureCache::ParkImage(ImageId id) {
 	if (owner->binding.is_bound || owner->binding.is_target) {
 		owner->binding.needs_rebind = true;
 	}
+	m_retire_epoch++;
 	return true;
 }
 
@@ -1755,8 +1757,11 @@ ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
 	}
 	auto& record = m_slot_images[association];
 	TouchImage(record);
-	record.depth_id             = depth_id;
-	record.stencil_subresources = depth.stencil_subresources;
+	if (record.depth_id != depth_id) {
+		record.depth_id = depth_id;
+		m_retire_epoch++;
+	}
+	record.stencil_subresources = m_slot_images[depth_id].stencil_subresources;
 	return association;
 }
 

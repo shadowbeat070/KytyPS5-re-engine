@@ -308,13 +308,16 @@ private:
 	std::vector<ImageId>                   m_evict_published;
 	std::map<uint64_t, MetaDataInfo>       m_surface_metas;
 	std::unordered_map<uint64_t, ImageId>  m_stencil_planes;
-	uint64_t                               m_total_used_memory      = 0;
-	uint64_t                               m_trigger_gc_memory      = 0;
-	uint64_t                               m_pressure_gc_memory     = 1536ull * 1024 * 1024;
-	uint64_t                               m_critical_gc_memory     = 3ull * 1024 * 1024 * 1024;
-	uint64_t                               m_gc_tick                = 0;
-	mutable uint32_t                       m_image_query_epoch      = 0;
-	bool                                   m_readback_linear_images = false;
+	uint64_t                               m_total_used_memory  = 0;
+	uint64_t                               m_trigger_gc_memory  = 0;
+	uint64_t                               m_pressure_gc_memory = 1536ull * 1024 * 1024;
+	uint64_t                               m_critical_gc_memory = 3ull * 1024 * 1024 * 1024;
+	uint64_t                               m_gc_tick            = 0;
+	// Advances whenever a registered image stops being servable: unregistered, parked, stencil
+	// proxy.
+	uint64_t         m_retire_epoch           = 0;
+	mutable uint32_t m_image_query_epoch      = 0;
+	bool             m_readback_linear_images = false;
 
 	friend struct TextureCacheTestAccess;
 	friend class BufferCache;

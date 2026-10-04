@@ -202,6 +202,22 @@ struct BufferCacheTestAccess {
   }
 };
 
+struct BindlessImageHeapTestAccess {
+  static uint32_t LiveElements(const BindlessImageHeap &heap) {
+    uint32_t live = 0;
+    for (const auto &elements : heap.m_elements) {
+      live += static_cast<uint32_t>(
+          std::ranges::count_if(elements, [](const auto &element) { return element.live; }));
+    }
+    return live;
+  }
+
+  static size_t TranslatedRecords(const BindlessImageHeap &heap) {
+    return static_cast<size_t>(std::ranges::count_if(
+        heap.m_cache, [](const auto &entry) { return entry.second != 0u; }));
+  }
+};
+
 struct StreamBufferTestAccess {
   static bool NormalizeReservation(bool coherent, uint64_t atom, uint64_t &size,
                                    uint64_t &alignment) {
@@ -377,6 +393,16 @@ struct TextureCacheTestAccess {
   static void DeleteImage(TextureCache &cache, ImageId id) {
     std::lock_guard lock(cache.m_lock);
     cache.DeleteImage(id);
+  }
+
+  static void FreeImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    cache.FreeImage(id);
+  }
+
+  static bool ParkImage(TextureCache &cache, ImageId id) {
+    std::lock_guard lock(cache.m_lock);
+    return cache.ParkImage(id);
   }
 
   static const Image *Owner(const TextureCache &cache, ImageId id) {
@@ -13944,6 +13970,118 @@ public:
         Require(name, "2D record",
                 plane != nullptr && plane->backing.image_type == vk::ImageType::e2D,
                 "the 2D record did not become a 2D image");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "heap direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "heap direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
+  void CheckBindlessHeapRetiredImages() {
+    constexpr const char *name = "BindlessHeapRetiredImages";
+    constexpr uintptr_t base = 0x0000000207a00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t stride = 48;
+    constexpr uint32_t record_offset = 16;
+    constexpr uint32_t records = 2;
+    constexpr uint64_t color_address = base + 0x10000;
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "heap direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "heap fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    std::array<u32, 8> tsharp{};
+    tsharp[0] = static_cast<u32>(color_address >> 8u);
+    tsharp[1] = static_cast<u32>(color_address >> 40u) |
+                (static_cast<u32>(Prospero::BufferFormat::k32Float) << 20u) | (3u << 30u);
+    tsharp[2] = 3u << 14u;
+    tsharp[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+    tsharp[5] = 0x00700000u;
+    std::memcpy(reinterpret_cast<void *>(base + stride + record_offset), tsharp.data(),
+                sizeof(tsharp));
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      auto &texture_cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      {
+        BindlessImageHeap heap(context, context.GetRenderExecutor());
+        ShaderRecompiler::IR::BindlessImageTable table{};
+        table.heap = {static_cast<u32>(base), static_cast<u32>(base >> 32u) | (stride << 16u),
+                      records, 0u};
+        table.stride = stride;
+        table.record_offset = record_offset;
+        const auto ImageAt = [&]() {
+          for (const auto id : TextureCacheTestAccess::FindImages(texture_cache, color_address,
+                                                                  64, false)) {
+            if (texture_cache.GetImage(id).info.data.address == color_address) {
+              return id;
+            }
+          }
+          return ImageId{};
+        };
+        const auto Live = [&] { return BindlessImageHeapTestAccess::LiveElements(heap); };
+        const auto Translated = [&] {
+          return BindlessImageHeapTestAccess::TranslatedRecords(heap);
+        };
+        const auto Commit = [&] {
+          Require(name, "commit", heap.Commit(scheduler.Current().Handle()) != nullptr,
+                  "the heap committed no descriptor set");
+        };
+
+        heap.Prepare(table);
+        Commit();
+        const auto first = ImageAt();
+        Require(name, "resolved", first && Live() == 1 && Translated() == 1,
+                "the record did not become a live element");
+        heap.Prepare(table);
+        Commit();
+        Require(name, "steady", Live() == 1 && Translated() == 1,
+                "an element died with nothing retired");
+
+        TextureCacheTestAccess::FreeImage(texture_cache, first);
+        Commit();
+        Require(name, "freed", Live() == 0 && Translated() == 0,
+                "a freed image stayed in the set, or its translation survived");
+
+        heap.Prepare(table);
+        Commit();
+        const auto second = ImageAt();
+        Require(name, "re-resolved", second && second != first && Live() == 1 && Translated() == 1,
+                "the stale heap was not rescanned onto the replacement image");
+
+        Require(name, "park", TextureCacheTestAccess::ParkImage(texture_cache, second),
+                "the image could not be parked");
+        Commit();
+        Require(name, "parked", Live() == 0,
+                "a parked image stayed in the set");
       }
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
@@ -48161,6 +48299,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBindlessNullImages();
     vulkan.CheckBindlessHeap1DRecords();
     vulkan.CheckBindlessHeapIntegerRecords();
+    vulkan.CheckBindlessHeapRetiredImages();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
@@ -49115,6 +49254,7 @@ int main(int argc, char **argv) {
     vulkan.CheckBindlessNullImages();
     vulkan.CheckBindlessHeap1DRecords();
     vulkan.CheckBindlessHeapIntegerRecords();
+    vulkan.CheckBindlessHeapRetiredImages();
     vulkan.CheckRenderExecutorStencilAliasRediscovery();
     vulkan.CheckBgra16Readback();
     vulkan.CheckLargeImageReadback();
