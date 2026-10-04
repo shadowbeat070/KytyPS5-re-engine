@@ -35,6 +35,28 @@ namespace {
 constexpr uint32_t SamplerBorderClampMask    = (1u << 2u) | (1u << 5u) | (1u << 8u);
 constexpr uint32_t SamplerDword3ReservedMask = 0x3ffff000u;
 
+std::optional<uint32_t> ConstantScalarWrite(const Decoder::Instruction& inst) {
+	const auto constant = [](const Decoder::Operand& operand) {
+		return operand.kind == Decoder::OperandKind::LiteralConstant ||
+		       operand.kind == Decoder::OperandKind::IntegerInlineConstant ||
+		       operand.kind == Decoder::OperandKind::FloatInlineConstant;
+	};
+	switch (inst.opcode) {
+		case Decoder::Opcode::S_MOV_B32:
+		case Decoder::Opcode::S_MOVK_I32:
+			if (constant(inst.src0)) return inst.src0.value;
+			break;
+		case Decoder::Opcode::S_BFM_B32:
+			// D = ((1 << S0[4:0]) - 1) << S1[4:0]
+			if (constant(inst.src0) && constant(inst.src1)) {
+				return ((1u << (inst.src0.value & 31u)) - 1u) << (inst.src1.value & 31u);
+			}
+			break;
+		default: break;
+	}
+	return std::nullopt;
+}
+
 uint32_t PossibleU32Bits(Value value) {
 	value = value.Resolve();
 	if (value.IsImmediate()) {
@@ -436,6 +458,7 @@ private:
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi || m_native_cfg.blocks.empty())
 			return value;
 		std::vector<const Inst*> candidates;
+		std::vector<Value>       constants;
 		std::vector<const Inst*> visited;
 		std::vector<const Inst*> pending {phi};
 		while (!pending.empty()) {
@@ -445,8 +468,13 @@ private:
 			visited.push_back(inst);
 			if (inst->GetOpcode() == ValueOpcode::Phi) {
 				for (size_t i = 0; i < inst->NumArgs(); ++i) {
-					const auto* arg = inst->Arg(i).Resolve().TryInstruction();
-					if (arg != nullptr) pending.push_back(arg);
+					const auto  operand = inst->Arg(i).Resolve();
+					const auto* arg     = operand.TryInstruction();
+					if (arg != nullptr) {
+						pending.push_back(arg);
+					} else if (operand.IsImmediate() && operand.GetType() == Type::U32) {
+						constants.push_back(operand);
+					}
 				}
 			} else if (inst->GetOpcode() == ValueOpcode::ReadConst ||
 			           inst->GetOpcode() == ValueOpcode::LoadAddressU32 ||
@@ -455,7 +483,7 @@ private:
 				candidates.push_back(inst);
 			}
 		}
-		if (candidates.empty()) return value;
+		if (candidates.empty() && constants.empty()) return value;
 		const auto source_at = [&](uint32_t pc) {
 			Value      source;
 			const auto native =
@@ -482,6 +510,15 @@ private:
 					return Value {};
 				source = current;
 			}
+			if (source.IsEmpty() && pc != UINT32_MAX && native != m_decoded.instructions.end() &&
+			    native->pc == pc && native->dst.kind == Decoder::OperandKind::Sgpr &&
+			    native->dst.reg == reg) {
+				const auto written  = ConstantScalarWrite(*native);
+				const auto constant = std::ranges::find_if(constants, [&](Value leaf) {
+					return written.has_value() && leaf.U32() == *written;
+				});
+				if (constant != constants.end()) source = *constant;
+			}
 			return source;
 		};
 		const auto use = std::ranges::find_if(m_native_cfg.blocks, [&](const auto& block) {
@@ -500,7 +537,8 @@ private:
 			const auto source = source_at(pc);
 			if (source.IsEmpty()) return false;
 			if (!selected.IsEmpty()) {
-				const auto op = source.TryInstruction()->GetOpcode();
+				const auto op =
+				    source.IsImmediate() ? ValueOpcode::Void : source.TryInstruction()->GetOpcode();
 				if ((op == ValueOpcode::LoadAddressU32 || op == ValueOpcode::ReadConstBuffer) &&
 				    selected_pc != pc)
 					return false;
