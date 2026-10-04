@@ -5785,6 +5785,49 @@ void TestRelativeIndexRangeFold() {
   }
 }
 
+// The guard's limit is defined in the last block of the sweep, so the first bound of the guarded
+// index is taken against a limit that has not been raised yet. Nothing else the index reads moves
+// after that, so only the limit's own raise can send the solver back to it.
+void TestIndexRangeFoldRevisitsLateGuardLimit() {
+  namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
+  Fixture fixture;
+  auto *entry = fixture.block;
+  auto *site = fixture.AddBlock();
+  auto *exit = fixture.AddBlock();
+  entry->AddBranch(site);
+  entry->AddBranch(exit);
+  site->AddBranch(exit);
+  fixture.program.block_info[0].terminator = {
+      .kind = CFG::TerminatorKind::ConditionalBranch, .true_block = 1, .false_block = 2};
+  fixture.program.block_info[1].terminator = {.kind = CFG::TerminatorKind::Branch,
+                                              .true_block = 2};
+  fixture.program.block_info[2].terminator.kind = CFG::TerminatorKind::Return;
+  const auto value =
+      fixture.Emit(ValueOpcode::BitwiseAnd32, {fixture.UserData(0), Value(0xffu)}, 0, entry);
+  const auto limit = fixture.Emit(
+      ValueOpcode::BitwiseAnd32,
+      {fixture.Emit(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))}, 0, exit),
+       Value(8u)},
+      0, exit);
+  const auto below = fixture.Emit(ValueOpcode::ULessThan32, {value, limit}, 0, entry);
+  fixture.program.block_info[0].condition =
+      fixture.Emit(ValueOpcode::ConditionRef, {below}, CFG::BranchCondition::SccNonZero, entry);
+  const auto index =
+      fixture.Emit(ValueOpcode::ShiftLeftLogical32, {value, Value(1u)}, 0, site);
+  const auto reachable = fixture.Emit(ValueOpcode::IEqual32, {index, Value(14u)}, 0, site);
+  const auto unreachable = fixture.Emit(ValueOpcode::IEqual32, {index, Value(16u)}, 0, site);
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::SelectU32, {reachable, Value(1u), Value(2u)}, 0, site)},
+               0, site);
+  fixture.Emit(ValueOpcode::ReferenceU32,
+               {fixture.Emit(ValueOpcode::SelectU32, {unreachable, Value(3u), Value(4u)}, 0, site)},
+               0, site);
+  const auto folded = FoldUnreachableIndexCompares(fixture.program);
+  Check(folded == 1u && unreachable.Resolve() == Value(false) &&
+            reachable.Resolve().TryInstruction() != nullptr,
+        "an index bounded by a guard whose limit was raised later kept the stale bound");
+}
+
 int main() {
   OverrideBindlessImageHeaps(0);
   try {
@@ -5843,6 +5886,7 @@ int main() {
     Run("ordered scalar read over a written buffer", TestOrderedScalarReadOverWrittenBuffer);
     Run("written descriptor sized by a gpu count", TestWrittenDescriptorSizedByGpuCount);
     Run("relative index range fold", TestRelativeIndexRangeFold);
+    Run("index range fold late guard limit", TestIndexRangeFoldRevisitsLateGuardLimit);
     Run("conservative buffer reachability", TestConservativeBufferReachability);
     Run("strided indirect image table", TestStridedIndirectImageTable);
     Run("bindless heap table", TestBindlessHeapTable);

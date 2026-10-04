@@ -49,6 +49,7 @@ public:
 			return 0;
 		}
 		BuildGuards();
+		BuildOrder();
 		for (uint32_t round = 0; round < MaxRounds; round++) {
 			if (!Solve()) {
 				return 0;
@@ -222,6 +223,7 @@ private:
 		for (uint32_t b = 0; b < count; b++) {
 			guard.holds[b] = in[b] != 0u && b != definition ? 1u : 0u;
 		}
+		m_guards_by_value[inst].push_back(static_cast<uint32_t>(m_guards.size()));
 		m_guards.push_back(std::move(guard));
 	}
 
@@ -338,11 +340,13 @@ private:
 			return value.GetType() == Type::U32 ? value.U32() : Top;
 		}
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || inst->GetType() != Type::U32 || !m_index.contains(inst->Parent())) {
+		if (inst == nullptr) {
 			return Top;
 		}
-		const auto found = m_bound.find(inst);
-		return found == m_bound.end() ? 0u : found->second;
+		if (const auto found = m_slots.find(inst); found != m_slots.end()) {
+			return m_bound[found->second];
+		}
+		return inst->GetType() != Type::U32 || !m_index.contains(inst->Parent()) ? Top : 0u;
 	}
 
 	uint32_t Bound(Value value, uint32_t block) const {
@@ -351,8 +355,13 @@ private:
 		if (inst == nullptr || block == UINT32_MAX) {
 			return result;
 		}
-		for (const auto& guard: m_guards) {
-			if (guard.value != inst || guard.holds[block] == 0u) {
+		const auto guards = m_guards_by_value.find(inst);
+		if (guards == m_guards_by_value.end()) {
+			return result;
+		}
+		for (const auto index: guards->second) {
+			const auto& guard = m_guards[index];
+			if (guard.holds[block] == 0u) {
 				continue;
 			}
 			const auto limit = Plain(guard.limit);
@@ -425,29 +434,83 @@ private:
 		}
 	}
 
+	void AddReads(Value value, std::vector<const Inst*>& reads) const {
+		const auto* inst = value.Resolve().TryInstruction();
+		if (inst == nullptr) {
+			return;
+		}
+		reads.push_back(inst);
+		if (const auto guards = m_guards_by_value.find(inst); guards != m_guards_by_value.end()) {
+			for (const auto index: guards->second) {
+				if (const auto* limit = m_guards[index].limit.Resolve().TryInstruction()) {
+					reads.push_back(limit);
+				}
+			}
+		}
+	}
+
+	void BuildOrder() {
+		for (uint32_t b = 0; b < m_program.blocks.size(); b++) {
+			for (const auto& inst: *m_program.blocks[b]) {
+				if (inst.GetType() == Type::U32) {
+					m_slots.emplace(&inst, static_cast<uint32_t>(m_order.size()));
+					m_order.push_back({&inst, b});
+				}
+			}
+		}
+		m_readers.assign(m_order.size(), {});
+		std::vector<const Inst*> reads;
+		for (uint32_t slot = 0; slot < m_order.size(); slot++) {
+			const auto& inst = *m_order[slot].inst;
+			reads.clear();
+			for (size_t i = 0; i < inst.NumArgs(); i++) {
+				AddReads(inst.Arg(i), reads);
+			}
+			if (inst.GetOpcode() == ValueOpcode::CompositeExtractU32x2 && inst.NumArgs() > 0) {
+				if (const auto* pair = inst.Arg(0).Resolve().TryInstruction()) {
+					for (size_t i = 0; i < pair->NumArgs(); i++) {
+						AddReads(pair->Arg(i), reads);
+					}
+				}
+			}
+			for (const auto* read: reads) {
+				if (const auto found = m_slots.find(read); found != m_slots.end()) {
+					auto& readers = m_readers[found->second];
+					if (readers.empty() || readers.back() != slot) {
+						readers.push_back(slot);
+					}
+				}
+			}
+		}
+	}
+
 	bool Solve() {
-		m_bound.clear();
-		m_raises.clear();
+		m_bound.assign(m_order.size(), 0u);
+		m_raises.assign(m_order.size(), 0u);
+		std::vector<uint8_t> dirty(m_order.size(), 1u);
 		for (uint32_t sweep = 0; sweep < MaxSweeps; sweep++) {
 			bool changed = false;
-			for (uint32_t b = 0; b < m_program.blocks.size(); b++) {
-				for (const auto& inst: *m_program.blocks[b]) {
-					if (inst.GetType() != Type::U32) {
-						continue;
-					}
-					auto  next  = Transfer(inst, b);
-					auto& bound = m_bound[&inst];
-					if (next <= bound) {
-						continue;
-					}
-					const auto raises = ++m_raises[&inst];
-					if (raises > WidenedRaises) {
-						next = Top;
-					} else if (raises > ExactRaises) {
-						next = CoveringMask(next);
-					}
-					bound   = next;
-					changed = true;
+			for (uint32_t slot = 0; slot < m_order.size(); slot++) {
+				if (dirty[slot] == 0u) {
+					continue;
+				}
+				dirty[slot]       = 0u;
+				const auto& entry = m_order[slot];
+				auto        next  = Transfer(*entry.inst, entry.block);
+				auto&       bound = m_bound[slot];
+				if (next <= bound) {
+					continue;
+				}
+				const auto raises = ++m_raises[slot];
+				if (raises > WidenedRaises) {
+					next = Top;
+				} else if (raises > ExactRaises) {
+					next = CoveringMask(next);
+				}
+				bound   = next;
+				changed = true;
+				for (const auto reader: m_readers[slot]) {
+					dirty[reader] = 1u;
 				}
 			}
 			if (!changed) {
@@ -457,16 +520,25 @@ private:
 		return false;
 	}
 
-	Program&                                   m_program;
-	std::unordered_map<const Block*, uint32_t> m_index;
-	std::unordered_map<uint32_t, uint32_t>     m_ids;
-	std::vector<std::vector<uint32_t>>         m_successors;
-	std::vector<std::vector<uint32_t>>         m_predecessors;
-	std::vector<Guard>                         m_guards;
-	std::unordered_map<const Inst*, uint32_t>  m_bound;
-	std::unordered_map<const Inst*, uint32_t>  m_raises;
-	std::unordered_set<const Inst*>            m_assumed;
-	std::unordered_map<const Inst*, bool>      m_uniform;
+	struct Ordered {
+		const Inst* inst  = nullptr;
+		uint32_t    block = 0;
+	};
+
+	Program&                                               m_program;
+	std::unordered_map<const Block*, uint32_t>             m_index;
+	std::unordered_map<uint32_t, uint32_t>                 m_ids;
+	std::vector<std::vector<uint32_t>>                     m_successors;
+	std::vector<std::vector<uint32_t>>                     m_predecessors;
+	std::vector<Guard>                                     m_guards;
+	std::unordered_map<const Inst*, std::vector<uint32_t>> m_guards_by_value;
+	std::vector<Ordered>                                   m_order;
+	std::vector<std::vector<uint32_t>>                     m_readers;
+	std::unordered_map<const Inst*, uint32_t>              m_slots;
+	std::vector<uint32_t>                                  m_bound;
+	std::vector<uint32_t>                                  m_raises;
+	std::unordered_set<const Inst*>                        m_assumed;
+	std::unordered_map<const Inst*, bool>                  m_uniform;
 };
 
 } // namespace
