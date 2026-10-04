@@ -123,13 +123,13 @@ void BindlessImageHeap::EnsureNullImages() {
 	for (uint32_t shape = 0; shape < Arrays; shape++) {
 		const auto              kind = static_cast<BindlessShape>(shape);
 		TextureCache::ImageDesc desc {};
-		desc.info.guest_format    = Prospero::BufferFormat::k32Float;
-		desc.info.pixel_format    = vk::Format::eR32Sfloat;
-		desc.info.type = kind == BindlessShape::Image3D   ? Prospero::ImageType::kColor3D
-		                 : kind == BindlessShape::Image1D ? Prospero::ImageType::kColor1D
-		                                                  : Prospero::ImageType::kColor2D;
-		desc.info.extent          = {1, 1, 1};
-		desc.info.resources       = {1, 1};
+		desc.info.guest_format = Prospero::BufferFormat::k32Float;
+		desc.info.pixel_format = vk::Format::eR32Sfloat;
+		desc.info.type         = kind == BindlessShape::Image3D   ? Prospero::ImageType::kColor3D
+		                         : kind == BindlessShape::Image1D ? Prospero::ImageType::kColor1D
+		                                                          : Prospero::ImageType::kColor2D;
+		desc.info.extent       = {1, 1, 1};
+		desc.info.resources    = {1, 1};
 		desc.info.bytes_per_block = 4;
 		desc.info.samples         = 1;
 		desc.info.mip_layout[0]   = {0, 0, 1, 1};
