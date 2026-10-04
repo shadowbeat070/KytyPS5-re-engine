@@ -138,9 +138,9 @@ uint32_t ImageType(EmitterState& state, const IR::ImageResource& image) {
 	const auto& info = ImageDimensionInfoFor(image.dimension);
 	const auto  scalar_type =
 	    image.atomic64 ? TypeU64(state) : ImageScalarType(state, image.numeric_class);
-	return state.builder.Type(spv::OpTypeImage, scalar_type,
-	                          info.spirv_dimension, image.depth_compare ? 1u : 0u, info.arrayed,
-	                          info.multisampled, sampled, format);
+	return state.builder.Type(spv::OpTypeImage, scalar_type, info.spirv_dimension,
+	                          image.depth_compare ? 1u : 0u, info.arrayed, info.multisampled,
+	                          sampled, format);
 }
 
 uint32_t ImageViewSizeType(EmitterState& state, ImageDimension dimension) {
@@ -160,9 +160,8 @@ uint32_t LoadImageDescriptor(EmitterState& state, uint32_t resource, uint32_t mi
 	// differs. The index is wave-uniform at best, which is what NonUniform states - and Vulkan
 	// wants the decoration on the thing the sample reads, not only on the index, so it follows
 	// the pointer and the loaded image out of here to the OpSampledImage.
-	const bool dynamic =
-	    state.dynamic_image_index != 0 && resource == state.dynamic_image_resource;
-	uint32_t pointer = 0;
+	const bool dynamic = state.dynamic_image_index != 0 && resource == state.dynamic_image_resource;
+	uint32_t   pointer = 0;
 	if (dynamic) {
 		const auto kind = IR::DescriptorBindingForImage(image_resource);
 		EXIT_IF(!kind.has_value());
@@ -202,12 +201,13 @@ uint32_t LoadSamplerDescriptor(EmitterState& state, uint32_t sampler) {
 	return sampler_id;
 }
 
-uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id, uint32_t mip) {
+uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampler_id,
+                          uint32_t mip) {
 	const auto& image_resource = state.program.info.images.at(resource);
 	EXIT_IF(image_resource.resource_class != IR::ImageResourceClass::Sampled);
-	const auto  image          = LoadImageDescriptor(state, resource, mip);
-	const auto  sampled_image = state.builder.AllocateId();
-	const auto  sampled_type =
+	const auto image         = LoadImageDescriptor(state, resource, mip);
+	const auto sampled_image = state.builder.AllocateId();
+	const auto sampled_type =
 	    state.builder.Type(spv::OpTypeSampledImage, ImageType(state, image_resource));
 	state.builder.AddFunction(spv::OpSampledImage, sampled_type, sampled_image, image, sampler_id);
 	// "If an instruction loads from or stores to a resource ... and the resource descriptor being

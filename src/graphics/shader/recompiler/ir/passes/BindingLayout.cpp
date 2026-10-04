@@ -71,7 +71,8 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 				continue;
 			}
 			shared.lds |= memory.kind == ResourceKind::FlatLocal;
-			// A dynamic V# keeps no host buffer alive, and its resource index is still the raw SRSRC operand.
+			// A dynamic V# keeps no host buffer alive, and its resource index is still the raw
+			// SRSRC operand.
 			if (memory.dynamic_buffer) {
 				continue;
 			}
@@ -81,11 +82,14 @@ SharedMemoryResources CollectMemoryResources(const Program& program, std::vector
 				}
 				shared.gds |= memory.kind == ResourceKind::Gds;
 				shared.lds |= memory.kind == ResourceKind::Lds;
-			} else if (memory.kind == ResourceKind::Buffer || memory.kind == ResourceKind::ScalarBuffer) {
+			} else if (memory.kind == ResourceKind::Buffer ||
+			           memory.kind == ResourceKind::ScalarBuffer) {
 				EXIT_IF(memory.resource >= program.info.buffers.size());
 				live_buffers.at(memory.resource) = true;
-				// Nothing names a candidate, so without this the binding and the descriptor write disagree.
-				for (const auto candidate: program.info.buffers[memory.resource].indirect_resources) {
+				// Nothing names a candidate, so without this the binding and the descriptor write
+				// disagree.
+				for (const auto candidate:
+				     program.info.buffers[memory.resource].indirect_resources) {
 					EXIT_IF(candidate >= program.info.buffers.size());
 					live_buffers.at(candidate) = true;
 				}
@@ -105,15 +109,18 @@ bool UsesFlattenedSrt(const Program& program) {
 	                        [](const ImageResource& image) { return image.bindless; })) {
 		return true;
 	}
-	return std::ranges::any_of(program.blocks, [](const Block* block) {
-		return std::ranges::any_of(*block, [](const Inst& inst) {
-			return inst.GetOpcode() == ValueOpcode::ReadConst;
-		});
-	}) || std::ranges::any_of(program.info.images, [](const ImageResource& image) {
-		return image.indirect_search_iterations != 0u;
-	}) || std::ranges::any_of(program.info.buffers, [](const BufferResource& buffer) {
-		return buffer.indirect_search_iterations != 0u;
-	});
+	return std::ranges::any_of(program.blocks,
+	                           [](const Block* block) {
+		                           return std::ranges::any_of(*block, [](const Inst& inst) {
+			                           return inst.GetOpcode() == ValueOpcode::ReadConst;
+		                           });
+	                           }) ||
+	       std::ranges::any_of(
+	           program.info.images,
+	           [](const ImageResource& image) { return image.indirect_search_iterations != 0u; }) ||
+	       std::ranges::any_of(program.info.buffers, [](const BufferResource& buffer) {
+		       return buffer.indirect_search_iterations != 0u;
+	       });
 }
 
 void PadIndexedImageBinding(const ShaderInfo& info, std::vector<uint32_t>& resources) {
@@ -134,14 +141,13 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		                                             ? "shader info is not ready"
 		                                             : "binding layout already allocated");
 	}
-	BindingLayout next;
+	BindingLayout         next;
 	std::vector<uint32_t> buffers;
 	const auto            shared = CollectMemoryResources(program, buffers);
-	next.user_data_registers = CollectUserData(program);
-	next.memory_offset_dword = static_cast<uint32_t>(next.user_data_registers.size());
+	next.user_data_registers     = CollectUserData(program);
+	next.memory_offset_dword     = static_cast<uint32_t>(next.user_data_registers.size());
 	next.memory_offset_count       = static_cast<uint32_t>(buffers.size());
-	next.push_data_start_dword =
-	    PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
+	next.push_data_start_dword = PushData::StartFor(push_data_start_dword, next.ShaderDataDwords());
 
 	if (!buffers.empty()) {
 		// Draw binding accesses this first group directly when memory_offset_count is nonzero.
