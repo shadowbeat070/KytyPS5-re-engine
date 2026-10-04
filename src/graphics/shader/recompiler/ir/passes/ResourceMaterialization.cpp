@@ -235,15 +235,14 @@ void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* sou
 		pending.assign(source->dwords.begin(), source->dwords.begin() + source->dword_count);
 	}
 	if (!extra.IsEmpty()) pending.push_back(extra);
-	std::vector<const Inst*> visited;
+	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
 		auto value = pending.back().Resolve();
 		pending.pop_back();
 		const auto* inst = value.TryInstruction();
-		if (inst == nullptr || std::ranges::find(visited, inst) != visited.end()) {
+		if (inst == nullptr || !visited.insert(inst).second) {
 			continue;
 		}
-		visited.push_back(inst);
 		if (inst->GetOpcode() == ValueOpcode::ReadConst) {
 			const auto slot = inst->Arg(1).Resolve();
 			if (slot.IsImmediate() && slot.GetType() == Type::U32 && slot.U32() < slots.size()) {
@@ -2414,18 +2413,29 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_read_order = OrderSrtReadsAgainstWrites(program);
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
-	CyclicPhiEntryCache         cyclic_entries {.program = &program};
-	Value                       unknown;
-	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
+	CyclicPhiEntryCache                   cyclic_entries {.program = &program};
+	std::unordered_map<const Inst*, bool> validated;
+	Value                                 unknown;
+	std::function<Value(Value)>           ClonePredicate = [&](Value value) -> Value {
 		value = value.Resolve();
 		if (value.IsEmpty()) return {};
 		const auto* inst = value.TryInstruction();
 		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
 			return Value(true);
 		}
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer, nullptr,
-		                         &cyclic_entries))
-			return Clone(value);
+		const auto runtime = [&] {
+			if (inst == nullptr) {
+				return ValidateRuntimeValue(program, value, RuntimeValueType::Integer);
+			}
+			if (const auto found = validated.find(inst); found != validated.end()) {
+				return found->second;
+			}
+			const bool valid = ValidateRuntimeValue(program, value, RuntimeValueType::Integer,
+			                                        nullptr, &cyclic_entries);
+			validated.emplace(inst, valid);
+			return valid;
+		};
+		if (runtime()) return Clone(value);
 		if (inst == nullptr) return {};
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ConditionRef || op == ValueOpcode::LogicalNot) {
