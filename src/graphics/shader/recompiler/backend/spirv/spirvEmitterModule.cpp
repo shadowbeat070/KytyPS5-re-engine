@@ -335,20 +335,21 @@ void DefineDescriptors(EmitterState& state) {
 	}
 	if (state.program.bindings.uses_bindless) {
 		const auto Define = [&](uint32_t type, const char* name, spv::StorageClass storage,
-		                        uint32_t binding) {
+		                        uint32_t binding, uint32_t set = IR::BindlessDescriptorSet) {
 			const auto variable =
 			    state.builder.DefineGlobalVariable(TypePointer(state, storage, type), storage);
 			state.builder.AddName(variable, name);
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet,
-			                            IR::BindlessDescriptorSet);
+			                            set);
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
 			return variable;
 		};
 		state.bindless_arena_variable =
 		    Define(StorageBufferType(state), "bindless_arena", spv::StorageClassStorageBuffer,
 		           IR::BindlessArenaBinding);
-		constexpr std::array names {"bindless_2d", "bindless_2d_array", "bindless_3d",
-		                            "bindless_1d"};
+		constexpr std::array names {
+		    "bindless_2d",      "bindless_2d_array",      "bindless_3d",      "bindless_1d",
+		    "bindless_2d_uint", "bindless_2d_array_uint", "bindless_3d_uint", "bindless_1d_uint"};
 		static_assert(names.size() == static_cast<size_t>(IR::BindlessShape::Count));
 		const bool samples_1d =
 		    std::ranges::any_of(state.program.info.images, [](const IR::ImageResource& image) {
@@ -356,7 +357,11 @@ void DefineDescriptors(EmitterState& state) {
 		    });
 		for (uint32_t shape = 0; shape < static_cast<uint32_t>(IR::BindlessShape::Count); shape++) {
 			const auto kind = static_cast<IR::BindlessShape>(shape);
-			if (kind == IR::BindlessShape::Image1D) {
+			if (IR::BindlessShapeNumericClass(kind) != Prospero::TextureNumericClass::Float &&
+			    !state.program.bindings.bindless_integer) {
+				continue;
+			}
+			if (IR::BindlessShapeDimension(kind) == ImageDimension::Dim1D) {
 				if (!samples_1d) {
 					continue;
 				}
@@ -367,7 +372,7 @@ void DefineDescriptors(EmitterState& state) {
 			                       ConstantU32(state, IR::BindlessImageSlots));
 			state.bindless_image_variables[shape] =
 			    Define(array, names[shape], spv::StorageClassUniformConstant,
-			           IR::BindlessImageBinding(kind));
+			           IR::BindlessImageBinding(kind), IR::BindlessImageSet(kind));
 		}
 	}
 }

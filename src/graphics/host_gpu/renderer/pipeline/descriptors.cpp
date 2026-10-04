@@ -1223,6 +1223,11 @@ void RenderExecutor::PrepareBindlessTables(std::span<PreparedBindings* const> st
 	if (m_bindless == nullptr) {
 		m_bindless = std::make_unique<BindlessImageHeap>(m_context, *this);
 	}
+	if (std::ranges::any_of(stages, [](const PreparedBindings* stage) {
+		    return stage->runtime->program->bindings.bindless_integer;
+	    })) {
+		m_bindless->EnableIntegers();
+	}
 	for (const auto* stage: stages) {
 		for (const auto& table: stage->runtime->resources->bindless_tables) {
 			m_bindless->Prepare(table);
@@ -1508,13 +1513,22 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	vk::DescriptorSet bindless_set = nullptr;
+	vk::DescriptorSet integer_set  = nullptr;
 	if (std::ranges::any_of(prepared_bindings, [](const PreparedBindings* prepared) {
 		    return prepared->runtime->program->bindings.uses_bindless;
 	    })) {
 		if (m_bindless == nullptr) {
 			m_bindless = std::make_unique<BindlessImageHeap>(m_context, *this);
 		}
+		const bool integer =
+		    std::ranges::any_of(prepared_bindings, [](const PreparedBindings* prepared) {
+			    return prepared->runtime->program->bindings.bindless_integer;
+		    });
+		if (integer) {
+			m_bindless->EnableIntegers();
+		}
 		bindless_set = m_bindless->Commit(vk_buffer);
+		integer_set  = integer ? m_bindless->IntegerSet() : nullptr;
 	}
 
 	if (!m_descriptor_writes.empty()) {
@@ -1570,6 +1584,11 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
 		                             ShaderRecompiler::IR::BindlessDescriptorSet, 1, &bindless_set,
 		                             0, nullptr);
+	}
+	if (integer_set != nullptr) {
+		vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout,
+		                             ShaderRecompiler::IR::BindlessIntegerDescriptorSet, 1,
+		                             &integer_set, 0, nullptr);
 	}
 }
 

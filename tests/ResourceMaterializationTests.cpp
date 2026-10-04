@@ -590,8 +590,24 @@ void TestBindlessRecordClassification() {
             volume->dimension == ImageDimension::Dim3D,
         "a volume T# was not served from the 3D array");
   Check(!Shape(Bindless::TSharp{}), "the null T# was served");
-  Check(!Shape(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor2D)),
-        "an integer T# was served from a float array");
+  Check(!Shape(TestTSharp(0x100, BufferFormat::k8UInt, ImageType::kColor2D)),
+        "an unsigned integer T# was served before anything loads integer records");
+  const auto Integer = [](const Bindless::TSharp &words) {
+    return Bindless::ClassifyRecord(words, true);
+  };
+  const auto mask = Integer(TestTSharp(0x100, BufferFormat::k8UInt, ImageType::kColor2D));
+  Check(mask && mask->array == BindlessShape::Uint2D &&
+            mask->numeric == Libs::Graphics::Prospero::TextureNumericClass::Uint &&
+            mask->Code() == (Libs::Graphics::ShaderRecompiler::IR::IndirectImageShape(
+                                 ImageDimension::Dim2D, false) |
+                             Libs::Graphics::ShaderRecompiler::IR::BindlessUintShapeCode),
+        "an unsigned integer T# was not served from the integer 2D array");
+  const auto masks =
+      Integer(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor2DArray, 3u));
+  Check(masks && masks->array == BindlessShape::Uint2DArray && masks->Code() != array->Code(),
+        "an unsigned integer 2D array T# shared the float array's shape code");
+  Check(!Integer(TestTSharp(0x100, BufferFormat::k32SInt, ImageType::kColor2D)),
+        "a signed integer T# was served");
   const auto line = Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor1D));
   Check(line && line->array == BindlessShape::Image1D &&
             line->dimension == ImageDimension::Dim1D && !line->cube &&
@@ -609,8 +625,10 @@ void TestBindlessRecordClassification() {
   Check(line->Code() != plain->Code() && line->Code() != array->Code() &&
             line->Code() != cube->Code() && line->Code() != volume->Code(),
         "the 1D shape code collides with another shape");
-  Check(!Shape(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor1D)),
-        "an integer 1D T# was served from a float array");
+  const auto mask_line =
+      Integer(TestTSharp(0x100, BufferFormat::k32UInt, ImageType::kColor1D));
+  Check(mask_line && mask_line->array == BindlessShape::Uint1D,
+        "an unsigned integer 1D T# was not served from the integer 1D array");
   Check(!Shape(TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2DMsaa)),
         "an MSAA T# was served");
   auto reserved = TestTSharp(0x100, BufferFormat::k8_8_8_8UNorm, ImageType::kColor2D);

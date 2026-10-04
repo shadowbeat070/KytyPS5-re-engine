@@ -333,29 +333,70 @@ inline constexpr uint32_t BindlessArenaBinding      = 0u;
 inline constexpr uint32_t BindlessFirstImageBinding = 1u;
 inline constexpr uint32_t BindlessImageSlots        = 4096u;
 
-enum class BindlessShape : uint32_t { Image2D, Image2DArray, Image3D, Image1D, Count };
+inline constexpr uint32_t BindlessIntegerDescriptorSet = 3u;
+
+enum class BindlessShape : uint32_t {
+	Image2D,
+	Image2DArray,
+	Image3D,
+	Image1D,
+	Uint2D,
+	Uint2DArray,
+	Uint3D,
+	Uint1D,
+	Count
+};
+inline constexpr uint32_t BindlessFloatShapes   = 4u;
+inline constexpr uint32_t BindlessUintShapeCode = 1u << 4u;
+static_assert(IndirectImageShape(Decoder::ImageDimension::Dim2DMsaaArray, true) <
+              BindlessUintShapeCode);
 
 // Cube samples go through the 2D-array element of their view; only the coordinates differ.
 [[nodiscard]] constexpr std::optional<BindlessShape>
-BindlessShapeFor(Decoder::ImageDimension dimension) {
+BindlessShapeFor(Decoder::ImageDimension       dimension,
+                 Prospero::TextureNumericClass numeric = Prospero::TextureNumericClass::Float) {
+	uint32_t shape = 0;
 	switch (dimension) {
-		case Decoder::ImageDimension::Dim2D: return BindlessShape::Image2D;
-		case Decoder::ImageDimension::Dim2DArray: return BindlessShape::Image2DArray;
-		case Decoder::ImageDimension::Dim3D: return BindlessShape::Image3D;
-		case Decoder::ImageDimension::Dim1D: return BindlessShape::Image1D;
+		case Decoder::ImageDimension::Dim2D: shape = 0u; break;
+		case Decoder::ImageDimension::Dim2DArray: shape = 1u; break;
+		case Decoder::ImageDimension::Dim3D: shape = 2u; break;
+		case Decoder::ImageDimension::Dim1D: shape = 3u; break;
+		default: return std::nullopt;
+	}
+	switch (numeric) {
+		case Prospero::TextureNumericClass::Float: return static_cast<BindlessShape>(shape);
+		case Prospero::TextureNumericClass::Uint:
+			return static_cast<BindlessShape>(shape + BindlessFloatShapes);
 		default: return std::nullopt;
 	}
 }
 [[nodiscard]] constexpr Decoder::ImageDimension BindlessShapeDimension(BindlessShape shape) {
-	switch (shape) {
-		case BindlessShape::Image2D: return Decoder::ImageDimension::Dim2D;
-		case BindlessShape::Image2DArray: return Decoder::ImageDimension::Dim2DArray;
-		case BindlessShape::Image1D: return Decoder::ImageDimension::Dim1D;
+	switch (static_cast<uint32_t>(shape) % BindlessFloatShapes) {
+		case 0u: return Decoder::ImageDimension::Dim2D;
+		case 1u: return Decoder::ImageDimension::Dim2DArray;
+		case 3u: return Decoder::ImageDimension::Dim1D;
 		default: return Decoder::ImageDimension::Dim3D;
 	}
 }
+[[nodiscard]] constexpr Prospero::TextureNumericClass
+BindlessShapeNumericClass(BindlessShape shape) {
+	return static_cast<uint32_t>(shape) >= BindlessFloatShapes
+	           ? Prospero::TextureNumericClass::Uint
+	           : Prospero::TextureNumericClass::Float;
+}
+[[nodiscard]] constexpr uint32_t BindlessShapeCode(Decoder::ImageDimension dimension, bool cube,
+                                                   Prospero::TextureNumericClass numeric) {
+	return IndirectImageShape(dimension, cube) |
+	       (numeric == Prospero::TextureNumericClass::Uint ? BindlessUintShapeCode : 0u);
+}
 [[nodiscard]] constexpr uint32_t BindlessImageBinding(BindlessShape shape) {
-	return BindlessFirstImageBinding + static_cast<uint32_t>(shape);
+	return static_cast<uint32_t>(shape) >= BindlessFloatShapes
+	           ? static_cast<uint32_t>(shape) - BindlessFloatShapes
+	           : BindlessFirstImageBinding + static_cast<uint32_t>(shape);
+}
+[[nodiscard]] constexpr uint32_t BindlessImageSet(BindlessShape shape) {
+	return static_cast<uint32_t>(shape) >= BindlessFloatShapes ? BindlessIntegerDescriptorSet
+	                                                           : BindlessDescriptorSet;
 }
 static_assert(BindlessImageSlots <= 0x10000u);
 
@@ -529,7 +570,8 @@ struct BindingLayout {
 	uint32_t                       memory_offset_count   = 0;
 	std::vector<uint32_t>          user_data_registers;
 	std::vector<DescriptorBinding> descriptors;
-	bool                           uses_bindless = false;
+	bool                           uses_bindless    = false;
+	bool                           bindless_integer = false;
 
 	[[nodiscard]] uint32_t ShaderDataDwords() const {
 		return memory_offset_dword + (memory_offset_count + 3u) / 4u;

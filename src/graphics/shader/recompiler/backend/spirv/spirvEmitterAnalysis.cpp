@@ -223,7 +223,7 @@ uint32_t MakeSampledImage(EmitterState& state, uint32_t resource, uint32_t sampl
 IR::ImageResource BindlessImageResource(IR::BindlessShape shape) {
 	IR::ImageResource image;
 	image.resource_class = IR::ImageResourceClass::Sampled;
-	image.numeric_class  = Prospero::TextureNumericClass::Float;
+	image.numeric_class  = IR::BindlessShapeNumericClass(shape);
 	image.dimension      = IR::BindlessShapeDimension(shape);
 	image.read           = true;
 	return image;

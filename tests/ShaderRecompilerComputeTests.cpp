@@ -13737,6 +13737,107 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckBindlessHeapIntegerRecords() {
+    constexpr const char *name = "BindlessHeapIntegerRecords";
+    constexpr uintptr_t base = 0x0000000207600000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t stride = 48;
+    constexpr uint32_t record_offset = 16;
+    constexpr uint32_t records = 3;
+    constexpr uint64_t color_address = base + 0x10000;
+    constexpr uint64_t mask_address = base + 0x20000;
+    static_assert(std::tuple_size_v<decltype(BindlessImageHeap::LayoutBindings({}))> ==
+                  1u + ShaderRecompiler::IR::BindlessFloatShapes);
+    EnsureRuntimeContext();
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), allocation_size,
+                allocation_alignment, 0, &direct_offset) == 0,
+            "heap direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, allocation_size, 0x3, 0x10,
+                                                           direct_offset,
+                                                           allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "heap fixed mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    const auto TSharp = [](uint64_t address, Prospero::BufferFormat format) {
+      std::array<u32, 8> words{};
+      words[0] = static_cast<u32>(address >> 8u);
+      words[1] = static_cast<u32>(address >> 40u) | (static_cast<u32>(format) << 20u) |
+                 (3u << 30u); // width 4
+      words[2] = 3u << 14u;
+      words[3] = DstSel(4, 5, 6, 7) | (static_cast<u32>(Prospero::TileMode::kLinear) << 20u) |
+                 (static_cast<u32>(Prospero::ImageType::kColor2D) << 28u);
+      words[5] = 0x00700000u;
+      return words;
+    };
+    const auto Put = [&](u32 record, const std::array<u32, 8> &words) {
+      std::memcpy(reinterpret_cast<void *>(base + record * stride + record_offset), words.data(),
+                  sizeof(words));
+    };
+    Put(1, TSharp(color_address, Prospero::BufferFormat::k32Float));
+    Put(2, TSharp(mask_address, Prospero::BufferFormat::k32UInt));
+
+    {
+      RenderContext context(m_runtime_context);
+      auto &scheduler = context.GetCommandScheduler();
+      HW::Context registers{};
+      HW::UserConfig user_config{};
+      HW::Shader shaders{};
+      context.InitializeGpu(nullptr);
+      scheduler.Begin(registers, user_config, shaders);
+      auto &texture_cache = context.GetTextureCache();
+      context.MapMemory(base, allocation_size);
+      {
+        BindlessImageHeap heap(context, context.GetRenderExecutor());
+        ShaderRecompiler::IR::BindlessImageTable table{};
+        table.heap = {static_cast<u32>(base), static_cast<u32>(base >> 32u) | (stride << 16u),
+                      records, 0u};
+        table.stride = stride;
+        table.record_offset = record_offset;
+        const auto ImageAt = [&](uint64_t address) {
+          for (const auto id : TextureCacheTestAccess::FindImages(texture_cache, address, 64,
+                                                                  false)) {
+            if (texture_cache.GetImage(id).info.data.address == address) {
+              return true;
+            }
+          }
+          return false;
+        };
+        heap.Prepare(table);
+        Require(name, "commit", heap.Commit(scheduler.Current().Handle()) != nullptr,
+                "the heap committed no descriptor set");
+        Require(name, "no integer consumer",
+                ImageAt(color_address) && !ImageAt(mask_address) &&
+                    heap.IntegerSet() == nullptr,
+                "an integer record was resolved, or the integer set built, with nothing loading "
+                "from the heap");
+        heap.EnableIntegers();
+        heap.Prepare(table);
+        Require(name, "commit", heap.Commit(scheduler.Current().Handle()) != nullptr,
+                "the heap committed no descriptor set");
+        Require(name, "integer consumer", ImageAt(mask_address) && heap.IntegerSet() != nullptr,
+                "enabling integer records did not re-resolve the cached unservable record");
+      }
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      context.ShutdownGpu();
+    }
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "heap direct-memory mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "heap direct-memory allocation release failed");
+    std::printf("[host]    %-32s ok\n", name);
+  }
+
   void CheckBindlessHeap1DRecords() {
     constexpr const char *name = "BindlessHeap1DRecords";
     constexpr uintptr_t base = 0x0000000207400000ull;
@@ -13869,22 +13970,31 @@ public:
       std::array<ImageId, static_cast<size_t>(BindlessShape::Count)> ids{};
       for (u32 shape = 0; shape < ids.size(); shape++) {
         const auto kind = static_cast<BindlessShape>(shape);
+        const auto dimension = ShaderRecompiler::IR::BindlessShapeDimension(kind);
+        const bool integer = ShaderRecompiler::IR::BindlessShapeNumericClass(kind) ==
+                             Prospero::TextureNumericClass::Uint;
         TextureCache::ImageDesc desc{};
-        desc.info.guest_format = Prospero::BufferFormat::k32Float;
-        desc.info.pixel_format = vk::Format::eR32Sfloat;
-        desc.info.type = kind == BindlessShape::Image3D   ? Prospero::ImageType::kColor3D
-                         : kind == BindlessShape::Image1D ? Prospero::ImageType::kColor1D
-                                                          : Prospero::ImageType::kColor2D;
+        desc.info.guest_format =
+            integer ? Prospero::BufferFormat::k32UInt : Prospero::BufferFormat::k32Float;
+        desc.info.pixel_format = integer ? vk::Format::eR32Uint : vk::Format::eR32Sfloat;
+        desc.info.type = dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D
+                             ? Prospero::ImageType::kColor3D
+                         : dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D
+                             ? Prospero::ImageType::kColor1D
+                             : Prospero::ImageType::kColor2D;
         desc.info.extent = {1, 1, 1};
         desc.info.resources = {1, 1};
         desc.info.bytes_per_block = 4;
         desc.info.samples = 1;
         desc.info.mip_layout[0] = {0, 0, 1, 1};
         desc.view_info.format = desc.info.pixel_format;
-        desc.view_info.type = kind == BindlessShape::Image3D        ? vk::ImageViewType::e3D
-                              : kind == BindlessShape::Image2DArray ? vk::ImageViewType::e2DArray
-                              : kind == BindlessShape::Image1D      ? vk::ImageViewType::e1D
-                                                                    : vk::ImageViewType::e2D;
+        desc.view_info.type =
+            dimension == ShaderRecompiler::Decoder::ImageDimension::Dim3D ? vk::ImageViewType::e3D
+            : dimension == ShaderRecompiler::Decoder::ImageDimension::Dim2DArray
+                ? vk::ImageViewType::e2DArray
+            : dimension == ShaderRecompiler::Decoder::ImageDimension::Dim1D
+                ? vk::ImageViewType::e1D
+                : vk::ImageViewType::e2D;
         desc.view_info.aspect = vk::ImageAspectFlagBits::eColor;
         desc.view_info.usage = vk::ImageUsageFlagBits::eSampled;
         desc.type = TextureCache::BindingType::Texture;
@@ -13903,8 +14013,12 @@ public:
                   ids[static_cast<size_t>(BindlessShape::Image3D)] !=
                       ids[static_cast<size_t>(BindlessShape::Image2D)] &&
                   ids[static_cast<size_t>(BindlessShape::Image2DArray)] ==
-                      ids[static_cast<size_t>(BindlessShape::Image2D)],
-              "the null images were not one per image type");
+                      ids[static_cast<size_t>(BindlessShape::Image2D)] &&
+                  ids[static_cast<size_t>(BindlessShape::Uint2D)] !=
+                      ids[static_cast<size_t>(BindlessShape::Image2D)] &&
+                  ids[static_cast<size_t>(BindlessShape::Uint2DArray)] ==
+                      ids[static_cast<size_t>(BindlessShape::Uint2D)],
+              "the null images were not one per image type and numeric class");
       scheduler.Finish();
       context.ShutdownGpu();
     }
@@ -17760,11 +17874,25 @@ public:
                                                    &empty_layout),
                 "vkCreateDescriptorSetLayout(empty)");
     }
-    const std::array set_layouts{descriptor_layout, empty_layout, bindless_layout};
+    vk::DescriptorSetLayout integer_layout = nullptr;
+    if (layout.bindless_integer) {
+      const auto integer =
+          BindlessImageHeap::IntegerLayoutBindings(vk::ShaderStageFlagBits::eCompute);
+      vk::DescriptorSetLayoutCreateInfo integer_info{};
+      integer_info.bindingCount = static_cast<u32>(integer.size());
+      integer_info.pBindings = integer.data();
+      RequireVk(test.name, "dispatch",
+                m_device.createDescriptorSetLayout(&integer_info, nullptr, &integer_layout),
+                "vkCreateDescriptorSetLayout(integer)");
+    }
+    const std::array set_layouts{descriptor_layout, empty_layout, bindless_layout,
+                                 integer_layout};
     vk::PipelineLayoutCreateInfo pipeline_layout_info{};
     pipeline_layout_info.sType = vk::StructureType::ePipelineLayoutCreateInfo;
     pipeline_layout_info.setLayoutCount =
-        layout.uses_bindless ? ShaderRecompiler::IR::BindlessDescriptorSet + 1u : 1u;
+        layout.bindless_integer ? ShaderRecompiler::IR::BindlessIntegerDescriptorSet + 1u
+        : layout.uses_bindless       ? ShaderRecompiler::IR::BindlessDescriptorSet + 1u
+                                     : 1u;
     pipeline_layout_info.pSetLayouts = set_layouts.data();
     const bool thread_limit = test.compute_info.dispatch_thread_dimensions;
     vk::PushConstantRange push_range{};
@@ -17820,9 +17948,15 @@ public:
         add_pool_size(binding.descriptorType, binding.descriptorCount);
       }
     }
+    if (layout.bindless_integer) {
+      for (const auto &binding :
+           BindlessImageHeap::IntegerLayoutBindings(vk::ShaderStageFlagBits::eCompute)) {
+        add_pool_size(binding.descriptorType, binding.descriptorCount);
+      }
+    }
     vk::DescriptorPoolCreateInfo pool_info{};
     pool_info.sType = vk::StructureType::eDescriptorPoolCreateInfo;
-    pool_info.maxSets = layout.uses_bindless ? 2u : 1u;
+    pool_info.maxSets = layout.bindless_integer ? 3u : layout.uses_bindless ? 2u : 1u;
     pool_info.poolSizeCount = static_cast<u32>(pool_sizes.size());
     pool_info.pPoolSizes = pool_sizes.empty() ? nullptr : pool_sizes.data();
     vk::DescriptorPool descriptor_pool = nullptr;
@@ -18093,6 +18227,7 @@ public:
       writes.push_back(write);
     }
     vk::DescriptorSet bindless_set = nullptr;
+    vk::DescriptorSet integer_set = nullptr;
     vk::DescriptorBufferInfo arena_info{};
     if (layout.uses_bindless) {
       vk::DescriptorSetAllocateInfo global_set_info{};
@@ -18110,12 +18245,27 @@ public:
       write.descriptorType = vk::DescriptorType::eStorageBuffer;
       write.pBufferInfo = &arena_info;
       writes.push_back(write);
+      if (layout.bindless_integer) {
+        vk::DescriptorSetAllocateInfo integer_set_info{};
+        integer_set_info.descriptorPool = descriptor_pool;
+        integer_set_info.descriptorSetCount = 1;
+        integer_set_info.pSetLayouts = &integer_layout;
+        RequireVk(test.name, "dispatch",
+                  m_device.allocateDescriptorSets(&integer_set_info, &integer_set),
+                  "vkAllocateDescriptorSets(integer)");
+      }
       for (u32 shape = 0; shape < bindless->images.size(); shape++) {
+        const auto kind = static_cast<ShaderRecompiler::IR::BindlessShape>(shape);
+        const bool integer =
+            ShaderRecompiler::IR::BindlessImageSet(kind) != ShaderRecompiler::IR::BindlessDescriptorSet;
+        if (integer && integer_set == nullptr) {
+          continue;
+        }
         Require(test.name, "dispatch",
                 bindless->images[shape].size() == ShaderRecompiler::IR::BindlessImageSlots,
                 "a bindless array must fill every element");
         vk::WriteDescriptorSet images{};
-        images.dstSet = bindless_set;
+        images.dstSet = integer ? integer_set : bindless_set;
         images.dstBinding = ShaderRecompiler::IR::BindlessImageBinding(
             static_cast<ShaderRecompiler::IR::BindlessShape>(shape));
         images.descriptorCount = ShaderRecompiler::IR::BindlessImageSlots;
@@ -18191,6 +18341,11 @@ public:
       cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout,
                              ShaderRecompiler::IR::BindlessDescriptorSet, 1,
                              &bindless_set, 0, nullptr);
+    }
+    if (integer_set != nullptr) {
+      cmd.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline_layout,
+                             ShaderRecompiler::IR::BindlessIntegerDescriptorSet, 1, &integer_set,
+                             0, nullptr);
     }
     Buffer thread_limit_buffer;
     if (layout.UsesPushData() || thread_limit) {
@@ -18296,6 +18451,9 @@ public:
     if (bindless_layout != nullptr) {
       m_device.destroyDescriptorSetLayout(bindless_layout, nullptr);
       m_device.destroyDescriptorSetLayout(empty_layout, nullptr);
+    }
+    if (integer_layout != nullptr) {
+      m_device.destroyDescriptorSetLayout(integer_layout, nullptr);
     }
     m_device.destroyShaderModule(module, nullptr);
   }
@@ -22253,6 +22411,22 @@ void CheckIndirectImageTableSelects(VulkanHarness *vulkan) {
   std::printf("[compute] %-32s ok\n", test.name);
 }
 
+// The integer arrays of the global set need integer views even where nothing reads them.
+VulkanHarness::Image BindlessUintNull(VulkanHarness *vulkan, const char *name, u32 shape) {
+  const auto dimension = shape % 4u;
+  const auto height = dimension == 3u ? 1u : 4u;
+  return vulkan->CreateImageMips(
+      name, 4, height, vk::Format::eR32G32B32A32Uint, vk::ImageUsageFlagBits::eSampled,
+      {std::vector<u32>(16u * height, 0xdeadu)}, 4, vk::ImageLayout::eShaderReadOnlyOptimal,
+      dimension == 2u ? vk::ImageType::e3D : dimension == 3u ? vk::ImageType::e1D
+                                                             : vk::ImageType::e2D,
+      dimension == 0u   ? vk::ImageViewType::e2D
+      : dimension == 1u ? vk::ImageViewType::e2DArray
+      : dimension == 2u ? vk::ImageViewType::e3D
+                        : vk::ImageViewType::e1D,
+      1);
+}
+
 constexpr u32 kBindlessMaterialBase = 0x1000u;
 constexpr u32 kBindlessMaterialStride = 224u;
 constexpr u32 kBindlessHeapBase = 0x2000u;
@@ -22699,6 +22873,233 @@ void CheckBindlessImageTable1D(VulkanHarness *vulkan) {
                   " channel " + std::to_string(channel) + " read " +
                   std::to_string(std::bit_cast<float>(actual[channel])) + ", expected " +
                   std::to_string(expected));
+    }
+    vulkan->DestroyBuffer(&buffer);
+  }
+  vulkan->Device().destroySampler(sampler, nullptr);
+  vulkan->DestroyBuffer(&arena_buffer);
+  for (auto &texture : textures) {
+    vulkan->DestroyImage(&texture);
+  }
+  for (auto &texture : nulls) {
+    vulkan->DestroyImage(&texture);
+  }
+  std::printf("[compute] %-32s ok\n", name);
+}
+
+float BindlessLoadTexel(u32 key, u32 mip, u32 layer, u32 x, u32 y) {
+  return static_cast<float>(key * 1000u + mip * 100u + layer * 50u + y * 4u + x);
+}
+
+TestCase BindlessHeapImageLoad() {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = "BindlessHeapImageLoad";
+  test.code = {
+      EncodeVop1(0x02, 16, Vgpr(0)),                  // v_readfirstlane_b32 s16, v0
+      EncodeSop2(0x26, 17, 16, 255u),                 // s_mul_i32 s17, s16, 224
+      kBindlessMaterialStride,
+      EncodeSmem0(0x08, 18, 6), EncodeSmem1(4, 17),   // s_buffer_load_dword s18, s[12:15], s17 offset:4
+      EncodeSmem0(0x08, 19, 6), EncodeSmem1(8, 17),   // s_buffer_load_dword s19, s[12:15], s17 offset:8
+      EncodeSop2(0x26, 20, 18, 255u),                 // s_mul_i32 s20, s18, 48
+      kBindlessHeapStride,
+      EncodeSop2(0x26, 21, 19, 255u),                 // s_mul_i32 s21, s19, 48
+      kBindlessHeapStride,
+      EncodeSmem0(0x0b, 24, 2), EncodeSmem1(kBindlessRecordOffset, 20), // s_buffer_load_dwordx8 s[24:31], s[4:7], s20 offset:16
+      EncodeSmem0(0x0b, 32, 2), EncodeSmem1(kBindlessRecordOffset, 21), // s_buffer_load_dwordx8 s[32:39], s[4:7], s21 offset:16
+  };
+  AppendVMovU32(&test.code, 20, 1);
+  AppendVMovU32(&test.code, 21, 1);
+  AppendVMovU32(&test.code, 22, 1);
+  AppendVMovU32(&test.code, 23, std::bit_cast<u32>(0.625f));
+  AppendVMovU32(&test.code, 24, std::bit_cast<u32>(0.875f));
+  test.code.insert(test.code.end(), {
+      EncodeMimg0(0x00, 0xf), EncodeMimg1(0, 20, 6),    // image_load v[0:3], v[20:21], s[24:31] dim:2d
+      EncodeMimg0(0x01, 0xf), EncodeMimg1(4, 20, 8),    // image_load_mip v[4:7], v[20:22], s[32:39] dim:2d
+      EncodeMimg0(0x27, 0xf), EncodeMimg1(8, 23, 6, 2), // image_sample_lz v[8:11], v[23:24], s[24:31], s[8:11] dim:2d
+  });
+  for (u32 channel = 0; channel < 12u; channel++) {
+    AppendStoreVgpr(&test.code, channel, channel);
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_READFIRSTLANE_B32, O::S_MUL_I32,      O::S_BUFFER_LOAD_DWORD,
+                  O::S_BUFFER_LOAD_DWORDX8, O::V_MOV_B32,    O::IMAGE_LOAD,
+                  O::IMAGE_LOAD_MIP,      O::IMAGE_SAMPLE,   O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.has_user_data = true;
+  test.user_data[4] = kBindlessHeapBase;
+  test.user_data[5] = kBindlessHeapStride << 16u;
+  test.user_data[6] = kBindlessHeapRecords;
+  test.user_data[12] = kBindlessMaterialBase;
+  test.user_data[13] = kBindlessMaterialStride << 16u;
+  test.user_data[14] = 2u;
+  test.user_data[50] = 12u * sizeof(u32);
+  test.initial.assign((kBindlessHeapBase + kBindlessHeapRecords * kBindlessHeapStride) / 4u, 0u);
+  // Two levels each: last_level 1 in word 3, max_mip 1 in word 5.
+  const auto Record = [&](u32 key, Prospero::ImageType type, u32 depth_field,
+                          Prospero::BufferFormat format =
+                              Prospero::BufferFormat::k32_32_32_32Float) {
+    const auto at = (kBindlessHeapBase + key * kBindlessHeapStride + kBindlessRecordOffset) / 4u;
+    test.initial[at + 0u] = 0x10000u + key * 0x100u;
+    test.initial[at + 1u] = static_cast<u32>(format) << 20u;
+    test.initial[at + 2u] = 3u | (3u << 14u);
+    test.initial[at + 3u] = DstSel(4, 5, 6, 7) | (1u << 16u) | (static_cast<u32>(type) << 28u);
+    test.initial[at + 4u] = depth_field;
+    test.initial[at + 5u] = 1u << 4u;
+  };
+  Record(1, Prospero::ImageType::kColor2D, 0);
+  Record(2, Prospero::ImageType::kColor2D, 0);
+  Record(3, Prospero::ImageType::kColor2DArray, 1);
+  Record(4, Prospero::ImageType::kColor3D, 0);
+  Record(5, Prospero::ImageType::kCube, 5);
+  Record(7, Prospero::ImageType::kColor2D, 0, Prospero::BufferFormat::k32_32_32_32UInt);
+  test.specialization_memory = true;
+  return test;
+}
+
+void CheckBindlessImageTableLoads(VulkanHarness *vulkan) {
+  using namespace ShaderRecompiler::IR;
+  const auto test = BindlessHeapImageLoad();
+  const char *name = "BindlessImageTableLoads";
+  const auto compiled = CompileBindlessCase(test, vulkan->SubgroupSize(), true);
+  Require(name, "binding layout",
+          compiled.program.bindings.uses_bindless &&
+              compiled.resources.bindless_tables.size() == 2u &&
+              std::ranges::count_if(compiled.program.info.images,
+                                    [](const ImageResource &image) { return image.bindless; }) ==
+                  2,
+          "the loaded heap tables were not served from the global set");
+  {
+    spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+    std::string text;
+    Require(name, "module", tools.Disassemble(compiled.spirv, &text), "disassembly failed");
+    // A wave the host runs as two halves emits every access twice; a load fetches through a
+    // float and an integer arm per shape, a sample through the float arms only.
+    const auto fetches = CountText(text, "OpImageFetch");
+    const auto samples = CountText(text, "OpImageSampleExplicitLod");
+    Require(name, "module",
+            samples != 0u && samples % 3u == 0u && fetches == 4u * samples &&
+                text.find("bindless_2d_array_uint") != std::string::npos,
+            "a heap load did not fetch through every 2D-family arm: fetches=" +
+                std::to_string(fetches) + " samples=" + std::to_string(samples));
+  }
+
+  using ImageType = VulkanHarness::Image;
+  const auto Texture = [&](u32 key, vk::ImageType type, vk::ImageViewType view, u32 layers,
+                           u32 mips, bool integer = false) {
+    std::vector<std::vector<u32>> levels(mips);
+    for (u32 mip = 0; mip < mips; mip++) {
+      const auto extent = 4u >> mip;
+      for (u32 layer = 0; layer < layers; layer++) {
+        for (u32 y = 0; y < extent; y++) {
+          for (u32 x = 0; x < extent; x++) {
+            const auto texel = BindlessLoadTexel(key, mip, layer, x, y);
+            levels[mip].insert(levels[mip].end(), 4u,
+                               integer ? static_cast<u32>(texel) : std::bit_cast<u32>(texel));
+          }
+        }
+      }
+    }
+    return vulkan->CreateImageMips(name, 4, 4,
+                                   integer ? vk::Format::eR32G32B32A32Uint
+                                           : vk::Format::eR32G32B32A32Sfloat,
+                                   vk::ImageUsageFlagBits::eSampled, levels, 4,
+                                   vk::ImageLayout::eShaderReadOnlyOptimal, type, view, layers);
+  };
+  std::array<ImageType, static_cast<size_t>(BindlessShape::Count)> nulls{
+      Texture(900, vk::ImageType::e2D, vk::ImageViewType::e2D, 1, 2),
+      Texture(900, vk::ImageType::e2D, vk::ImageViewType::e2DArray, 1, 2),
+      Texture(900, vk::ImageType::e3D, vk::ImageViewType::e3D, 1, 1),
+      vulkan->CreateImageMips(name, 4, 1, vk::Format::eR32G32B32A32Sfloat,
+                              vk::ImageUsageFlagBits::eSampled,
+                              {std::vector<u32>(16u, std::bit_cast<u32>(-1.0f))}, 4,
+                              vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e1D,
+                              vk::ImageViewType::e1D, 1),
+      BindlessUintNull(vulkan, name, 4), BindlessUintNull(vulkan, name, 5),
+      BindlessUintNull(vulkan, name, 6), BindlessUintNull(vulkan, name, 7)};
+  std::vector<ImageType> textures;
+  textures.reserve(8);
+
+  const auto heap = std::span(test.initial).subspan(kBindlessHeapBase / 4u);
+  Bindless::TranslationCache cache;
+  Bindless::SlotAllocator slots;
+  VulkanHarness::BindlessFixture fixture;
+  for (u32 shape = 0; shape < fixture.images.size(); shape++) {
+    fixture.images[shape].assign(BindlessImageSlots,
+                                 {nullptr, nulls[shape].view, nulls[shape].layout});
+  }
+  std::vector<u32> arena(1u + kBindlessHeapRecords, 0u);
+  constexpr u32 kRegionBase = 1u;
+  const auto records = Bindless::HeapRecordCount(kBindlessHeapRecords * kBindlessHeapStride,
+                                                 kBindlessHeapStride, kBindlessRecordOffset,
+                                                 1u << 20u);
+  Bindless::TranslateHeap(
+      heap, kBindlessHeapStride, kBindlessRecordOffset, records, cache,
+      [&](const Bindless::TSharp &tsharp,
+          const Bindless::RecordShape &shape) -> std::optional<u32> {
+        const auto key = (tsharp[0] - 0x10000u) / 0x100u;
+        const auto slot = slots.Assign(shape.array, tsharp[0]);
+        Require(name, "slot", slot.has_value(), "an array ran out of elements");
+        if (shape.array == BindlessShape::Image3D) {
+          textures.push_back(Texture(key, vk::ImageType::e3D, vk::ImageViewType::e3D, 1, 1));
+        } else if (shape.array == BindlessShape::Image2DArray) {
+          textures.push_back(Texture(key, vk::ImageType::e2D, vk::ImageViewType::e2DArray,
+                                     (tsharp[4] & 0x1fffu) + 1u, 2));
+        } else {
+          textures.push_back(Texture(key, vk::ImageType::e2D, vk::ImageViewType::e2D, 1, 2,
+                                     shape.numeric == Prospero::TextureNumericClass::Uint));
+        }
+        fixture.images[static_cast<size_t>(shape.array)][*slot] = {
+            nullptr, textures.back().view, textures.back().layout};
+        return Bindless::TranslationWord(shape, *slot);
+      },
+      std::span(arena).subspan(kRegionBase, records), true);
+  Require(name, "translation",
+          (arena[kRegionBase + 7] >> 16u) ==
+              (IndirectImageShape(ShaderRecompiler::Decoder::ImageDimension::Dim2D, false) |
+               BindlessUintShapeCode),
+          "the integer record was not translated into the integer 2D array");
+  auto arena_buffer = vulkan->CreateStorageBuffer(name, arena, arena.size());
+  fixture.arena = arena_buffer.buffer;
+  fixture.arena_size = arena_buffer.size;
+  for (const auto &table : compiled.resources.bindless_tables) {
+    fixture.patches.push_back({table.srt_offset, kRegionBase, records});
+  }
+
+  const auto sampler = vulkan->CreateSampler(name);
+  // A 2D access to an array or cube record reads its first layer; a volume, a null record or a
+  // key past the table reads zero, and so does a sample of the integer record.
+  const auto Expected = [](u32 key, u32 mip, u32 x, u32 y, bool sample) -> u32 {
+    if (key == 7u) {
+      return sample ? 0u : static_cast<u32>(BindlessLoadTexel(key, mip, 0, x, y));
+    }
+    return std::bit_cast<u32>((key >= 1u && key <= 3u) || key == 5u
+                                  ? BindlessLoadTexel(key, mip, 0, x, y)
+                                  : 0.0f);
+  };
+  struct Probe {
+    u32 load_key;
+    u32 mip_key;
+  };
+  const std::array probes{Probe{1, 2}, Probe{2, 1},  Probe{3, 3},  Probe{1, 5},
+                          Probe{4, 1}, Probe{6, 3},  Probe{99, 4}, Probe{0xffffffffu, 5},
+                          Probe{7, 7}, Probe{2, 7}};
+  for (const auto &probe : probes) {
+    auto memory = test.initial;
+    memory[1] = probe.load_key;
+    memory[2] = probe.mip_key;
+    auto buffer = vulkan->CreateStorageBuffer(name, memory, memory.size());
+    vulkan->Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, {},
+                     &fixture);
+    const auto actual = vulkan->ReadBuffer(name, buffer, 12);
+    for (u32 channel = 0; channel < 12u; channel++) {
+      const auto expected = channel < 4u   ? Expected(probe.load_key, 0, 1, 1, false)
+                            : channel < 8u ? Expected(probe.mip_key, 1, 1, 1, false)
+                                           : Expected(probe.load_key, 0, 2, 3, true);
+      Require(name, "fetched texel", actual[channel] == expected,
+              "keys " + std::to_string(probe.load_key) + "/" + std::to_string(probe.mip_key) +
+                  " channel " + std::to_string(channel) + " read " + Hex(actual[channel]) +
+                  ", expected " + Hex(expected));
     }
     vulkan->DestroyBuffer(&buffer);
   }
@@ -47650,9 +48051,11 @@ int main(int argc, char **argv) {
     VulkanHarness vulkan;
     CheckBindlessImageTableSelects(&vulkan);
     CheckBindlessImageTable1D(&vulkan);
+    CheckBindlessImageTableLoads(&vulkan);
     CheckNull1DImageBindings(&vulkan);
     vulkan.CheckBindlessNullImages();
     vulkan.CheckBindlessHeap1DRecords();
+    vulkan.CheckBindlessHeapIntegerRecords();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--s-memrealtime-only") == 0) {
@@ -48390,6 +48793,7 @@ int main(int argc, char **argv) {
     CheckBindlessImageModuleStability();
     CheckBindlessImageTableSelects(&vulkan);
     CheckBindlessImageTable1D(&vulkan);
+    CheckBindlessImageTableLoads(&vulkan);
     CheckNull1DImageBindings(&vulkan);
     return 0;
   }
@@ -48605,6 +49009,7 @@ int main(int argc, char **argv) {
     vulkan.CheckStencilPlaneEqualFootprint(true);
     vulkan.CheckBindlessNullImages();
     vulkan.CheckBindlessHeap1DRecords();
+    vulkan.CheckBindlessHeapIntegerRecords();
     vulkan.CheckRenderExecutorStencilAliasRediscovery();
     vulkan.CheckBgra16Readback();
     vulkan.CheckLargeImageReadback();
@@ -48629,6 +49034,7 @@ int main(int argc, char **argv) {
   CheckIndirectImageTableSelects(&vulkan);
   CheckBindlessImageTableSelects(&vulkan);
   CheckBindlessImageTable1D(&vulkan);
+  CheckBindlessImageTableLoads(&vulkan);
   CheckNull1DImageBindings(&vulkan);
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);

@@ -427,6 +427,10 @@ bool ServedBindless(const ResourcePlan& program, uint32_t image_index) {
 	return image.resource_class == ImageResourceClass::Sampled && !image.written && !image.atomic &&
 	       !image.depth_compare && !image.r128 && BindlessShapeFor(image.dimension).has_value();
 }
+
+bool BindlessReads(ValueOpcode opcode) {
+	return opcode == ValueOpcode::ImageSampleRaw || opcode == ValueOpcode::ImageRead;
+}
 // Why an indirect image table could not be enumerated. Every clause below refuses for a different
 // reason with a different fix - a handle the host cannot decode, a probe budget the table outgrows,
 // an image budget its materials outgrow - and the caller reported all of them as the same line. The
@@ -2919,7 +2923,7 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
 			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
-			    inst.GetOpcode() == ValueOpcode::ImageSampleRaw) {
+			    BindlessReads(inst.GetOpcode())) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
@@ -3109,7 +3113,8 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 				EXIT_IF(memory.sampler == UINT32_MAX);
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
-			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw);
+			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        !(image.bindless && BindlessReads(inst.GetOpcode())));
 		}
 	}
 	for (auto& memory: memory_info) {

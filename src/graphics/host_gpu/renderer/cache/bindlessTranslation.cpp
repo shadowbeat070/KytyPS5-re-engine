@@ -14,7 +14,7 @@ size_t TSharpHash::operator()(const TSharp& words) const noexcept {
 	return static_cast<size_t>(XXH3_64bits(words.data(), sizeof(words)));
 }
 
-std::optional<RecordShape> ClassifyRecord(const TSharp& words) {
+std::optional<RecordShape> ClassifyRecord(const TSharp& words, bool integer) {
 	// Base address and format both zero is the null T#.
 	if (words[0] == 0u && (words[1] & 0xffu) == 0u) {
 		return std::nullopt;
@@ -26,8 +26,12 @@ std::optional<RecordShape> ClassifyRecord(const TSharp& words) {
 	}
 	const auto format = static_cast<Prospero::BufferFormat>((words[1] >> 20u) & 0x1ffu);
 	if (format == Prospero::BufferFormat::kInvalid || format > Prospero::BufferFormat::kBc7Srgb ||
-	    Prospero::IsFmaskTextureFormat(format) || Prospero::RemapTextureFormat(format) != format ||
-	    Prospero::SampledTextureNumericClass(format) != Prospero::TextureNumericClass::Float) {
+	    Prospero::IsFmaskTextureFormat(format) || Prospero::RemapTextureFormat(format) != format) {
+		return std::nullopt;
+	}
+	const auto numeric = Prospero::SampledTextureNumericClass(format);
+	if (numeric != Prospero::TextureNumericClass::Float &&
+	    (numeric != Prospero::TextureNumericClass::Uint || !integer)) {
 		return std::nullopt;
 	}
 	RecordShape shape;
@@ -50,8 +54,10 @@ std::optional<RecordShape> ClassifyRecord(const TSharp& words) {
 			break;
 		default: return std::nullopt;
 	}
+	shape.numeric   = numeric;
+	shape.array     = *ShaderRecompiler::IR::BindlessShapeFor(shape.dimension, numeric);
 	const auto type = static_cast<Prospero::ImageType>((words[3] >> 28u) & 0xfu);
-	if ((shape.array == BindlessShape::Image2DArray ||
+	if ((shape.dimension == ImageDimension::Dim2DArray ||
 	     type == Prospero::ImageType::kColor1DArray) &&
 	    ((words[4] >> 16u) & 0x1fffu) > (words[4] & 0x1fffu)) {
 		return std::nullopt;
@@ -116,14 +122,14 @@ TSharp RecordAt(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset
 
 void TranslateHeap(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset,
                    uint32_t records, TranslationCache& cache, const RecordResolver& resolve,
-                   std::span<uint32_t> words) {
+                   std::span<uint32_t> words, bool integer) {
 	for (uint32_t record = 0; record < records && record < words.size(); record++) {
 		const auto tsharp = RecordAt(heap, stride, offset, record);
 		if (const auto found = cache.find(tsharp); found != cache.end()) {
 			words[record] = found->second;
 			continue;
 		}
-		const auto shape = ClassifyRecord(tsharp);
+		const auto shape = ClassifyRecord(tsharp, integer);
 		const auto word =
 		    shape.has_value() ? resolve(tsharp, *shape) : std::optional<uint32_t> {0u};
 		if (word.has_value()) {
@@ -134,12 +140,12 @@ void TranslateHeap(std::span<const uint32_t> heap, uint32_t stride, uint32_t off
 }
 
 std::vector<TSharp> MissingRecords(std::span<const uint32_t> heap, uint32_t stride, uint32_t offset,
-                                   uint32_t records, const TranslationCache& cache) {
+                                   uint32_t records, const TranslationCache& cache, bool integer) {
 	std::vector<TSharp>                    missing;
 	std::unordered_set<TSharp, TSharpHash> seen;
 	for (uint32_t record = 0; record < records; record++) {
 		const auto tsharp = RecordAt(heap, stride, offset, record);
-		if (cache.contains(tsharp) || !ClassifyRecord(tsharp).has_value() ||
+		if (cache.contains(tsharp) || !ClassifyRecord(tsharp, integer).has_value() ||
 		    !seen.insert(tsharp).second) {
 			continue;
 		}

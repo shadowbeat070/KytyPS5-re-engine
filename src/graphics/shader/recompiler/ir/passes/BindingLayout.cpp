@@ -177,6 +177,15 @@ void AllocateBindings(Program& program, uint32_t push_data_start_dword, bool lds
 		}
 		resources.insert(resources.end(), count, i);
 	}
+	next.bindless_integer =
+	    next.uses_bindless && std::ranges::any_of(program.blocks, [&](const Block* block) {
+		    return std::ranges::any_of(*block, [&](const Inst& inst) {
+			    return inst.GetOpcode() == ValueOpcode::ImageRead &&
+			           program.info.images
+			               .at(program.memory_info.at(inst.Flags<MemoryFlags>().index).resource)
+			               .bindless;
+		    });
+	    });
 	for (uint32_t i = 0; i < image_groups.size(); i++) {
 		if (!image_groups[i].empty()) {
 			PadIndexedImageBinding(program.info, image_groups[i]);
