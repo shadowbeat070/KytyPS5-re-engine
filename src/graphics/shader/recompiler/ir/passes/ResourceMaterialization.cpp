@@ -2414,6 +2414,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_read_order = OrderSrtReadsAgainstWrites(program);
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
+	CyclicPhiEntryCache         cyclic_entries {.program = &program};
 	Value                       unknown;
 	std::function<Value(Value)> ClonePredicate = [&](Value value) -> Value {
 		value = value.Resolve();
@@ -2422,7 +2423,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
 			return Value(true);
 		}
-		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer)) return Clone(value);
+		if (ValidateRuntimeValue(program, value, RuntimeValueType::Integer, nullptr,
+		                         &cyclic_entries))
+			return Clone(value);
 		if (inst == nullptr) return {};
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ConditionRef || op == ValueOpcode::LogicalNot) {

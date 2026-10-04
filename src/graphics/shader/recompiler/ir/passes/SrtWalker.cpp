@@ -358,8 +358,8 @@ bool IsRuntimeUniformOp(ValueOpcode op) {
 class RuntimeValidator {
 public:
 	RuntimeValidator(const ResourcePlan& program, RuntimeValueType type,
-	                 RuntimeValueFailure* failure)
-	    : m_program(program), m_type(type), m_failure(failure) {}
+	                 RuntimeValueFailure* failure, CyclicPhiEntryCache* cache)
+	    : m_program(program), m_type(type), m_failure(failure), m_cyclic_cache(cache) {}
 
 	bool Run(Value value) { return Validate(value); }
 
@@ -556,7 +556,8 @@ private:
 			// Accept the value the loop is entered with; the evaluator proves it is a fixpoint
 			// before anything is bound.
 			CyclicPhiFailure cyclic;
-			const auto       entry = ResolveCyclicPhiEntry(m_program, value, nullptr, &cyclic);
+			const auto       entry =
+			    ResolveCyclicPhiEntry(m_program, value, nullptr, &cyclic, m_cyclic_cache);
 			if (entry.IsEmpty()) {
 				// Name which of the two shapes stopped the walk: a web nothing enters needs a
 				// runtime descriptor, while disagreeing entry values only need proving equal.
@@ -706,7 +707,8 @@ private:
 
 	const ResourcePlan&                                 m_program;
 	RuntimeValueType                                    m_type;
-	RuntimeValueFailure*                                m_failure = nullptr;
+	RuntimeValueFailure*                                m_failure      = nullptr;
+	CyclicPhiEntryCache*                                m_cyclic_cache = nullptr;
 	std::unordered_map<const Inst*, std::vector<Value>> m_validated_uniform;
 	Value                                               m_active_mask;
 	std::unordered_set<const Inst*>                     m_visiting;
@@ -2375,11 +2377,11 @@ std::string_view RuntimeValueRejectName(RuntimeValueReject reason) {
 }
 
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value, RuntimeValueType type,
-                          RuntimeValueFailure* failure) {
+                          RuntimeValueFailure* failure, CyclicPhiEntryCache* cache) {
 	if (failure != nullptr) {
 		*failure = {};
 	}
-	return RuntimeValidator(program, type, failure).Run(value);
+	return RuntimeValidator(program, type, failure, cache).Run(value);
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

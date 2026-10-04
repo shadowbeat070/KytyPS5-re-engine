@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
@@ -916,9 +917,21 @@ struct CyclicPhiFailure {
 	Value           other;
 };
 
+// Valid only while nothing rewrites the program's instructions.
+struct CyclicPhiEntryCache {
+	struct Answer {
+		Value                    entry;
+		std::vector<const Inst*> web;
+		CyclicPhiFailure         reject;
+	};
+	const ResourcePlan*                     program = nullptr;
+	std::unordered_map<const Inst*, Answer> answers;
+};
+
 Value ResolveCyclicPhiEntry(const ResourcePlan& program, Value value,
                             std::vector<const Inst*>* web_out = nullptr,
-                            CyclicPhiFailure*         reject  = nullptr);
+                            CyclicPhiFailure*         reject  = nullptr,
+                            CyclicPhiEntryCache*      cache   = nullptr);
 Value ResolveActiveU32(Value value, Value active);
 
 } // namespace Libs::Graphics::ShaderRecompiler::IR

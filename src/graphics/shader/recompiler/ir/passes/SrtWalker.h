@@ -161,7 +161,8 @@ struct FlatRefreshFailure {
 // only where that reason is logged: it is written at most once, and only when validation fails.
 bool ValidateRuntimeValue(const ResourcePlan& program, Value value,
                           RuntimeValueType     type    = RuntimeValueType::Any,
-                          RuntimeValueFailure* failure = nullptr);
+                          RuntimeValueFailure* failure = nullptr,
+                          CyclicPhiEntryCache* cache   = nullptr);
 // Uses the strict reader for values that affect shader specialization.
 SrtRuntime CleanRuntime(SrtRuntime runtime);
 
