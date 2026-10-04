@@ -299,7 +299,10 @@ bool TileGetTextureBlockLayout(Prospero::BufferFormat format, Prospero::TileMode
 	if (!TileGetTextureElementLayout(format, element)) {
 		return false;
 	}
-	if ((family == TileBlockFamily::Depth64KB || family == TileBlockFamily::RenderTarget64KB) &&
+	// The render-target swizzle depends only on the element size, so BC blocks tile like one.
+	const bool block_compressed = Prospero::BlockCompressedBytesPerBlock(format) != 0;
+	if ((family == TileBlockFamily::Depth64KB ||
+	     (family == TileBlockFamily::RenderTarget64KB && !block_compressed)) &&
 	    Prospero::RenderTargetBytesPerElement(format) != element.bytes) {
 		return false;
 	}
