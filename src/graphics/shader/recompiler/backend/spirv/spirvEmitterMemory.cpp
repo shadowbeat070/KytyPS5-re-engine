@@ -457,11 +457,14 @@ uint32_t ReadDynamicConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
 	}
 	const auto u64    = TypeU64(state);
 	const auto word1  = ctx.Arg(*handle, 1);
-	auto       offset = ctx.Arg(inst, 1);
-	if (mem.offset != 0u) {
-		offset = Binary(state, spv::OpIAdd, TypeU32(state), offset, ConstantU32(state, mem.offset));
+	// Scalar buffer addressing aligns the base and each offset independently, without wrapping.
+	auto offset_64 = Unary(
+	    state, spv::OpUConvert, u64,
+	    Binary(state, spv::OpBitwiseAnd, TypeU32(state), ctx.Arg(inst, 1), ConstantU32(state, ~3u)));
+	if ((mem.offset & ~3u) != 0u) {
+		offset_64 = Binary(state, spv::OpIAdd, u64, offset_64,
+		                   ConstantU64(state, mem.offset & ~3u));
 	}
-	offset = Binary(state, spv::OpBitwiseAnd, TypeU32(state), offset, ConstantU32(state, ~3u));
 	const auto stride =
 	    Unary(state, spv::OpUConvert, u64,
 	          EmitBitFieldUExtract(state, word1, ConstantU32(state, 16u), ConstantU32(state, 14u)));
@@ -470,7 +473,6 @@ uint32_t ReadDynamicConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
 	    Select(state, u64,
 	           Binary(state, spv::OpIEqual, TypeBool(state), stride, ConstantU64(state, 0)),
 	           records, Binary(state, spv::OpIMul, u64, records, stride));
-	const auto offset_64 = Unary(state, spv::OpUConvert, u64, offset);
 	const auto in_bounds =
 	    Binary(state, spv::OpULessThanEqual, TypeBool(state),
 	           Binary(state, spv::OpIAdd, u64, offset_64, ConstantU64(state, 4u)), size);
