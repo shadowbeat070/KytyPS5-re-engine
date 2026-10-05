@@ -37,7 +37,7 @@ namespace {
 }
 
 [[nodiscard]] vk::ImageCreateFlags ImageCreateFlags(const GraphicContext& graphics,
-                                                   const ImageInfo& info) {
+                                                    const ImageInfo&      info) {
 	vk::ImageCreateFlags flags {};
 	if (DepthAspectTransferFormat(info.pixel_format) == vk::Format::eUndefined) {
 		flags |= vk::ImageCreateFlagBits::eMutableFormat;
@@ -63,10 +63,9 @@ namespace {
 		usage |= vk::ImageUsageFlagBits::eSampled;
 		if (graphics.supports_block_texel_view) {
 			const auto storage = usage | vk::ImageUsageFlagBits::eStorage;
-			if (graphics.GetImageFormatProperties(info.pixel_format, HostImageType(info.type),
-			                                      vk::ImageTiling::eOptimal, storage,
-			                                      ImageCreateFlags(graphics, info),
-			                                      nullptr) == vk::Result::eSuccess) {
+			if (graphics.GetImageFormatProperties(
+			        info.pixel_format, HostImageType(info.type), vk::ImageTiling::eOptimal, storage,
+			        ImageCreateFlags(graphics, info), nullptr) == vk::Result::eSuccess) {
 				usage = storage;
 			} else {
 				static std::atomic_flag warned = ATOMIC_FLAG_INIT;
@@ -86,7 +85,8 @@ namespace {
 	}
 	if (DepthAspectTransferFormat(info.pixel_format) != vk::Format::eUndefined) {
 		usage |= vk::ImageUsageFlagBits::eDepthStencilAttachment;
-		if (graphics.attachment_feedback_loop_enabled && (usage & vk::ImageUsageFlagBits::eSampled)) {
+		if (graphics.attachment_feedback_loop_enabled &&
+		    (usage & vk::ImageUsageFlagBits::eSampled)) {
 			usage |= vk::ImageUsageFlagBits::eAttachmentFeedbackLoopEXT;
 		}
 		return usage;
@@ -354,14 +354,14 @@ std::pair<uint32_t, uint32_t> Image::SanitizeCopyLayers(const Image& source,
 void Image::CopyImage(Image& source) {
 	EXIT_IF(source.backing.samples != backing.samples);
 	m_scheduler.EndRendering();
-	const uint32_t levels     = std::min(source.backing.mip_levels, backing.mip_levels);
-	const uint32_t base_depth = source.backing.image_type == backing.image_type
-	                                ? std::min(source.backing.extent.depth, backing.extent.depth)
-	                            : backing.image_type == vk::ImageType::e3D
-	                                ? backing.extent.depth
-	                                : source.backing.extent.depth;
-	const bool carry_stencil = CopyCarriesStencil(source.backing.format, backing.format);
-	const auto source_aspect =
+	const uint32_t levels        = std::min(source.backing.mip_levels, backing.mip_levels);
+	const uint32_t base_depth    = source.backing.image_type == backing.image_type
+	                                   ? std::min(source.backing.extent.depth, backing.extent.depth)
+	                               : backing.image_type == vk::ImageType::e3D
+	                                   ? backing.extent.depth
+	                                   : source.backing.extent.depth;
+	const bool     carry_stencil = CopyCarriesStencil(source.backing.format, backing.format);
+	const auto     source_aspect =
 	    carry_stencil ? FullAspectMask(source.backing.format)
 	                  : FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
 	const auto destination_aspect =
@@ -681,7 +681,8 @@ void Validate(const ImageInfo& info) {
 		case ImageMetadataKind::Dcc:
 		case ImageMetadataKind::Cmask:
 			if (!GuestRange {info.metadata.range.address,
-			                 std::max<uint64_t>(info.metadata.range.size, 1)}.Valid() ||
+			                 std::max<uint64_t>(info.metadata.range.size, 1)}
+			         .Valid() ||
 			    info.metadata.compression == VideoOutCompression::Unsupported) {
 				EXIT("invalid color metadata\n");
 			}
@@ -757,12 +758,12 @@ Image::Image(GraphicContext& graphics, CommandScheduler& scheduler, const ImageI
 		     allocation.budget.reported ? "reported" : "unknown",
 		     allocation.host_fallback_allowed ? "tried" : "not permitted for this usage");
 	}
-	SetVulkanObjectNameF(
-	    graphics.device, backing.image,
-	    "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} layers={} samples={}]",
-	    info.data.address, info.data.size, info.extent.width, info.extent.height, info.extent.depth,
-	    static_cast<uint32_t>(info.pixel_format), info.resources.levels, info.resources.layers,
-	    info.samples);
+	SetVulkanObjectNameF(graphics.device, backing.image,
+	                     "Kyty.Image[guest=0x{:016x} size=0x{:x} extent={}x{}x{} format={} mips={} "
+	                     "layers={} samples={}]",
+	                     info.data.address, info.data.size, info.extent.width, info.extent.height,
+	                     info.extent.depth, static_cast<uint32_t>(info.pixel_format),
+	                     info.resources.levels, info.resources.layers, info.samples);
 }
 
 bool Image::Supersede(uint64_t address, uint64_t size) {
@@ -798,7 +799,7 @@ bool Image::Supersede(uint64_t address, uint64_t size) {
 uint64_t Image::HashGuestEdges() const {
 	std::array<uint8_t, TRACKER_PAGE_SIZE * 2> bytes {};
 	const auto                                 range = info.data;
-	const uint64_t head_end =
+	const uint64_t                             head_end =
 	    std::min(range.End(), Common::AlignUp(range.address, TRACKER_PAGE_SIZE));
 	const uint64_t tail_begin =
 	    std::max(range.address, Common::AlignDown(range.End(), TRACKER_PAGE_SIZE));

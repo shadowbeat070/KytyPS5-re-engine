@@ -146,7 +146,7 @@ public:
 	[[nodiscard]] std::span<const std::pair<uint64_t, uint64_t>> SupersededRanges() const noexcept {
 		return m_superseded;
 	}
-	void               ClearBufferModified() noexcept { m_buffer_modified = false; }
+	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
 	                            bool pages = false) const noexcept {
@@ -171,12 +171,12 @@ public:
 	[[nodiscard]] static bool CopyCarriesStencil(vk::Format source,
 	                                             vk::Format destination) noexcept;
 
-	ImageInfo        info;
-	VulkanImage      backing;
+	ImageInfo                    info;
+	VulkanImage                  backing;
 	std::vector<CachedImageView> views;
-	ImageUsage       usage;
-	ImageBinding     binding;
-	bool             registered     = false;
+	ImageUsage                   usage;
+	ImageBinding                 binding;
+	bool                         registered = false;
 	// Parked: still registered, still tracked, still collectable, but no longer an answer to an
 	// overlapping lookup. A conflicting surface took the guest bytes over; this image keeps the
 	// pixels nobody else can reproduce and steps out of the candidate walk until an exact
@@ -191,9 +191,9 @@ public:
 	uint64_t         tick_accessed_last = 0;
 	// Counted in presented frames, not queue submissions: this title submits dozens of command
 	// buffers per frame, so a submission count cannot tell "used a moment ago" from "long dead".
-	uint64_t         frame_accessed_last = 0;
-	uint64_t         frame_touched_last  = 0;
-	size_t           lru_id              = 0;
+	uint64_t frame_accessed_last = 0;
+	uint64_t frame_touched_last  = 0;
+	size_t   lru_id              = 0;
 
 private:
 	friend struct ImageTestAccess;
@@ -204,19 +204,19 @@ private:
 	[[nodiscard]] static std::pair<uint32_t, uint32_t>
 	SanitizeCopyLayers(const Image& source, const Image& destination, uint32_t depth);
 
-	GraphicContext&   m_graphics;
-	CommandScheduler& m_scheduler;
-	uint64_t          m_maybe_cpu_hash   = 0;
-	bool              m_cpu_dirty        = false;
-	bool              m_maybe_cpu_dirty  = false;
-	bool              m_maybe_hash_valid = false;
-	uint64_t          m_gpu_write_serial = 0;
-	uint64_t          m_gpu_write_epoch    = 0;
-	uint64_t          m_buffer_write_epoch = 0;
+	GraphicContext&                            m_graphics;
+	CommandScheduler&                          m_scheduler;
+	uint64_t                                   m_maybe_cpu_hash     = 0;
+	bool                                       m_cpu_dirty          = false;
+	bool                                       m_maybe_cpu_dirty    = false;
+	bool                                       m_maybe_hash_valid   = false;
+	uint64_t                                   m_gpu_write_serial   = 0;
+	uint64_t                                   m_gpu_write_epoch    = 0;
+	uint64_t                                   m_buffer_write_epoch = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> m_superseded;
-	bool              m_gpu_modified     = false;
-	bool              m_buffer_modified  = false;
-	bool              m_backing_failed   = false;
+	bool                                       m_gpu_modified    = false;
+	bool                                       m_buffer_modified = false;
+	bool                                       m_backing_failed  = false;
 };
 
 namespace ImageOps {
