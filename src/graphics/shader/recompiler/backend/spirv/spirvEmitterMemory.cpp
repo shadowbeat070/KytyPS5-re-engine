@@ -1690,6 +1690,60 @@ uint32_t EmitIndirectBufferSwitch(ValueEmitContext& ctx, const IR::Inst& inst,
 	return phi_words[2];
 }
 
+// A buffer whose source is an indirect descriptor follows upstream's store contract: a key the
+// mapping lacks stores nothing, and a null candidate is never written.
+bool KeyedStoreBuffer(const EmitterState& state, uint32_t resource) {
+	const auto& program = state.program;
+	if (resource >= program.info.buffers.size()) {
+		return false;
+	}
+	const auto source = program.info.buffers[resource].source;
+	return source < program.descriptor_sources.size() &&
+	       program.descriptor_sources[source].indirect_descriptor.has_value();
+}
+
+bool NullKeyedStoreBuffer(const EmitterState& state, const IR::MemoryInfo& mem) {
+	return mem.kind == IR::ResourceKind::Buffer && KeyedStoreBuffer(state, mem.resource) &&
+	       state.program.info.buffers[mem.resource].packed_stride == 0u;
+}
+
+template <typename Fn>
+void EmitKeyedBufferStore(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
+                          Fn&& store) {
+	auto&       state  = ctx.state;
+	const auto& buffer = state.program.info.buffers[mem.resource];
+	const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+	if (handle == nullptr || handle->NumArgs() == 0u) {
+		ctx.Fail(inst, "indirect buffer store has no runtime key");
+		return;
+	}
+	uint32_t   matched  = 0;
+	const auto found    = EmitUnrolledCandidateSearch(state, buffer.indirect_mapping_offset,
+	                                                  buffer.indirect_search_iterations,
+	                                                  ctx.Def(handle->Arg(0)), &matched);
+	const auto selected = Select(state, TypeU32(state), matched, found,
+	                             ConstantU32(state, UINT32_MAX));
+	const auto& candidates = buffer.indirect_resources;
+	const auto  merge      = state.builder.AllocateId();
+	std::vector<uint32_t> labels(candidates.size());
+	std::vector<uint32_t> branches {spv::OpSwitch, selected, merge};
+	for (uint32_t ordinal = 0; ordinal < labels.size(); ordinal++) {
+		labels[ordinal] = state.builder.AllocateId();
+		branches.push_back(ordinal);
+		branches.push_back(labels[ordinal]);
+	}
+	state.builder.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(branches);
+	for (uint32_t ordinal = 0; ordinal < labels.size(); ordinal++) {
+		EmitLabel(state, labels[ordinal]);
+		auto per_candidate     = mem;
+		per_candidate.resource = candidates[ordinal];
+		store(per_candidate);
+		state.builder.AddFunction(spv::OpBranch, merge);
+	}
+	EmitLabel(state, merge);
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
 	if (mem.dynamic_buffer) {
@@ -2046,6 +2100,8 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  type              = inst.Arg(inst.NumArgs() - 2).GetType();
 	const auto  address_info      = IR::AddressOpcodeInfoOf(op);
 	const auto store = [&](const IR::MemoryInfo& access) -> uint32_t {
+		if (NullKeyedStoreBuffer(ctx.state, access))
+			return 0u;
 		if (access.kind == IR::ResourceKind::FlatLocal)
 			StoreLocalFlat(ctx, inst);
 		else if (buffer_components > 1u)
@@ -2067,6 +2123,10 @@ void EmitStoreMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 		return 0u;
 	};
 	if (IsIndirectBufferRoot(ctx, mem)) {
+		if (KeyedStoreBuffer(ctx.state, mem.resource)) {
+			EmitKeyedBufferStore(ctx, inst, mem, store);
+			return;
+		}
 		// No result to merge: the switch is emitted for its side effects and the phi is skipped.
 		EmitIndirectBufferSwitch(ctx, inst, mem, 0u, true, store);
 		return;

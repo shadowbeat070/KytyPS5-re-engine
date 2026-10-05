@@ -526,8 +526,10 @@ struct IndirectCandidateSearch {
 };
 
 // Unrolled: a loop per access made large buffer-table modules compile for seconds.
+// `matched`, when given, receives whether any mapping entry equalled the key.
 uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
-                                     uint32_t iterations, uint32_t key);
+                                     uint32_t iterations, uint32_t key,
+                                     uint32_t* matched = nullptr);
 
 // A loop, so the key count never reaches the module; image tables only.
 // `mapping_slot` indexes the flattened SRT's directory, which holds the table's real mapping

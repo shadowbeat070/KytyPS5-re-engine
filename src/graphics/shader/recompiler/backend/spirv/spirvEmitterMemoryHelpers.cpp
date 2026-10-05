@@ -763,7 +763,7 @@ uint32_t LoadFlattenedSrtWord(EmitterState& state, uint32_t index) {
 }
 
 uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
-                                     uint32_t iterations, uint32_t key) {
+                                     uint32_t iterations, uint32_t key, uint32_t* matched) {
 	const auto LoadMapping = [&](uint32_t index) {
 		const auto pointer = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state),
@@ -781,6 +781,7 @@ uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
 	auto       low      = ConstantU32(state, 0u);
 	auto       high     = LoadMapping(mapping);
 	auto       selected = ConstantU32(state, 0u);
+	auto       any      = matched != nullptr ? ConstantBool(state, false) : 0u;
 	for (uint32_t iteration = 0; iteration < iterations; iteration++) {
 		const auto active = Binary(state, spv::OpULessThan, TypeBool(state), low, high);
 		const auto mid    = Binary(state, spv::OpShiftRightLogical, TypeU32(state),
@@ -803,6 +804,9 @@ uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_selected, match, candidate,
 		                          selected);
 		selected              = next_selected;
+		if (matched != nullptr) {
+			any = Binary(state, spv::OpLogicalOr, TypeBool(state), any, match);
+		}
 		const auto less = Binary(state, spv::OpULessThan, TypeBool(state), mapped_key, key);
 		const auto take_upper = Binary(state, spv::OpLogicalAnd, TypeBool(state), active, less);
 		const auto take_lower = Binary(state, spv::OpLogicalAnd, TypeBool(state), active,
@@ -815,6 +819,9 @@ uint32_t EmitUnrolledCandidateSearch(EmitterState& state, uint32_t mapping_slot,
 		const auto next_high = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpSelect, TypeU32(state), next_high, take_lower, mid, high);
 		high = next_high;
+	}
+	if (matched != nullptr) {
+		*matched = any;
 	}
 	return selected;
 }

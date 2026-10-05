@@ -686,7 +686,6 @@ struct DescriptorSource {
 		uint32_t              selector_stride = 0;
 		uint32_t              selector_offset = 0;
 		uint32_t              table_offset    = 0;
-		uint32_t              table_stride    = 0;
 		uint32_t              workgroup_axis  = UINT32_MAX;
 		uint32_t              selector_shift  = 0;
 		Value                 key_count;
@@ -709,6 +708,9 @@ struct DescriptorSource {
 		// byte step is that times the V#'s stride, which is not known until the descriptor is read.
 		bool indexed_heap = false;
 		bool bindless     = false;
+		// The material offset was matched as an affine chain, so its step need not be the
+		// material V#'s record stride; every aligned word is probed.
+		bool affine_selector = false;
 
 		bool operator==(const IndirectDescriptor& other) const = default;
 	};

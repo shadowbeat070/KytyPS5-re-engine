@@ -377,7 +377,11 @@ public:
 			}
 		}
 		for (const auto& plan: m_indirect_descriptors) {
-			plan.handle->SetArg(0, plan.key);
+			// A handle reached through a phi keeps it; the projection below rewrites its arms.
+			if (plan.reads[0] == nullptr ||
+			    plan.handle->Arg(0).Resolve().TryInstruction() == plan.reads[0]) {
+				plan.handle->SetArg(0, plan.key);
+			}
 			for (uint32_t dword = 0; dword < 4u; dword++) {
 				plan.handle->SetArg(dword + 1u, plan.roots[dword + 4u]);
 			}
@@ -389,6 +393,27 @@ public:
 					if (!plan.kept[dword]) {
 						m_program.memory_info[plan.memory[dword]].planning_only = true;
 					}
+				}
+			}
+		}
+		// Project descriptor-only SSA onto its key. Existing Phis preserve dominance;
+		// native descriptor resolution excludes their stale incoming values at each use.
+		for (const auto& plan: m_indirect_descriptors) {
+			if (plan.reads[0] == nullptr) {
+				continue;
+			}
+			for (uint32_t dword = 0; dword < plan.reads.size(); dword++) {
+				if (plan.kept[dword]) {
+					continue;
+				}
+				const auto* read  = plan.reads[dword];
+				const auto  owner = std::ranges::find_if(
+                    m_indirect_descriptors,
+                    [&](const IndirectDescriptorPlan& candidate) { return candidate.reads[0] == read; });
+				const auto key  = owner != m_indirect_descriptors.end() ? owner->key : Value(0u);
+				const auto uses = read->Uses();
+				for (const auto& use: uses) {
+					use.user->SetArg(use.operand, key);
 				}
 			}
 		}
@@ -1032,11 +1057,11 @@ private:
 				if (a.material_source != b.material_source || a.table_source != b.table_source ||
 				    a.selector_stride != b.selector_stride ||
 				    a.selector_offset != b.selector_offset || a.selector_shift != b.selector_shift ||
-				    a.table_offset != b.table_offset || a.table_stride != b.table_stride ||
+				    a.table_offset != b.table_offset ||
 				    a.workgroup_axis != b.workgroup_axis || a.sources != b.sources ||
 				    a.material_offset != b.material_offset || a.heap_stride != b.heap_stride ||
 				    a.record_offset != b.record_offset || a.key_mask != b.key_mask ||
-				    a.indexed_heap != b.indexed_heap ||
+				    a.indexed_heap != b.indexed_heap || a.affine_selector != b.affine_selector ||
 				    !EquivalentValue(m_program, a.key_count, b.key_count) ||
 				    a.selector_first.IsEmpty() != b.selector_first.IsEmpty() ||
 				    (!a.selector_first.IsEmpty() &&
@@ -1107,6 +1132,19 @@ private:
 			}
 		}
 		return UsedOnlyAsImageHandle(user);
+	}
+
+	static bool UsesOnlyImageDescriptors(const Inst& value) {
+		if (value.Uses().empty()) return false;
+		std::vector<const Inst*> values {&value};
+		for (size_t index = 0; index < values.size(); ++index) {
+			for (const auto& use: values[index]->Uses()) {
+				if (use.user->GetOpcode() == ValueOpcode::GetImageResource) continue;
+				if (use.user->GetOpcode() != ValueOpcode::Phi) return false;
+				if (std::ranges::find(values, use.user) == values.end()) values.push_back(use.user);
+			}
+		}
+		return true;
 	}
 
 	// RE9 samples one bindless texture several times, so its heap record feeds several handles.
@@ -1402,6 +1440,39 @@ private:
 		return stride != 0u && uniform(selector);
 	}
 
+	// Any U32 the GPU derived, scaled and offset by constants: the stride and offset the chain adds.
+	bool MatchAffineMaterialOffset(Value value, uint32_t& stride, uint32_t& offset) const {
+		stride = 1u;
+		offset = 0u;
+		value  = value.Resolve();
+		while (const auto* inst = value.TryInstruction()) {
+			if (inst->NumArgs() != 2u) break;
+			uint32_t constant = 0;
+			Value    remaining;
+			if (inst->GetOpcode() == ValueOpcode::ShiftLeftLogical32 &&
+			    ImmediateU32(inst->Arg(1), constant) && constant < 32u) {
+				stride *= 1u << constant;
+				remaining = inst->Arg(0);
+			} else if (inst->GetOpcode() == ValueOpcode::IAdd32 ||
+			           inst->GetOpcode() == ValueOpcode::IMul32) {
+				if (ImmediateU32(inst->Arg(0), constant)) remaining = inst->Arg(1);
+				else if (ImmediateU32(inst->Arg(1), constant)) remaining = inst->Arg(0);
+				else break;
+				if (inst->GetOpcode() == ValueOpcode::IAdd32) offset += stride * constant;
+				else stride *= constant;
+			} else {
+				break;
+			}
+			value = remaining.Resolve();
+		}
+		// A masked selector names a set of records, not a step; MatchMaterialOffset decides those.
+		const auto* masked = value.TryInstruction();
+		if (masked != nullptr && masked->GetOpcode() == ValueOpcode::BitwiseAnd32) {
+			return false;
+		}
+		return stride != 0u && value.GetType() == Type::U32 && !value.IsImmediate();
+	}
+
 	// A heap record index is a shift when the stride is a power of two and a multiply otherwise;
 	// both name the same thing, so the stride comes from whichever the shader used.
 	bool MatchHeapRecordIndex(const Inst* index_math, uint32_t& stride, Value& key) const {
@@ -1467,6 +1538,49 @@ private:
 			block = previous;
 		}
 		return false;
+	}
+
+	// The shader narrows a material word as (word >> shift) & mask; the host narrows it as
+	// (word & key_mask) >> shift, so the mask is recorded shifted into place.
+	Value MaterialKeyWord(Value key, DescriptorSource::IndirectDescriptor& indirect) const {
+		const auto* inst  = key.Resolve().TryInstruction();
+		uint32_t    mask  = UINT32_MAX;
+		uint32_t    shift = 0;
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
+		    inst->NumArgs() == 2u) {
+			uint32_t immediate = 0;
+			Value    masked;
+			if (ImmediateU32(inst->Arg(0), immediate)) {
+				masked = inst->Arg(1).Resolve();
+			} else if (ImmediateU32(inst->Arg(1), immediate)) {
+				masked = inst->Arg(0).Resolve();
+			}
+			if (immediate != 0u && masked.TryInstruction() != nullptr) {
+				mask = immediate;
+				key  = masked;
+				inst = masked.TryInstruction();
+			}
+		}
+		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::ShiftRightLogical32 &&
+		    ImmediateU32(inst->Arg(1), shift) && shift != 0u && shift < 32u) {
+			key = inst->Arg(0);
+		} else {
+			shift = 0;
+		}
+		indirect.selector_shift = shift;
+		indirect.key_mask       = mask == UINT32_MAX ? UINT32_MAX : mask << shift;
+		return key.Resolve();
+	}
+
+	uint32_t WorkgroupAxis(Value key) const {
+		const auto* builtin = key.Resolve().TryInstruction();
+		uint32_t    axis    = UINT32_MAX;
+		if (m_program.stage != ShaderType::Compute || builtin == nullptr ||
+		    builtin->GetOpcode() != ValueOpcode::GetBuiltin || builtin->NumArgs() != 2u ||
+		    builtin->Arg(0) != Value(static_cast<uint32_t>(StageInputKind::WorkgroupId)) ||
+		    !ImmediateU32(builtin->Arg(1), axis) || axis >= 3u)
+			return UINT32_MAX;
+		return axis;
 	}
 
 	// The byte offset an image heap read computes: a record index scaled by the heap's record
@@ -1900,6 +2014,34 @@ private:
 		return true;
 	}
 
+	bool MatchUniformizedBufferKey(Value key, const Inst& image,
+	                               DescriptorSource::IndirectDescriptor& indirect,
+	                               DescriptorSource&                     material_source) {
+		const auto* selected = UniformizedMaterialValue(key, image);
+		if (selected == nullptr) return false;
+		const auto* loaded = MaterialKeyWord(selected->Arg(1), indirect).TryInstruction();
+		if (indirect.selector_shift == 0u && indirect.key_mask == UINT32_MAX) return false;
+		if (loaded == nullptr || loaded->GetOpcode() != ValueOpcode::SelectU32 ||
+		    !EquivalentValue(m_program, selected->Arg(0), loaded->Arg(0)))
+			return false;
+		const auto* read = loaded->Arg(1).Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::LoadBufferU32) return false;
+		const auto& memory = m_program.memory_info[read->Flags<MemoryFlags>().index];
+		uint32_t    offset = 1u, scalar = 1u;
+		if (memory.kind != ResourceKind::Buffer || memory.typed || memory.formatted ||
+		    !memory.idxen || memory.offen || !ImmediateU32(read->Arg(2), offset) || offset != 0u ||
+		    !ImmediateU32(read->Arg(3), scalar) || scalar != 0u ||
+		    !EquivalentValue(m_program, selected->Arg(0), read->Arg(4)) ||
+		    !MakeRuntimeTableSource(*read, material_source))
+			return false;
+		// GPU index arithmetic may wrap. Every record in the bounded V# is a candidate.
+		indirect.material_source = InternSource(material_source);
+		indirect.selector_first  = Value(0u);
+		indirect.key_count       = material_source.dwords[2];
+		indirect.selector_offset = memory.offset;
+		return true;
+	}
+
 	const Inst* BoundedLoop(Value key, const Block* use, const auto& accepts_bound) const {
 		const auto* phi = key.Resolve().TryInstruction();
 		if (phi == nullptr || phi->GetOpcode() != ValueOpcode::Phi ||
@@ -2057,7 +2199,8 @@ private:
 	// One image descriptor: eight dwords of T#.
 	static constexpr uint32_t DescriptorBytes = 8u * sizeof(uint32_t);
 
-	bool TryMakeIndirectImage(Inst& handle, IndirectDescriptorPlan& plan) {
+	bool TryMakeIndirectImage(Inst& handle, uint32_t base_reg, uint32_t pc,
+	                          IndirectDescriptorPlan& plan) {
 		if (handle.GetOpcode() != ValueOpcode::GetImageResource || handle.NumArgs() != 8u) {
 			return false;
 		}
@@ -2066,7 +2209,8 @@ private:
 		uint32_t table_offset = 0;
 		uint32_t heap_stride  = 0;
 		for (uint32_t dword = 0; dword < plan.reads.size(); ++dword) {
-			auto* read = handle.Arg(dword).Resolve().TryInstruction();
+			auto* read =
+			    NativeDescriptorSource(handle.Arg(dword), base_reg + dword, pc).TryInstruction();
 			if (read == nullptr) {
 				return false;
 			}
@@ -2124,9 +2268,14 @@ private:
 		}
 		DescriptorSource                material_source;
 		DescriptorSource::IndirectDescriptor indirect;
-		indirect.table_offset = table_offset;
-		indirect.heap_stride  = heap_stride;
-		if (table_source.dword_count == 2u) {
+		indirect.table_offset   = table_offset;
+		indirect.heap_stride    = heap_stride;
+		indirect.workgroup_axis = WorkgroupAxis(key);
+		if (indirect.workgroup_axis != UINT32_MAX) {
+			// The descriptor also supplies dimensions to shader arithmetic. Keep its reads;
+			// only the image handle is projected onto the bounded workgroup key.
+			plan.reads.fill(nullptr);
+		} else if (table_source.dword_count == 2u) {
 			const auto* selector = key.Resolve().TryInstruction();
 			const bool  bitscan  = selector != nullptr &&
 			                       selector->GetOpcode() == ValueOpcode::FindILsb32 &&
@@ -2167,21 +2316,7 @@ private:
 				// way or it probes the heap at a packed word times the record stride, far out of
 				// bounds. `key` itself stays the masked value, which is what the emitted search
 				// compares.
-				if (material_read != nullptr &&
-				    material_read->GetOpcode() == ValueOpcode::BitwiseAnd32 &&
-				    material_read->NumArgs() == 2u) {
-					uint32_t mask = 0;
-					Value    masked;
-					if (ImmediateU32(material_read->Arg(0), mask)) {
-						masked = material_read->Arg(1).Resolve();
-					} else if (ImmediateU32(material_read->Arg(1), mask)) {
-						masked = material_read->Arg(0).Resolve();
-					}
-					if (mask != 0u && masked.TryInstruction() != nullptr) {
-						indirect.key_mask = mask;
-						material_read     = masked.TryInstruction();
-					}
-				}
+				auto* material_read = MaterialKeyWord(key, indirect).TryInstruction();
 				uint32_t    material_memory_index = 0;
 				const auto* memory = material_read != nullptr
 				                         ? ScalarReadMemory(*material_read, material_memory_index)
@@ -2204,7 +2339,14 @@ private:
 				                         indirect.selector_stride, indirect.selector_offset,
 				                         selector_mask, false, true) ||
 				    selector_kind != DescriptorSource::SelectorKind::Stride) {
-					return false;
+					// A table the bindless heap serves anyway keeps that path.
+					if ((BindlessImageHeapsEnabled() && indirect.selector_shift == 0u) ||
+					    heap_stride != DescriptorBytes || table_offset != 0u ||
+					    !MatchAffineMaterialOffset(material_read->Arg(1), indirect.selector_stride,
+					                               indirect.selector_offset)) {
+						return false;
+					}
+					indirect.affine_selector = true;
 				}
 				const auto step = std::gcd<uint64_t>(indirect.selector_stride, uint64_t {1} << 32u);
 				indirect.selector_offset =
@@ -2224,10 +2366,16 @@ private:
 					return false;
 				}
 				indirect.material_source = InternSource(material_source);
-				indirect.bindless        = BindlessImageHeapsEnabled();
+				indirect.bindless        = BindlessImageHeapsEnabled() && indirect.selector_shift == 0u;
 				return true;
 			};
+			const auto unmatched = indirect;
 			if (!match_material()) {
+				indirect        = unmatched;
+				material_source = {};
+			}
+			if (indirect.material_source == UINT32_MAX &&
+			    !MatchUniformizedBufferKey(key, handle, indirect, material_source)) {
 				const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 				if (!BindlessImageHeapsEnabled() || shift == nullptr ||
 				    !UsedOnlyByReadsAndArithmetic(*shift, plan.reads)) {
@@ -2240,8 +2388,14 @@ private:
 				material_source       = {};
 			}
 		}
-		if (kept_reads && !indirect.bindless) {
-			return false;
+		if (kept_reads && !indirect.bindless && indirect.workgroup_axis == UINT32_MAX) {
+			// A record may also reach other image handles through phis; they plan on their own.
+			for (uint32_t dword = 0; dword < plan.reads.size(); dword++) {
+				if (plan.kept[dword] && !UsesOnlyImageDescriptors(*plan.reads[dword])) {
+					return false;
+				}
+			}
+			plan.kept.fill(false);
 		}
 		indirect.table_source = InternSource(table_source);
 		DescriptorSource image_source;
@@ -2485,8 +2639,11 @@ private:
 				if (handle == nullptr || FindIndirectDescriptor(*handle) != nullptr) {
 					continue;
 				}
+				const auto             flags = inst.Flags<MemoryFlags>();
 				IndirectDescriptorPlan plan;
-				if (TryMakeIndirectImage(*handle, plan) || TryMakeFiniteImage(*handle, plan)) {
+				if (TryMakeIndirectImage(*handle, m_program.memory_info[flags.index].resource * 4u,
+				                         flags.pc, plan) ||
+				    TryMakeFiniteImage(*handle, plan)) {
 					m_indirect_descriptors.push_back(std::move(plan));
 				}
 			}

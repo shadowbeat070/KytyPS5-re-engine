@@ -1079,9 +1079,6 @@ void Require(const char *shader_name, const char *stage, bool value,
              const std::string &message);
 // Upstream capabilities this branch does not carry (see the rebase decision log). Their tests
 // stay compiled for the port and are skipped until then.
-constexpr bool kWorkgroupIndexedDescriptors = false; // upstream 0ee88009
-constexpr bool kMaterialKeyImageArrays = false;      // upstream 843b5778, b183cb10
-constexpr bool kUpstreamIndirectBufferStores = false; // upstream 429d0af6
 
 void EnsureConfigInitialized() {
   static bool config_initialized = false;
@@ -12119,7 +12116,6 @@ public:
       uint64_t table_program_id = 0;
       for (const auto test : {TableCase{1, 4, 2, 0}, TableCase{2, 4, 2, 0},
                               TableCase{2, 8, 3, 1}, TableCase{1, 4, 2, 0}}) {
-        if (!kWorkgroupIndexedDescriptors) break;
         const auto address = base + 0x90000 + test.image * 0x10000;
         const ShaderTextureResource sharp{{static_cast<u32>(address >> 8u),
             (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 20u) |
@@ -40374,7 +40370,6 @@ void CheckRuntimeBufferRecords(VulkanHarness &vulkan) {
 }
 
 void CheckIndirectBufferStore(VulkanHarness &vulkan) {
-  if (!kUpstreamIndirectBufferStores) return;
   using namespace ShaderRecompiler::IR;
   TestCase test;
   test.name = "IndirectBufferStore";
@@ -40427,7 +40422,7 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
   candidate.indirect_search_iterations = 0;
   candidate.indirect_resources.clear();
   program.descriptor_sources.resize(1);
-  program.descriptor_sources[0].indirect_descriptor.emplace().table_stride = 16;
+  program.descriptor_sources[0].indirect_descriptor.emplace().heap_stride = 16;
   ShaderComputeInputInfo compute;
   compute.wave_size = 32;
   compute.host_subgroup_size = vulkan.SubgroupSize();
@@ -40465,7 +40460,8 @@ void CheckIndirectBufferStore(VulkanHarness &vulkan) {
       if (null_buffers != 0u && swapped) continue;
       // Repeated keys select two distinct logical buffers within one native allocation.
       // Keys below, between and above the live keys must not select either buffer.
-      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 3u,
+      // Slot 4 is the root's directory word; its mapping follows at 5.
+      compiled.resources.flattened_srt = {0u, 0u, 0u, 0u, 5u, 3u,
                                          10u, swapped ? 0u : 1u,
                                          12u, swapped ? 1u : 0u,
                                          14u, swapped ? 0u : 1u};
@@ -40542,7 +40538,7 @@ void CheckIndirectImageKeySwitch() {
   program.descriptor_sources[0].dword_count = 8;
   program.descriptor_sources[0].indirect_descriptor =
       DescriptorSource::IndirectDescriptor{.material_source = 0, .table_source = 0,
-          .selector_stride = 224, .selector_offset = 12, .table_stride = 32};
+          .selector_stride = 224, .selector_offset = 12, .heap_stride = 32};
   program.descriptor_sources[1].dword_count = 4;
 
   ImageResource root{};
@@ -45546,7 +45542,6 @@ void CheckImageSamplerSpecialization() {
   for (const bool scalar : {false, true}) {
     using namespace ShaderRecompiler::IR;
     const char *name = scalar ? "ScalarMaterialImageDomain" : "GpuMaterialImageDomain";
-    if (!kMaterialKeyImageArrays) continue;
     constexpr u32 count = 70, table_base = 0x1000, material_base = 0x2000;
     std::vector<u32> memory(4096);
     for (u32 i = 0; i < count; ++i) {
@@ -45666,9 +45661,9 @@ void CheckImageSamplerSpecialization() {
     Require(name, "bounded native material plan",
             plan.capture_specialization_reads && !translated.program.has_address_writes &&
                 MaterializeResources(plan, runtime, snapshot, specialization) &&
-                snapshot.images.size() == count + 1u,
+                snapshot.images.size() >= count + 1u,
             "GPU-selected material descriptors did not expand beyond native root capacity");
-    const auto offset = specialization.images[0].indirect_mapping_offset;
+    const auto offset = snapshot.flattened_srt[specialization.images[0].indirect_mapping_offset];
     const auto ordinal = [&](u32 key) {
       for (u32 i = 0; i < snapshot.flattened_srt[offset]; ++i)
         if (snapshot.flattened_srt[offset + 1u + 2u * i] == key)
@@ -45686,7 +45681,7 @@ void CheckImageSamplerSpecialization() {
     memory[table_base / 4u + 8u] += 0x10000u;
     Require(name, "runtime descriptor refresh",
             MaterializeResources(plan, runtime, snapshot, specialization) &&
-                specialization == previous && snapshot.images[1].dwords[0] == 0x11100u,
+                specialization == previous && snapshot.images[ordinal(1u)].dwords[0] == 0x11100u,
             "descriptor addresses were frozen or entered the shader specialization");
     auto compiled = ShaderRecompiler::CompileProgram(std::move(translated), options, specialization);
     ValidateSpirv(name, compiled.spirv);

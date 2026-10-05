@@ -606,7 +606,7 @@ RefusedIndirectTables& RefusedTables() {
 uint64_t IndirectTableSignature(const DescriptorSource::IndirectDescriptor& indirect,
                                 const DescriptorValue&                 material_value,
                                 const DescriptorValue& table_value, uint32_t image_index,
-                                uint64_t readable_extent) {
+                                uint64_t readable_extent, uint32_t workgroup_keys) {
 	struct Key {
 		uint32_t image_index;
 		uint32_t material_count;
@@ -619,6 +619,10 @@ uint64_t IndirectTableSignature(const DescriptorSource::IndirectDescriptor& indi
 		uint32_t record_offset;
 		uint32_t key_mask;
 		uint32_t indexed_heap;
+		uint32_t affine_selector;
+		uint32_t selector_shift;
+		uint32_t workgroup_axis;
+		uint32_t workgroup_keys;
 		uint64_t readable_extent;
 		uint32_t material_dwords[8];
 		uint32_t table_dwords[8];
@@ -634,6 +638,10 @@ uint64_t IndirectTableSignature(const DescriptorSource::IndirectDescriptor& indi
 	key.record_offset   = indirect.record_offset;
 	key.key_mask        = indirect.key_mask;
 	key.indexed_heap    = indirect.indexed_heap ? 1u : 0u;
+	key.affine_selector = indirect.affine_selector ? 1u : 0u;
+	key.selector_shift  = indirect.selector_shift;
+	key.workgroup_axis  = indirect.workgroup_axis;
+	key.workgroup_keys  = workgroup_keys;
 	// A refusal only holds for the backing the arena had when it was refused.
 	key.readable_extent = readable_extent;
 	std::copy(material_value.dwords.begin(), material_value.dwords.end(), key.material_dwords);
@@ -702,20 +710,77 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 	auto& keys = program.material_keys;
 	keys.clear();
 	if (indirect.material_source == UINT32_MAX) {
-		uint32_t   key_count = 0;
-		const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
-		if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
-		if (table_value.dword_count != 2u || !evaluated) {
-			return Refuse(IndirectImageFailure::Stage::KeyCountUnevaluable);
+		uint32_t key_count = 0;
+		if (indirect.workgroup_axis != UINT32_MAX) {
+			if (indirect.workgroup_axis >= runtime.workgroup_counts.size() ||
+			    runtime.workgroup_counts[indirect.workgroup_axis] == 0u) {
+				return Refuse(IndirectImageFailure::Stage::KeyCountUnevaluable);
+			}
+			key_count = runtime.workgroup_counts[indirect.workgroup_axis];
+		} else {
+			const bool evaluated = clean.Evaluate(indirect.key_count, key_count);
+			if (std::bit_cast<int32_t>(key_count) <= 0) key_count = 0;
+			if (table_value.dword_count != 2u || !evaluated) {
+				return Refuse(IndirectImageFailure::Stage::KeyCountUnevaluable);
+			}
 		}
 		failure.key_count    = key_count;
 		failure.probe_budget = MaxIndirectImageProbes;
 		if (key_count > MaxIndirectImageProbes ||
-		    uint64_t {indirect.table_offset} + uint64_t {key_count} * 32u > UINT32_MAX + 1ull) {
+		    (key_count != 0u && uint64_t {indirect.table_offset} +
+		                                uint64_t {key_count - 1u} * indirect.heap_stride +
+		                                32u >
+		                            UINT32_MAX + 1ull)) {
 			return Refuse(IndirectImageFailure::Stage::KeyCountOverBudget);
 		}
 		keys.resize(key_count);
 		std::iota(keys.begin(), keys.end(), 0u);
+	} else if (!indirect.selector_first.IsEmpty()) {
+		ShaderBufferResource material;
+		uint32_t             first = 0;
+		uint32_t             count = 0;
+		if (!DecodeBufferDescriptor(material_value, material) || material.Type() != 0u ||
+		    ((indirect.selector_shift != 0u || indirect.key_mask != UINT32_MAX) &&
+		     (material.Base48() & 3u) != 0u) ||
+		    material.SwizzleEnabled() || material.AddTid() || material.OutOfBounds() != 0u ||
+		    uint64_t {indirect.selector_offset} + 4u > material.Stride() ||
+		    !clean.Evaluate(indirect.selector_first, first) ||
+		    !clean.Evaluate(indirect.key_count, count) ||
+		    uint64_t {first} + count > material.NumRecords()) {
+			return Refuse(IndirectImageFailure::Stage::MaterialDescriptorUndecodable);
+		}
+		failure.probe_count  = count;
+		failure.probe_budget = MaxIndirectImageProbes;
+		if (count > MaxIndirectImageProbes ||
+		    (count != 0u && (uint64_t {first} + count - 1u) * material.Stride() +
+		                            indirect.selector_offset + 4u >
+		                        uint64_t {UINT32_MAX} + 1u)) {
+			return Refuse(IndirectImageFailure::Stage::ProbeCountOverBudget);
+		}
+		keys.resize(count);
+		if (material.Stride() == 4u && indirect.selector_offset == 0u) {
+			if (!ReadScalarTable(material.Base48(), material.GetSize(), uint64_t {first} * 4u,
+			                     runtime, keys)) {
+				return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
+			}
+		} else {
+			for (uint32_t index = 0; index < count; ++index) {
+				const auto offset =
+				    (uint64_t {first} + index) * material.Stride() + indirect.selector_offset;
+				if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime,
+				                     {&keys[index], 1})) {
+					failure.offset = offset;
+					return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
+				}
+			}
+		}
+		if (indirect.selector_shift != 0u || indirect.key_mask != UINT32_MAX) {
+			for (auto& key: keys) {
+				key = (key & indirect.key_mask) >> indirect.selector_shift;
+			}
+			keys.push_back(0u); // An out-of-range material load returns zero.
+		}
+		SortUniqueKeys(keys);
 	} else if (!indirect.selector_mask.IsEmpty()) {
 		uint32_t mask  = 0;
 		uint32_t count = 0;
@@ -755,7 +820,7 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 		failure.selector_stride = indirect.selector_stride;
 		failure.material_stride = material.Stride();
 		failure.material_size   = material.GetSize();
-		if (material.Stride() != indirect.selector_stride) {
+		if (!indirect.affine_selector && material.Stride() != indirect.selector_stride) {
 			return Refuse(IndirectImageFailure::Stage::MaterialStrideMismatch);
 		}
 		// The first aligned offset includes the immediate added after shader U32 arithmetic.
@@ -788,7 +853,9 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 		static thread_local std::vector<uint32_t> span_words;
 		const uint64_t                            words_per_probe = step / sizeof(uint32_t);
 		const uint64_t                            span_probes =
-		    program.capture_specialization_reads ? 1u : std::max<uint64_t>(1u, MaxSpanBytes / step);
+		    program.capture_specialization_reads && step != sizeof(uint32_t)
+		        ? 1u
+		        : std::max<uint64_t>(1u, MaxSpanBytes / step);
 		for (uint64_t probe = 0, offset = first; probe < probe_count;) {
 			const auto count   = std::min(span_probes, probe_count - probe);
 			bool       spanned = false;
@@ -806,7 +873,7 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 					return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
 				}
 				// The shader narrows the key before indexing the heap, so the enumeration must too.
-				keys.push_back(key & indirect.key_mask);
+				keys.push_back((key & indirect.key_mask) >> indirect.selector_shift);
 			}
 		}
 		SortUniqueKeys(keys);
@@ -824,8 +891,9 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 	snapshot.flattened_srt.resize(mapping_offset + 1u + keys.size() * 2u);
 	snapshot.flattened_srt[mapping_offset] = static_cast<uint32_t>(keys.size());
 	const auto record_at                   = [&](size_t entry) {
-		return static_cast<uint64_t>(keys[entry]) * indirect.heap_stride + indirect.table_offset +
-		       indirect.record_offset;
+		// The shader scales the key in 32-bit arithmetic, so the record offset wraps with it.
+		return uint64_t {static_cast<uint32_t>(keys[entry] * indirect.heap_stride)} +
+		       indirect.table_offset + indirect.record_offset;
 	};
 	// Heap records likewise; a record the table bound truncates is never windowed.
 	KYTY_PROFILER_BLOCK("EnumerateIndirectImage heap records");
@@ -836,6 +904,7 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 	bool                                      window_valid     = false;
 	static thread_local std::unordered_map<CandidateWords, uint32_t, CandidateWordsHash> ordinals;
 	ordinals.clear();
+	bool null_key = false;
 	for (uint32_t entry = 0; entry < keys.size(); ++entry) {
 		const auto      key = keys[entry];
 		DescriptorValue candidate;
@@ -905,10 +974,18 @@ bool EnumerateIndirectImage(const ResourcePlan&                    program,
 				specialization.images.push_back(child);
 			}
 		}
+		null_key |= ordinal == 0u;
 		snapshot.flattened_srt[mapping_offset + 1u + entry * 2u] = key;
 		snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = ordinal;
 	}
-	if (snapshot.images.size() == children_begin) {
+	if (indirect.workgroup_axis != UINT32_MAX && !null_key &&
+	    snapshot.images.size() == children_begin + 1u) {
+		// Every workgroup reads the same record, so it binds directly.
+		snapshot.images[image_index] = snapshot.images.back();
+		snapshot.images.pop_back();
+		specialization.images.pop_back();
+		snapshot.flattened_srt.resize(mapping_offset);
+	} else if (snapshot.images.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
 		const auto slot = IndirectMappingSlot(program, image_index);
@@ -1084,8 +1161,12 @@ bool MaterializeIndirectImage(const ResourcePlan&                    program,
 	        ? runtime.readable_extent(runtime.userdata, signature_material.Base48(),
 	                                  signature_material.GetSize())
 	        : 0u;
+	const auto workgroup_keys =
+	    indirect.workgroup_axis < runtime.workgroup_counts.size()
+	        ? runtime.workgroup_counts[indirect.workgroup_axis]
+	        : 0u;
 	const auto signature = IndirectTableSignature(indirect, material_value, table_value,
-	                                              image_index, signature_extent);
+	                                              image_index, signature_extent, workgroup_keys);
 	if (const auto* remembered = RefusedTables().Find(signature, runtime)) {
 		failure = *remembered;
 		return false;
@@ -2484,9 +2565,13 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		}
 		plan.requires_specialization_memory = true;
 		capture_image_reads |= !source->indirect_descriptor->selector_mask.IsEmpty() ||
+		                       !source->indirect_descriptor->selector_first.IsEmpty() ||
+		                       source->indirect_descriptor->selector_shift != 0u ||
 		                       !source->indirect_descriptor->sources.empty();
 		MarkCleanFlatSlots(plan, Source(plan, source->indirect_descriptor->material_source),
 		                   plan.clean_flat_slots, source->indirect_descriptor->selector_mask);
+		MarkCleanFlatSlots(plan, nullptr, plan.clean_flat_slots,
+		                   source->indirect_descriptor->selector_first);
 		if (source->indirect_descriptor->sources.empty()) {
 			MarkCleanFlatSlots(plan, Source(plan, source->indirect_descriptor->table_source),
 			                   plan.clean_flat_slots);
