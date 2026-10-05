@@ -440,6 +440,12 @@ DynamicBufferElement DynamicBufferAccess(ValueEmitContext& ctx, const IR::Inst& 
 	        AndCondition(state, nonzero(field(word3, 12, 7)), in_bounds)};
 }
 
+// DWORD buffer accesses are forced to DWORD alignment, as the native path's DwordIndex is.
+uint32_t AlignedDwordAddress(EmitterState& state, uint32_t address) {
+	return Binary(state, spv::OpBitwiseAnd, TypeU64(state), address,
+	              ConstantU64(state, ~uint64_t {3}));
+}
+
 // S_BUFFER_LOAD ignores index, swizzle and ADD_TID; the stride only scales the range check.
 uint32_t ReadDynamicConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst,
                                 const IR::MemoryInfo& mem) {
@@ -563,7 +569,8 @@ uint32_t LoadWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo me
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
 		if (mem.dynamic_buffer) {
 			const auto element = DynamicBufferAccess(ctx, inst, mem, 0u, 4u);
-			return LoadBda(ctx, element.address, element.in_bounds, 32u, mem.glc);
+			return LoadBda(ctx, AlignedDwordAddress(ctx.state, element.address),
+			               element.in_bounds, 32u, mem.glc);
 		}
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return LoadWordPrepared(ctx, inst, mem, resource);
@@ -861,7 +868,8 @@ void StoreWord(ValueEmitContext& ctx, const IR::Inst& inst, IR::MemoryInfo mem) 
 		if (mem.dynamic_buffer) {
 			const auto element = DynamicBufferAccess(ctx, inst, mem, 0u, 4u);
 			EmitIfCondition(ctx.state, element.in_bounds, [&]() {
-				StoreBdaDword(ctx, element.address, ctx.Arg(inst, inst.NumArgs() - 2), mem.glc);
+				StoreBdaDword(ctx, AlignedDwordAddress(ctx.state, element.address),
+				              ctx.Arg(inst, inst.NumArgs() - 2), mem.glc);
 			});
 			return;
 		}
@@ -1260,8 +1268,8 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::M
 			    std::array<uint32_t, 4> values {};
 			    for (uint32_t component = 0; component < components; component++) {
 				    const auto element = DynamicBufferAccess(ctx, inst, mem, component * 4u, 4u);
-				    values[component] =
-				        LoadBda(ctx, element.address, element.in_bounds, 32u, mem.glc);
+				    values[component] = LoadBda(ctx, AlignedDwordAddress(state, element.address),
+				                                element.in_bounds, 32u, mem.glc);
 			    }
 			    return ConstructU32Composite(state, components, values);
 		    }
@@ -1302,7 +1310,10 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 				                          c);
 				const auto element = DynamicBufferAccess(ctx, inst, mem, c * 4u, 4u);
 				EmitIfCondition(state, element.in_bounds,
-				                [&]() { StoreBdaDword(ctx, element.address, data, mem.glc); });
+				                [&]() {
+					                StoreBdaDword(ctx, AlignedDwordAddress(state, element.address),
+					                              data, mem.glc);
+				                });
 			}
 			return;
 		}
