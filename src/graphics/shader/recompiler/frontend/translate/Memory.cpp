@@ -588,17 +588,6 @@ void Translator::DS_ATOMIC(const Decoder::Instruction& inst, IR::ValueOpcode opc
 	}
 }
 
-// A 64-bit LDS atomic takes its operand from a VGPR pair and returns the pre-op pair.
-void Translator::DS_ATOMIC64(const Decoder::Instruction& inst, IR::ValueOpcode opcode) {
-	const auto memory  = MemoryInfoFromDecoded(inst);
-	const auto address = ReadU32(MemorySourceAt(inst, 1));
-	const auto data    = ReadU64(MemorySourceAt(inst, 0));
-	const auto result =
-	    ir.Emit(opcode, {address, data, ir.GetExec()}, AddMemoryInfo(memory, inst.pc));
-	WriteOperand(inst.dst, result);
-	return;
-}
-
 // DS_CMPST_RTN_B64 takes the swap value from data1 and the comparand from data0, the opposite
 // order from BUFFER_ATOMIC_CMPSWAP_X2, as the RDNA 2 ISA warns in its own opcode description.
 void Translator::DS_CMPST64(const Decoder::Instruction& inst) {
@@ -1073,7 +1062,7 @@ void Translator::EmitMemory(const Decoder::Instruction& inst) {
 		case Decoder::Opcode::DS_MAX_RTN_U32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax32, true);
 		case Decoder::Opcode::DS_MAX_RTN_U64:
-			return DS_ATOMIC64(inst, IR::ValueOpcode::SharedAtomicUMax64);
+			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicUMax64, true);
 		case Decoder::Opcode::DS_CMPST_RTN_B64: return DS_CMPST64(inst);
 		case Decoder::Opcode::DS_AND_B32:
 			return DS_ATOMIC(inst, IR::ValueOpcode::SharedAtomicAnd32, false);
