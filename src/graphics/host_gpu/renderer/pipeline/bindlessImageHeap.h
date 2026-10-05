@@ -87,6 +87,10 @@ private:
 		vk::ImageLayout         layout = vk::ImageLayout::eUndefined;
 		bool                    live   = false;
 	};
+	struct Watched {
+		std::vector<uint32_t> elements;
+		bool                  pending = false;
+	};
 	struct Version {
 		vk::DescriptorSet       set          = nullptr;
 		vk::DescriptorPool      pool         = nullptr;
@@ -102,6 +106,9 @@ private:
 	[[nodiscard]] bool           ElementAlive(const Element& element);
 	void                         Kill(ShaderRecompiler::IR::BindlessShape array, uint32_t slot);
 	void                         ForgetKilled();
+	void                         Watch(uint32_t element, ImageId id);
+	void                         Unwatch(uint32_t element, ImageId id);
+	void                         MarkPending(ImageId id, Watched& watched);
 	void                         SweepDeadElements();
 	void                         TouchLiveElements();
 	void                         EvictIdleHeaps(uint64_t frame);
@@ -136,6 +143,8 @@ private:
 	uint64_t                                                 m_swept_epoch     = UINT64_MAX;
 	std::vector<uint32_t>                                    m_killed;
 	std::vector<bool>                                        m_killed_mask;
+	std::unordered_map<ImageId, Watched>                     m_watched;
+	std::vector<ImageId>                                     m_pending;
 	Version                                                  m_current;
 	std::deque<Version>                                      m_retired;
 	std::vector<vk::DescriptorPool>                          m_pools;

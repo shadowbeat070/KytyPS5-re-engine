@@ -239,17 +239,42 @@ void BindlessImageHeap::Kill(BindlessShape array, uint32_t slot) {
 	if (!element.live) {
 		return;
 	}
+	const auto killed = static_cast<uint32_t>(index) * IR::BindlessImageSlots + slot;
+	Unwatch(killed, element.id);
 	element.live         = false;
 	element.view         = nullptr;
 	m_infos[index][slot] = {nullptr, m_null[index].view, vk::ImageLayout::eGeneral};
 	m_set_dirty          = true;
-	const auto killed    = static_cast<uint32_t>(index) * IR::BindlessImageSlots + slot;
 	if (m_killed_mask.empty()) {
 		m_killed_mask.resize(Arrays * IR::BindlessImageSlots);
 	}
 	if (!m_killed_mask[killed]) {
 		m_killed_mask[killed] = true;
 		m_killed.push_back(killed);
+	}
+}
+
+void BindlessImageHeap::MarkPending(ImageId id, Watched& watched) {
+	if (!watched.pending) {
+		watched.pending = true;
+		m_pending.push_back(id);
+	}
+}
+
+void BindlessImageHeap::Watch(uint32_t element, ImageId id) {
+	auto& watched = m_watched[id];
+	watched.elements.push_back(element);
+	MarkPending(id, watched);
+}
+
+void BindlessImageHeap::Unwatch(uint32_t element, ImageId id) {
+	const auto found = m_watched.find(id);
+	if (found == m_watched.end()) {
+		return;
+	}
+	std::erase(found->second.elements, element);
+	if (found->second.elements.empty()) {
+		m_watched.erase(found);
 	}
 }
 
@@ -434,6 +459,10 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 		const auto array   = static_cast<size_t>(entry.shape.array);
 		auto&      element = m_elements[array][*slot];
 		if (!element.live || element.view != view) {
+			const auto key = static_cast<uint32_t>(array) * IR::BindlessImageSlots + *slot;
+			if (element.live) {
+				Unwatch(key, element.id);
+			}
 			auto&       image = cache.m_slot_images[entry.binding.image_id];
 			const auto& info  = entry.binding.desc.view_info;
 			element.id        = entry.binding.image_id;
@@ -446,6 +475,7 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 			image.usage.texture   = true;
 			m_infos[array][*slot] = {nullptr, view, element.layout};
 			m_set_dirty           = true;
+			Watch(key, element.id);
 		}
 		m_cache[entry.tsharp] = Bindless::TranslationWord(entry.shape, *slot);
 	}
@@ -465,6 +495,8 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 void BindlessImageHeap::ResetElements() {
 	m_slots.Reset();
 	m_cache.clear();
+	m_watched.clear();
+	m_pending.clear();
 	for (uint32_t array = 0; array < ActiveArrays(); array++) {
 		for (uint32_t slot = 0; slot < IR::BindlessImageSlots; slot++) {
 			m_elements[array][slot].live = false;
@@ -688,21 +720,35 @@ vk::DescriptorSet BindlessImageHeap::Commit(vk::CommandBuffer command) {
 		    image.GetBarriers(layout, vk::AccessFlagBits2::eShaderRead, SampleStages, range);
 		m_barriers.insert(m_barriers.end(), barriers.begin(), barriers.end());
 	};
-	for (uint32_t array = 0; array < ActiveArrays(); array++) {
-		const auto used = m_slots.Used(static_cast<BindlessShape>(array));
-		for (uint32_t slot = 0; slot < used; slot++) {
-			const auto& element = m_elements[array][slot];
-			if (!element.live) {
-				continue;
-			}
-			auto& image = cache.m_slot_images[element.id];
-			if (image.binding.is_target ||
-			    (image.binding.is_bound &&
-			     (image.binding.shader_write || image.binding.force_general))) {
-				continue;
-			}
+	// Only images whose tracked state changed since they were last brought can need a barrier.
+	for (const auto id: cache.m_sampled_state_changes) {
+		if (const auto found = m_watched.find(id); found != m_watched.end()) {
+			MarkPending(id, found->second);
+		}
+	}
+	cache.m_sampled_state_changes.clear();
+	std::erase_if(m_pending, [&](ImageId id) {
+		const auto found = m_watched.find(id);
+		if (found == m_watched.end()) {
+			return true;
+		}
+		auto& image = cache.m_slot_images[id];
+		if (image.binding.is_target || (image.binding.is_bound && (image.binding.shader_write ||
+		                                                           image.binding.force_general))) {
+			return false;
+		}
+		image.state_watch = nullptr;
+		for (const auto key: found->second.elements) {
+			const auto& element =
+			    m_elements[key / IR::BindlessImageSlots][key % IR::BindlessImageSlots];
 			Bring(image, element.layout, element.range);
 		}
+		image.state_watch     = &cache.m_sampled_state_changes;
+		image.state_watch_id  = id;
+		found->second.pending = false;
+		return true;
+	});
+	for (uint32_t array = 0; array < ActiveArrays(); array++) {
 		Bring(cache.m_slot_images[m_null[array].id], vk::ImageLayout::eGeneral,
 		      m_null[array].range);
 	}
