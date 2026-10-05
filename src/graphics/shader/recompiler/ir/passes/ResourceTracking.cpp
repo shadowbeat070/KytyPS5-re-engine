@@ -2947,7 +2947,8 @@ private:
 				const auto* indirect = root != nullptr ? FindIndirectBuffer(*root) : nullptr;
 				if (indirect == nullptr || IsDemotedTable(*indirect)) {
 					if (indirect != nullptr && (memory.formatted || memory.typed)) {
-						return RejectFormattedDemotion(flags.pc);
+						// Only 4 decodes a format in the shader.
+						return take_indirect_load() || RejectFormattedDemotion(flags.pc);
 					}
 					// 3. Any other descriptor sourced from memory: decode the V# with full
 					// addressing, reaching the stores, atomics, subword and formatted accesses 1
