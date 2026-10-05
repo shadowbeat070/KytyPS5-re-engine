@@ -28,7 +28,7 @@ struct UnfoldableSet {
 	// Sorted, unique. Copied into ResourcePlan::unfoldable_pcs on the next translation.
 	std::vector<uint32_t> pcs;
 	// Bumped only when `pcs` grows, which is the only condition that costs a re-translation.
-	uint32_t              generation = 0;
+	uint32_t generation = 0;
 	// The set as it stood before the growth the current generation names. At most one growth is
 	// ever outstanding: a growth bumps the generation, so the very next draw of this shader misses
 	// its key and compiles. The compile a rollback answers is therefore always the one this stash
@@ -38,7 +38,7 @@ struct UnfoldableSet {
 	// Set by a rollback. The proof still stands - the source really is unfoldable - but claiming
 	// it produces a module this host will not build, so the channel stops offering it instead of
 	// rebuilding into the same refusal on every draw.
-	bool                  frozen = false;
+	bool frozen = false;
 };
 
 // True when `pcs` gained anything, which is the only condition that may bump a generation and so
