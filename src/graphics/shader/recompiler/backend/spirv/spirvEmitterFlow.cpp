@@ -818,8 +818,51 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                                ctx.Arg(inst, 1));
 }
 
+// An EXECZ/VCCZ branch is one decision per wave: the region may re-enable lanes and read them.
+static uint32_t EmitUniformLaneCondition(ValueEmitContext& ctx, const IR::Inst& inst,
+                                         CFG::BranchCondition kind) {
+	auto&      state  = ctx.state;
+	const auto ballot = ctx.Ballot(inst.Arg(0));
+	const bool zero =
+	    kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero;
+	uint32_t words[2] {};
+	for (uint32_t i = 0; i < 2; i++) {
+		words[i] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), words[i], ballot, i);
+	}
+	const auto result = state.builder.AllocateId();
+	if (!zero) {
+		const auto any = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBitwiseOr, TypeU32(state), any, words[0], words[1]);
+		state.builder.AddFunction(spv::OpINotEqual, TypeBool(state), result, any,
+		                          ConstantU32(state, 0));
+		return result;
+	}
+	const auto active = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active,
+	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
+	uint32_t agree[2] {};
+	for (uint32_t i = 0; i < 2; i++) {
+		const auto reference = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), reference, active, i);
+		agree[i] = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpIEqual, TypeBool(state), agree[i], words[i], reference);
+	}
+	state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), result, agree[0], agree[1]);
+	return result;
+}
+
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
-	if (ctx.other_half == nullptr) return ctx.Arg(inst, 0);
+	if (ctx.other_half == nullptr) {
+		const auto kind = inst.Flags<CFG::BranchCondition>();
+		const bool lane =
+		    kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::ExecNonZero ||
+		    kind == CFG::BranchCondition::VccZero || kind == CFG::BranchCondition::VccNonZero;
+		if (lane && ctx.state.requirements.subgroup_ballot) {
+			return EmitUniformLaneCondition(ctx, inst, kind);
+		}
+		return ctx.Arg(inst, 0);
+	}
 	// A native scalar branch makes one decision for both emulated wave halves.
 	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
