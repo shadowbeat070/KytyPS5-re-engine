@@ -34,6 +34,7 @@ struct BufferAddress {
 	uint32_t byte;
 };
 
+
 BufferAddress CalculateBufferAddress(EmitterState& state, uint32_t index, uint32_t offset,
                                      uint32_t soffset, uint32_t immediate, uint32_t stride,
                                      uint32_t swizzle, uint32_t index_stride) {
@@ -573,9 +574,8 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
                              const MemoryResourceAccess& resource, uint32_t bits,
                              bool sign_extend) {
 	const auto address = ByteAddress(ctx, inst, mem);
-	const auto index = Binary(
-	    ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
-	    ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
+	const auto index   = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
+	                            ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend, mem.glc);
@@ -882,7 +882,7 @@ template <typename Fn>
 uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           Fn&& operation) {
 	return EmitValueOrZeroIfCondition(ctx.state, ctx.Arg(inst, inst.NumArgs() - 1), [&]() {
-		const auto index = DwordIndex(ctx, inst, mem);
+		const auto index    = DwordIndex(ctx, inst, mem);
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return EmitValueOrZeroIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
@@ -2085,6 +2085,19 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
 }
 
+uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      state  = ctx.state;
+	const auto source = ctx.Arg(inst, 0);
+	const auto index  = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                           Binary(state, spv::OpShiftRightLogical, TypeU32(state),
+	                                  ctx.Arg(inst, 1), ConstantU32(state, 2)),
+	                           ConstantU32(state, 31));
+	const auto base   = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
+	                           EmitSubgroupLocalInvocationId(state), ConstantU32(state, ~31u));
+	const auto target = Binary(state, spv::OpBitwiseOr, TypeU32(state), base, index);
+	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
+}
+
 uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state   = ctx.state;
 	auto       lane    = EmitSubgroupLocalInvocationId(state);
@@ -2129,19 +2142,6 @@ uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	state.builder.AddFunction(spv::OpGroupNonUniformShuffle, TypeU32(state), result,
 	                          ConstantU32(state, spv::ScopeSubgroup), ctx.Arg(inst, 0), source);
 	return Select(state, TypeU32(state), active, result, ConstantU32(state, 0));
-}
-
-uint32_t EmitBpermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
-	auto&      state  = ctx.state;
-	const auto source = ctx.Arg(inst, 0);
-	const auto index  = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-	                           Binary(state, spv::OpShiftRightLogical, TypeU32(state),
-	                                  ctx.Arg(inst, 1), ConstantU32(state, 2)),
-	                           ConstantU32(state, 31));
-	const auto base   = Binary(state, spv::OpBitwiseAnd, TypeU32(state),
-	                           EmitSubgroupLocalInvocationId(state), ConstantU32(state, ~31u));
-	const auto target = Binary(state, spv::OpBitwiseOr, TypeU32(state), base, index);
-	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter
