@@ -145,6 +145,8 @@ public:
 	// slice-aligned slices the write covers. A marked slice discards the attachment contents at
 	// load, so an address match on its own is not enough to spend it.
 	[[nodiscard]] bool ClearMetaSlices(uint64_t address, uint64_t size);
+	// A shader store inside a metadata surface supersedes the pending clears it can reach.
+	void               DiscardMetaClears(uint64_t address, uint64_t size);
 	[[nodiscard]] bool TouchMeta(uint64_t address, uint32_t slice, bool is_clear);
 
 	bool UnmapMemory(uint64_t address, uint64_t size);

@@ -6542,6 +6542,28 @@ public:
             executor, unaligned_input, command) &&
             ClearedExactly({}),
         "a dispatch writing across a slice boundary was replaced by a clear");
+
+    // Nanite's HTile export supersedes the pending clears its binding reaches.
+    const auto ClearAll = [&] {
+      Reset();
+      return texture_cache.ClearMetaSlices(meta, slices * slice);
+    };
+    Require(name, "metadata store discards the clear",
+            ClearAll() &&
+                (texture_cache.DiscardMetaClears(meta, slices * slice),
+                 ClearedExactly({})),
+            "a shader store over the whole metadata left a clear pending");
+    Require(name, "partial store discards the slices it reaches",
+            ClearAll() &&
+                (texture_cache.DiscardMetaClears(meta + slice + 4, slice),
+                 ClearedExactly({0, 3})),
+            "a store across slices 1 and 2 did not discard exactly those");
+    Require(name, "pool store keeps the clear",
+            ClearAll() &&
+                (texture_cache.DiscardMetaClears(meta, 8 * slices * slice),
+                 texture_cache.DiscardMetaClears(meta - slice, slice),
+                 ClearedExactly({0, 1, 2, 3})),
+            "a store that is not aimed at the metadata discarded its clear");
     scheduler.Finish();
     std::printf("[host]    %-32s ok\n", name);
   }

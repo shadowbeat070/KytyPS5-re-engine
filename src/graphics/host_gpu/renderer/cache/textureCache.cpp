@@ -2849,6 +2849,32 @@ bool TextureCache::ClearMetaSlices(uint64_t address, uint64_t size) {
 	return true;
 }
 
+void TextureCache::DiscardMetaClears(uint64_t address, uint64_t size) {
+	if (size == 0) {
+		return;
+	}
+	std::scoped_lock lock {m_lock};
+	const auto       found = FindMetaContaining(address);
+	if (found == m_surface_metas.end()) {
+		return;
+	}
+	auto&      info   = found->second;
+	const auto offset = address - found->first;
+	if (info.range_size == 0 || size > info.range_size - offset) {
+		// A binding past the surface is a pool spanning it, not a store aimed at the metadata.
+		return;
+	}
+	if (info.slices == 0 || info.range_size % info.slices != 0) {
+		info.clear_mask = {};
+		return;
+	}
+	const auto slice_size = info.range_size / info.slices;
+	const auto last       = (offset + size - 1) / slice_size;
+	for (auto slice = offset / slice_size; slice <= last; slice++) {
+		info.clear_mask.Assign(static_cast<uint32_t>(slice), false);
+	}
+}
+
 bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
 	std::scoped_lock lock {m_lock};
 	const auto       found = m_surface_metas.find(address);
