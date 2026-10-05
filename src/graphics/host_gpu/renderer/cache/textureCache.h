@@ -308,6 +308,7 @@ private:
 	std::vector<ImageId>                   m_evict_published;
 	std::map<uint64_t, MetaDataInfo>       m_surface_metas;
 	std::unordered_map<uint64_t, ImageId>  m_stencil_planes;
+	std::vector<ImageId>                   m_sampled_state_changes;
 	uint64_t                               m_total_used_memory  = 0;
 	uint64_t                               m_trigger_gc_memory  = 0;
 	uint64_t                               m_pressure_gc_memory = 1536ull * 1024 * 1024;

@@ -195,6 +195,10 @@ public:
 	uint64_t frame_touched_last  = 0;
 	size_t   lru_id              = 0;
 
+	// One-shot: the next change to the tracked state appends state_watch_id here and disarms.
+	std::vector<ImageId>* state_watch = nullptr;
+	ImageId               state_watch_id {};
+
 private:
 	friend struct ImageTestAccess;
 

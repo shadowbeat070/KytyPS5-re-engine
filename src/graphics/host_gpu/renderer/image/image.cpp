@@ -224,6 +224,10 @@ Image::Barriers Image::GetBarriers(vk::ImageLayout                      destinat
 	}
 
 	state = {destination_stage, destination_access, destination_layout};
+	if (state_watch != nullptr) {
+		state_watch->push_back(state_watch_id);
+		state_watch = nullptr;
+	}
 	return barriers;
 }
 
