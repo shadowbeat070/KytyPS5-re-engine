@@ -2610,6 +2610,18 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 	if (!walker.RefreshFlatBuffer(snapshot.flattened_srt, &flat_failure, prune,
 	                              observed.read_condition_memory != nullptr ? &conditions
 	                                                                        : nullptr)) {
+		// A hoisted read whose own address never evaluates stays a native load on rebuild.
+		if (refused_tables != nullptr &&
+		    flat_failure.stage == FlatRefreshFailure::Stage::ValueUnevaluable &&
+		    flat_failure.raw_read == RawReadReject::HandleOperandUnavailable &&
+		    flat_failure.flat_offset < program.srt_reads.size()) {
+			if (const auto* read =
+			        program.srt_reads[flat_failure.flat_offset].value.Resolve().TryInstruction();
+			    read != nullptr && (read->GetOpcode() == ValueOpcode::LoadAddressU32 ||
+			                        read->GetOpcode() == ValueOpcode::ReadConstBuffer)) {
+				refused_tables->push_back(read->Flags<MemoryFlags>().pc);
+			}
+		}
 		MaterializeFailure() =
 		    fmt::format("flat srt refresh: {}", DescribeFlatRefreshFailure(flat_failure));
 		return false;

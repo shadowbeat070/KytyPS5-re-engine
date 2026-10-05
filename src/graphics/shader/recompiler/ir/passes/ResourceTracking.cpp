@@ -883,6 +883,10 @@ private:
 		m_cyclic_entries = {};
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
+			if (std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
+			    m_program.unfoldable_pcs.end()) {
+				continue;
+			}
 			auto& memory         = m_program.memory_info[flags.index];
 			memory.planning_only = true;
 			const auto* handle   = read->Arg(0).Resolve().TryInstruction();
