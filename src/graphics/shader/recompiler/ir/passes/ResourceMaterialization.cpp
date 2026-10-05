@@ -2684,6 +2684,13 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 			continue;
 		}
 		if (!evaluate(buffer.source, snapshot.buffers[i], buffer.written)) {
+			// An unprovable loop-carried descriptor is decoded in-shader on rebuild, not dropped.
+			if (refused_tables != nullptr &&
+			    (buffer.written ? clean : walker).RefusedOnPhi()) {
+				refused_tables->push_back(buffer.first_use_pc);
+				table_refused = true;
+				continue;
+			}
 			// Which buffer, and whether it was the table's own root, is what separates a
 			// loop-carried heap record from an ordinary descriptor that simply would not read.
 			MaterializeFailure() =

@@ -2171,6 +2171,7 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 	const auto& descriptor = m_program.descriptor_sources[source];
 	result                 = {};
 	result.dword_count     = descriptor.dword_count;
+	m_phi_reject           = PhiReject::None;
 	for (uint32_t index = 0; index < descriptor.dword_count; ++index) {
 		if (!Evaluate(descriptor.dwords[index], result.dwords[index])) {
 			return false;

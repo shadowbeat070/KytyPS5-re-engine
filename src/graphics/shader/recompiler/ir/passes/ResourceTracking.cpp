@@ -2639,6 +2639,35 @@ private:
 		                  "decode");
 	}
 
+	// A handle on a non-invariant loop phi: the one shape whose fixpoint a walk can fail to prove.
+	bool CarriesLoopPhi(const Inst& handle) const {
+		std::vector<const Inst*>        pending;
+		std::unordered_set<const Inst*> seen;
+		const auto                      push = [&](const Inst& inst) {
+			for (size_t arg = 0; arg < inst.NumArgs(); ++arg) {
+				if (const auto* operand = inst.Arg(arg).Resolve().TryInstruction(); operand != nullptr) {
+					pending.push_back(operand);
+				}
+			}
+		};
+		push(handle);
+		while (!pending.empty() && seen.size() < 256u) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!seen.insert(inst).second) {
+				continue;
+			}
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				if (ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(inst))).IsEmpty()) {
+					return true;
+				}
+				continue;
+			}
+			push(*inst);
+		}
+		return false;
+	}
+
 	bool TakeDynamicBuffer(const Inst* root, const MemoryInfo& memory, uint32_t index,
 	                       BufferAccess buffer, uint32_t pc) {
 		if (root == nullptr || root->GetOpcode() != ValueOpcode::GetBufferResource) {
@@ -2992,6 +3021,15 @@ private:
 					source = planned->source;
 					m_applied_indirect_buffers.insert(carried);
 				}
+			}
+			// A descriptor materialization named as unprovable is decoded in the shader on rebuild.
+			if (handle != nullptr && !m_applied_indirect_buffers.contains(handle) &&
+			    std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
+			        m_program.unfoldable_pcs.end() &&
+			    CarriesLoopPhi(*handle) &&
+			    (TakeDynamicBuffer(handle, memory, flags.index, buffer, flags.pc) ||
+			     take_indirect_load())) {
+				return true;
 			}
 			resource = AddBuffer(source, memory, inst, flags.pc);
 			if (resource == UINT32_MAX) {

@@ -242,6 +242,8 @@ public:
 	// With prune clear every block counts as reachable and no branch condition is read.
 	bool RefreshFlatBuffer(std::vector<uint32_t>& flat, FlatRefreshFailure* failure = nullptr,
 	                       bool prune = true, SrtWalker* conditions = nullptr);
+	// Whether the last refused descriptor stopped at a loop phi the walk could not prove invariant.
+	[[nodiscard]] bool RefusedOnPhi() const { return m_phi_reject != PhiReject::None; }
 
 private:
 	static ResourcePlan::EvaluationContext& AcquireContext(const ResourcePlan& program);
