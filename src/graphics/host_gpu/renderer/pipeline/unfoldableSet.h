@@ -4,6 +4,8 @@
 #include <algorithm>
 #include <cstdint>
 #include <span>
+#include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -93,6 +95,37 @@ inline bool RefuseRebuild(UnfoldableSet& set) {
 	set.frozen = true;
 	return true;
 }
+
+// Equal code has equal sizes, so a size no set was ever grown for names only empty sets.
+inline uint64_t UnfoldableCodeSize(std::span<const uint32_t> code,
+                                   std::span<const uint32_t> back_code) {
+	return static_cast<uint64_t>(code.size()) | (static_cast<uint64_t>(back_code.size()) << 32u);
+}
+
+// The sets keyed by code hash; a set Learn has grown never reads as empty again.
+class UnfoldableSets {
+public:
+	// `code_key` hashes the code, and is called only when a set of this size can be non-empty.
+	template <typename CodeKey>
+	[[nodiscard]] const UnfoldableSet& Find(uint64_t code_size, CodeKey&& code_key) {
+		static const UnfoldableSet empty;
+		return m_learned_sizes.contains(code_size) ? m_sets[code_key()] : empty;
+	}
+
+	[[nodiscard]] UnfoldableSet& Get(uint64_t code_key) { return m_sets[code_key]; }
+
+	bool Learn(uint64_t code_size, uint64_t code_key, std::span<const uint32_t> reported) {
+		if (!Graphics::Learn(m_sets[code_key], reported)) {
+			return false;
+		}
+		m_learned_sizes.insert(code_size);
+		return true;
+	}
+
+private:
+	std::unordered_map<uint64_t, UnfoldableSet> m_sets;
+	std::unordered_set<uint64_t>                m_learned_sizes;
+};
 
 } // namespace Libs::Graphics
 

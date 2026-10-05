@@ -37,6 +37,7 @@
 #include <fmt/format.h>
 #include <limits>
 #include <mutex>
+#include <optional>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
 #include <stop_token>
@@ -836,12 +837,16 @@ struct PipelineCache::ProgramCache {
 
 		KYTY_PROFILER_BLOCK("ProgramCache::Get");
 		const auto user_data = std::span(params.user_data).first(params.user_data_count);
-		uint64_t   code_key  = 0;
-		{
-			KYTY_PROFILER_BLOCK("ProgramCache::ShaderCodeKey");
-			code_key = ShaderCodeKey(params.code, params.back_code);
-		}
-		auto& proven                     = unfoldable[code_key];
+		const auto code_size = UnfoldableCodeSize(params.code, params.back_code);
+		std::optional<uint64_t> code_key;
+		const auto              key = [&] {
+			if (!code_key.has_value()) {
+				KYTY_PROFILER_BLOCK("ProgramCache::ShaderCodeKey");
+				code_key = ShaderCodeKey(params.code, params.back_code);
+			}
+			return *code_key;
+		};
+		const auto& proven               = unfoldable.Find(code_size, key);
 		lookup_key.stage                 = stage;
 		lookup_key.hash                  = params.hash;
 		lookup_key.user_data_count       = params.user_data_count;
@@ -885,7 +890,7 @@ struct PipelineCache::ProgramCache {
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization, &reported_unfoldable)) {
 				ReportUnmaterialized(stage, params.hash);
-				Learn(proven, reported_unfoldable);
+				unfoldable.Learn(code_size, key(), reported_unfoldable);
 				return {};
 			}
 			KYTY_PROFILER_BLOCK("ProgramCache permutation search");
@@ -1020,7 +1025,7 @@ struct PipelineCache::ProgramCache {
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization, &reported_unfoldable)) {
 				ReportUnmaterialized(stage, params.hash);
-				Learn(proven, reported_unfoldable);
+				unfoldable.Learn(code_size, key(), reported_unfoldable);
 				return {};
 			}
 		}
@@ -1050,7 +1055,7 @@ struct PipelineCache::ProgramCache {
 			// the generation that draws: the shot keeps the missing effect it had before the
 			// channel fired, which is the outcome the channel was trying to improve on and is
 			// strictly better than a shader that stops drawing at all.
-			if (channel_rebuild && RefuseRebuild(proven)) {
+			if (channel_rebuild && RefuseRebuild(unfoldable.Get(key()))) {
 				ReportRebuildRefused(stage, params.hash, rejected.reason);
 				return {};
 			}
@@ -1169,7 +1174,7 @@ struct PipelineCache::ProgramCache {
 	// the declared hash: guest code is rewritten under one, and a pc recorded against the old code
 	// names nothing in the new. UnfoldableSet, Learn and RefuseRebuild live in unfoldableSet.h so
 	// the rollback can be tested without a device.
-	std::unordered_map<uint64_t, UnfoldableSet> unfoldable;
+	UnfoldableSets unfoldable;
 	// Keyed on the whole ProgramKey: see ReportSkipped. `reported_shaders` stays on the hash, so
 	// the log still carries one line per shader however many of its shapes refuse.
 	std::unordered_set<ProgramKey, ProgramKeyHash> skipped_shaders;

@@ -26,7 +26,9 @@ namespace {
 
 using Libs::Graphics::Learn;
 using Libs::Graphics::RefuseRebuild;
+using Libs::Graphics::UnfoldableCodeSize;
 using Libs::Graphics::UnfoldableSet;
+using Libs::Graphics::UnfoldableSets;
 
 int g_failures = 0;
 
@@ -188,6 +190,48 @@ void TestRollbackUndoesOnlyTheLastGrowth() {
 	Check(set.generation == 1, "a frozen set bumped its generation");
 }
 
+// Code of a size nothing was learned for skips the hash and still reads the
+// empty set.
+void TestUnlearnedSizesSkipTheCodeHash() {
+  UnfoldableSets sets;
+  uint32_t hashed = 0;
+  const auto key = [&](uint64_t value) {
+    return [&hashed, value] {
+      hashed++;
+      return value;
+    };
+  };
+  const auto empty = [](const UnfoldableSet &set) {
+    return set.pcs.empty() && set.generation == 0 && set.previous_pcs.empty() &&
+           !set.frozen;
+  };
+  const std::vector<uint32_t> code(10, 0u);
+  const std::vector<uint32_t> back(3, 0u);
+  const auto size = UnfoldableCodeSize(code, {});
+  Check(size != UnfoldableCodeSize(code, back) &&
+            UnfoldableCodeSize(std::vector<uint32_t>(3, 0u),
+                               std::vector<uint32_t>(10, 0u)) !=
+                UnfoldableCodeSize(code, back),
+        "the code size key does not tell the front and back halves apart");
+  Check(empty(sets.Find(size, key(1))) && hashed == 0,
+        "an unlearned size hashed its code");
+  Check(!sets.Learn(size, 1, {}) && empty(sets.Find(size, key(1))) &&
+            hashed == 0,
+        "an empty report made a size count as learned");
+  Check(sets.Learn(size, 1, std::vector<uint32_t>{0x100u}),
+        "a report did not grow the set");
+  const auto &learned = sets.Find(size, key(1));
+  Check(hashed == 1 && learned.pcs == std::vector<uint32_t>{0x100u} &&
+            learned.generation == 1,
+        "a learned size did not hash its code to find the grown set");
+  Check(empty(sets.Find(size, key(2))) && hashed == 2,
+        "other code of a learned size did not read its own, empty, set");
+  Check(empty(sets.Find(size + 1u, key(1))) && hashed == 2,
+        "code of another size was hashed or read a set it cannot have");
+  Check(RefuseRebuild(sets.Get(1)) && sets.Find(size, key(1)).frozen,
+        "a rolled-back set stopped being found under its size");
+}
+
 } // namespace
 
 int main() {
@@ -196,7 +240,8 @@ int main() {
 	TestAFrozenSetNeverRebuildsAgain();
 	TestGenerationZeroRefusalStillDisablesTheShader();
 	TestRollbackUndoesOnlyTheLastGrowth();
-	if (g_failures != 0) {
+        TestUnlearnedSizesSkipTheCodeHash();
+        if (g_failures != 0) {
 		std::fprintf(stderr, "UnfoldableRebuildTests: %d check(s) failed\n", g_failures);
 		return 1;
 	}
