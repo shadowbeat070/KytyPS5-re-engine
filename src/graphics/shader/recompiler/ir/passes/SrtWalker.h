@@ -249,6 +249,7 @@ private:
 	bool                                    EvaluateWide(Value value, uint64_t& result);
 	bool                                    Arg(const Inst& inst, size_t index, uint64_t& result);
 	bool                                    EvaluatePhi(const Inst& inst, uint64_t& result);
+	const ResourcePlan::PhiPlan*            FrozenPhiPlan(const Inst& inst);
 	bool                                    EvaluateExtract(const Inst& inst, uint64_t& result);
 	bool        EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint64_t& result);
 	bool        EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes = 0u);

@@ -854,6 +854,14 @@ struct ResourcePlan {
 		uint64_t mask  = 0;
 	};
 	mutable std::vector<ClosedBallot> closed_ballots;
+	// Pure functions of a frozen plan's instructions; a deque so a held web survives later inserts.
+	struct PhiPlan {
+		Value                    invariant;
+		Value                    entry;
+		std::vector<const Inst*> web;
+	};
+	mutable std::vector<uint32_t> phi_plan_index;
+	mutable std::deque<PhiPlan>   phi_plans;
 };
 
 struct Program: ResourcePlan {

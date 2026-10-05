@@ -1000,6 +1000,54 @@ void TestUnboundImageSpecialization() {
         "a push-data start overlapping an earlier stage was reusable, or a later one was not");
 }
 
+// A frozen plan's cached phi resolution must accept, refuse and carry as the
+// walk does.
+void TestFrozenPhiPlansWalkLikeTheProgram() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  for (const uint32_t stride : {0u, 1u}) {
+    Program program;
+    program.stage = Libs::Graphics::ShaderType::Compute;
+    program.srt_plan_complete = true;
+    program.resource_tracking_complete = true;
+    auto &block = AddValueBlock(program);
+    auto &entry = block.AppendNewInst(ValueOpcode::GetUserData,
+                                      {Value(static_cast<ScalarReg>(0))});
+    auto &loop = block.AppendNewInst(ValueOpcode::Phi, {},
+                                     static_cast<uint64_t>(Type::U32));
+    auto &step =
+        block.AppendNewInst(ValueOpcode::IAdd32, {Value(&loop), Value(stride)});
+    loop.AddPhiOperand(&block, Value(&entry));
+    loop.AddPhiOperand(&block, Value(&step));
+    DescriptorSource source;
+    source.dword_count = 4;
+    source.dwords = {Value(&loop), Value(0u), Value(4u), Value(0u)};
+    program.descriptor_sources.push_back(source);
+    program.info.buffers.push_back({.source = 0});
+    auto plan = ExtractResourcePlan(program);
+    Check(plan.frozen_values && !program.frozen_values,
+          "the fixture did not compare a frozen plan with a program");
+    for (const uint32_t value : {0x10u, 0x20u, 0x10u}) {
+      const std::array<uint32_t, 1> user_data{value};
+      const SrtRuntime runtime{.user_data = user_data};
+      ResourceSnapshot frozen;
+      ResourceSnapshot walked;
+      ResourceSpecialization frozen_specialization;
+      ResourceSpecialization walked_specialization;
+      const bool frozen_ok =
+          MaterializeResources(plan, runtime, frozen, frozen_specialization);
+      const bool walked_ok =
+          MaterializeResources(program, runtime, walked, walked_specialization);
+      Check(frozen_ok == walked_ok && frozen_ok == (stride == 0u),
+            "a frozen phi plan accepted or refused a loop the walk did not");
+      Check(!frozen_ok || (frozen.buffers == walked.buffers &&
+                           frozen.buffers[0].dwords[0] == value),
+            "a frozen phi plan carried another value than the loop does");
+    }
+    Check(plan.phi_plans.size() == 1u,
+          "a phi was resolved more than once on a frozen plan");
+  }
+}
+
 } // namespace
 
 namespace Common {
@@ -1074,6 +1122,7 @@ int main() {
   TestUnboundBufferSpecialization();
   TestUnboundImageSpecialization();
   TestCyclicPhiEntryCacheAnswersLikeTheWalk();
+  TestFrozenPhiPlansWalkLikeTheProgram();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

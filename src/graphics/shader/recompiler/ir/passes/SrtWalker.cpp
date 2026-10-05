@@ -937,6 +937,27 @@ const Inst* SrtWalker::ColdPlainOperand(Value value, uint32_t& index) {
 	                                                                                       : inst;
 }
 
+const ResourcePlan::PhiPlan* SrtWalker::FrozenPhiPlan(const Inst& inst) {
+	if (!m_program.frozen_values) {
+		return nullptr;
+	}
+	const auto index = inst.EvaluationIndex(m_program.evaluation_value_count);
+	if (index < m_program.phi_plan_index.size() && m_program.phi_plan_index[index] != UINT32_MAX) {
+		return &m_program.phi_plans[m_program.phi_plan_index[index]];
+	}
+	const Value phi(const_cast<Inst*>(&inst));
+	auto&       plan = m_program.phi_plans.emplace_back();
+	plan.invariant   = ResolveInvariantPhi(m_program, phi);
+	if (plan.invariant.IsEmpty()) {
+		plan.entry = ResolveCyclicPhiEntry(m_program, phi, &plan.web);
+	}
+	if (index >= m_program.phi_plan_index.size()) {
+		m_program.phi_plan_index.resize(index + 1u, UINT32_MAX);
+	}
+	m_program.phi_plan_index[index] = static_cast<uint32_t>(m_program.phi_plans.size() - 1u);
+	return &plan;
+}
+
 // EvaluateWide's plain-arithmetic recursion, unrolled in rule operand order to hit the memo.
 bool SrtWalker::EvaluateChain(const Inst& root, uint64_t& result) {
 	struct Frame {
@@ -1018,7 +1039,10 @@ bool SrtWalker::Arg(const Inst& inst, size_t index, uint64_t& result) {
 }
 
 bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
-	const auto value = ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
+	const auto* frozen = FrozenPhiPlan(inst);
+	const auto  value  = frozen != nullptr
+	                         ? frozen->invariant
+	                         : ResolveInvariantPhi(m_program, Value(const_cast<Inst*>(&inst)));
 	if (!value.IsEmpty()) {
 		return EvaluateWide(value, result);
 	}
@@ -1033,9 +1057,13 @@ bool SrtWalker::EvaluatePhi(const Inst& inst, uint64_t& result) {
 	}
 	// Loop-carried: assume the entry value and require every operand to reproduce it, which
 	// makes it the value the phi holds on every iteration.
-	std::vector<const Inst*> web;
-	const auto entry     = ResolveCyclicPhiEntry(m_program, Value(const_cast<Inst*>(&inst)), &web);
-	uint64_t   candidate = 0;
+	std::vector<const Inst*> resolved_web;
+	const auto               entry =
+	    frozen != nullptr
+	        ? frozen->entry
+	        : ResolveCyclicPhiEntry(m_program, Value(const_cast<Inst*>(&inst)), &resolved_web);
+	const auto& web       = frozen != nullptr ? frozen->web : resolved_web;
+	uint64_t    candidate = 0;
 	if (entry.IsEmpty()) {
 		return refuse_phi(PhiReject::NoEntry);
 	}
