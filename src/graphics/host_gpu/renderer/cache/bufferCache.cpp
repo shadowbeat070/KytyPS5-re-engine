@@ -911,6 +911,32 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	dst->Fill(dst_offset, size, value);
 }
 
+void BufferCache::FillBufferPattern(uint64_t vaddr, uint64_t size, const uint32_t* pattern,
+                                    uint32_t words) {
+	const uint64_t pattern_size = uint64_t {words} * sizeof(uint32_t);
+	if (pattern == nullptr || words == 0 || words > 4 || vaddr == 0 || (vaddr & 3u) != 0 ||
+	    size == 0 || size % pattern_size != 0 || size > UINT64_MAX - vaddr) {
+		EXIT("BufferCache: invalid pattern fill\n");
+	}
+	if (std::all_of(pattern, pattern + words, [&](uint32_t word) { return word == pattern[0]; })) {
+		FillBuffer(vaddr, size, pattern[0], false);
+		return;
+	}
+	std::vector<uint32_t> data(size / sizeof(uint32_t));
+	for (size_t i = 0; i < data.size(); i++) {
+		data[i] = pattern[i % words];
+	}
+	if (!IsRegionGpuModified(vaddr, size)) {
+		// Access the guest mapping so write faults invalidate cached buffers and images.
+		std::memcpy(reinterpret_cast<void*>(vaddr), data.data(), size);
+		return;
+	}
+	m_texture_cache.InvalidateMemoryFromGPU(vaddr, size);
+	auto [dst, dst_offset] = ObtainBuffer(vaddr, size, true, true);
+	(void)dst_offset;
+	WriteDataBuffer(*dst, vaddr, data.data(), size);
+}
+
 void BufferCache::CopyBuffer(uint64_t dst_vaddr, uint64_t src_vaddr, uint64_t size, bool dst_gds,
                              bool src_gds) {
 	const bool dst_memory = !dst_gds;
