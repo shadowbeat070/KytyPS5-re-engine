@@ -79,7 +79,8 @@ private:
 		return Mode::NoAccess;
 	}
 	if (watched == Mode::Read) {
-		return static_cast<Mode>(static_cast<uint32_t>(guest) & ~static_cast<uint32_t>(Mode::Write));
+		return static_cast<Mode>(static_cast<uint32_t>(guest) &
+		                         ~static_cast<uint32_t>(Mode::Write));
 	}
 	return guest;
 }
@@ -315,7 +316,7 @@ struct PageManager::Impl {
 		const auto begin = Common::AlignDown(vaddr, PAGE_SIZE);
 		const auto end   = Common::AlignUp(vaddr + size, PAGE_SIZE);
 		for (auto chunk_begin = begin; chunk_begin < end;) {
-			const auto chunk_end = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
+			const auto chunk_end   = std::min(end, Common::AlignUp(chunk_begin + 1, REGION_SIZE));
 			const auto region_base = Common::AlignDown(chunk_begin, REGION_SIZE);
 			auto*      region = track ? GetOrCreateRegion(chunk_begin) : FindRegion(chunk_begin);
 			if (region == nullptr) {
