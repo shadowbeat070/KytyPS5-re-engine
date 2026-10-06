@@ -2436,6 +2436,137 @@ private:
 		return true;
 	}
 
+	struct WaterfallWord {
+		const Inst* load = nullptr;
+		uint32_t    byte = 0;
+		Value       lane;
+	};
+
+	bool MatchWaterfallWord(Value value, WaterfallWord& word) const {
+		const auto* read = value.Resolve().TryInstruction();
+		if (read == nullptr || read->GetOpcode() != ValueOpcode::ReadLane || read->NumArgs() != 2u)
+			return false;
+		word.lane          = read->Arg(1).Resolve();
+		auto        lifted = read->Arg(0).Resolve();
+		const auto* select = lifted.TryInstruction();
+		Value       select_condition;
+		if (select != nullptr && select->GetOpcode() == ValueOpcode::SelectU32) {
+			select_condition = select->Arg(0).Resolve();
+			lifted           = select->Arg(1).Resolve();
+		}
+		const auto* load      = lifted.TryInstruction();
+		uint32_t    component = 0;
+		if (load != nullptr && (load->GetOpcode() == ValueOpcode::CompositeExtractU32x4 ||
+		                        load->GetOpcode() == ValueOpcode::CompositeExtractU32x2)) {
+			if (!ImmediateU32(load->Arg(1), component)) return false;
+			load = load->Arg(0).Resolve().TryInstruction();
+		}
+		if (load == nullptr || load->NumArgs() != 5u ||
+		    (load->GetOpcode() != ValueOpcode::LoadBufferU32 &&
+		     load->GetOpcode() != ValueOpcode::LoadBufferU32x2 &&
+		     load->GetOpcode() != ValueOpcode::LoadBufferU32x4))
+			return false;
+		const auto flags = load->Flags<MemoryFlags>();
+		if (flags.index >= m_program.memory_info.size()) return false;
+		const auto& memory  = m_program.memory_info[flags.index];
+		uint32_t    voffset = 0;
+		uint32_t    soffset = 0;
+		if (memory.kind != ResourceKind::Buffer || !memory.idxen || memory.offen || memory.typed ||
+		    memory.formatted || memory.data_bits != 32u || component >= memory.data_dwords ||
+		    !ImmediateU32(load->Arg(2), voffset) || voffset != 0u ||
+		    !ImmediateU32(load->Arg(3), soffset) || soffset != 0u ||
+		    memory.offset > UINT32_MAX - component * sizeof(uint32_t))
+			return false;
+		if (!select_condition.IsEmpty() &&
+		    !EquivalentValue(m_program, select_condition, load->Arg(4)))
+			return false;
+		word.load = load;
+		word.byte = memory.offset + component * static_cast<uint32_t>(sizeof(uint32_t));
+		return true;
+	}
+
+	// A waterfall loop's V_READLANE of an indexed BUFFER_LOAD is the heap record at that lane.
+	bool TryMakeWaterfallImage(Inst& handle, IndirectDescriptorPlan& plan) {
+		if (!BindlessImageHeapsEnabled() || handle.GetOpcode() != ValueOpcode::GetImageResource ||
+		    handle.NumArgs() != 8u)
+			return false;
+		for (const auto& use: handle.Uses()) {
+			const auto op = use.user->GetOpcode();
+			if (op != ValueOpcode::ImageSampleRaw && op != ValueOpcode::ImageRead) return false;
+			const auto flags = use.user->Flags<MemoryFlags>();
+			if (flags.index >= m_program.memory_info.size()) return false;
+			const auto& memory = m_program.memory_info[flags.index];
+			if ((memory.image_sample_flags & Decoder::ImageSampleFlagCompare) != 0u ||
+			    memory.image_r128)
+				return false;
+		}
+		const auto same_heap = [&](const Inst& left, const Inst& right) {
+			const auto* a = left.Arg(0).Resolve().TryInstruction();
+			const auto* b = right.Arg(0).Resolve().TryInstruction();
+			if (a == nullptr || b == nullptr || a->GetOpcode() != ValueOpcode::GetBufferResource ||
+			    b->GetOpcode() != ValueOpcode::GetBufferResource)
+				return false;
+			for (uint32_t arg = 0; arg < 4u; arg++) {
+				if (!EquivalentValue(m_program, a->Arg(arg), b->Arg(arg))) return false;
+			}
+			return true;
+		};
+		std::array<WaterfallWord, 8> words;
+		for (uint32_t dword = 0; dword < words.size(); dword++) {
+			if (!MatchWaterfallWord(handle.Arg(dword), words[dword])) return false;
+			const auto& first = words[0];
+			const auto& word  = words[dword];
+			if (dword == 0u) {
+				if ((word.byte & 3u) != 0u) return false;
+				continue;
+			}
+			if (static_cast<uint64_t>(first.byte) + dword * sizeof(uint32_t) != word.byte ||
+			    !EquivalentValue(m_program, first.lane, word.lane) ||
+			    !same_heap(*first.load, *word.load) ||
+			    !EquivalentValue(m_program, first.load->Arg(1), word.load->Arg(1)) ||
+			    !EquivalentValue(m_program, first.load->Arg(4), word.load->Arg(4)))
+				return false;
+		}
+		DescriptorSource table_source;
+		if (!MakeRuntimeTableSource(*words[0].load, table_source) || table_source.dword_count != 4u)
+			return false;
+
+		DescriptorSource::IndirectDescriptor indirect;
+		indirect.table_source = InternSource(table_source);
+		indirect.table_offset = words[0].byte;
+		// The record step is the heap V#'s stride, known only once the descriptor is bound.
+		indirect.heap_stride  = 1u;
+		indirect.indexed_heap = true;
+		indirect.bindless     = true;
+
+		// A lane the load skipped never fetched a record, so its key names none.
+		auto*      block = handle.Parent();
+		const auto where = std::ranges::find_if(block->Instructions(),
+		                                        [&](const Inst& inst) { return &inst == &handle; });
+		const auto* load = words[0].load;
+		Value       index  = load->Arg(1).Resolve();
+		const auto  active = load->Arg(4).Resolve();
+		if (!(active.IsImmediate() && active.GetType() == Type::U1 && active.U1())) {
+			index = Value(&*block->PrependNewInst(where, ValueOpcode::SelectU32,
+			                                      {active, index, Value(0xffffffffu)}));
+		}
+		const Value key(
+		    &*block->PrependNewInst(where, ValueOpcode::ReadLane, {index, words[0].lane}));
+
+		DescriptorSource image_source;
+		image_source.dword_count = 8u;
+		image_source.dwords.fill(Value(0u));
+		std::copy_n(table_source.dwords.begin(), 4u, image_source.dwords.begin() + 4u);
+		image_source.indirect_descriptor = indirect;
+		plan.handle                      = &handle;
+		plan.source                      = InternSource(image_source);
+		plan.key                         = key;
+		plan.roots                       = image_source.dwords;
+		// The record reads stay: the loop compares them to retire lanes.
+		plan.reads.fill(nullptr);
+		return true;
+	}
+
 	using SelectorBounds = std::span<const std::pair<const Inst*, uint32_t>>;
 
 	bool SelectorPredicateFalse(Value value, SelectorBounds bounds, uint32_t depth = 0) const {
@@ -2667,7 +2798,7 @@ private:
 				IndirectDescriptorPlan plan;
 				if (TryMakeIndirectImage(*handle, m_program.memory_info[flags.index].resource * 4u,
 				                         flags.pc, plan) ||
-				    TryMakeFiniteImage(*handle, plan)) {
+				    TryMakeFiniteImage(*handle, plan) || TryMakeWaterfallImage(*handle, plan)) {
 					m_indirect_descriptors.push_back(std::move(plan));
 				}
 			}

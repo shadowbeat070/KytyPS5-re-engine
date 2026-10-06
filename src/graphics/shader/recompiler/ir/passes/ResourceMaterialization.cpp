@@ -2848,8 +2848,23 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 				return false;
 			}
 			BindlessImageTable entry;
-			entry.srt_offset    = static_cast<uint32_t>(slot);
-			entry.stride        = indirect.heap_stride;
+			entry.srt_offset = static_cast<uint32_t>(slot);
+			entry.stride     = indirect.heap_stride;
+			if (indirect.indexed_heap) {
+				// A swizzled or ADD_TID heap has no flat record step.
+				const auto stride  = (table.dwords[1] >> 16u) & 0x3fffu;
+				const bool swizzle = ((table.dwords[1] >> 31u) & 1u) != 0u;
+				const bool add_tid = ((table.dwords[3] >> 23u) & 1u) != 0u;
+				const auto step    = uint64_t {stride} * indirect.heap_stride;
+				if (stride == 0u || swizzle || add_tid || step > UINT32_MAX) {
+					MaterializeFailure() = fmt::format(
+					    "bindless image table at pc 0x{:08x}: indexed heap V# has stride {}{}{}",
+					    image.first_use_pc, stride, swizzle ? " (swizzled)" : "",
+					    add_tid ? " (add_tid)" : "");
+					return false;
+				}
+				entry.stride = static_cast<uint32_t>(step);
+			}
 			entry.record_offset = indirect.table_offset + indirect.record_offset;
 			std::copy_n(table.dwords.begin(), 4u, entry.heap.begin());
 			snapshot.bindless_tables.push_back(entry);
