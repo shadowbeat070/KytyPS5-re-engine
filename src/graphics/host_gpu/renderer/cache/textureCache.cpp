@@ -267,6 +267,20 @@ bool GrowLayers(ImageInfo& info, const ImageInfo& requested, const ImageInfo& ca
 	return true;
 }
 
+[[nodiscard]] bool LayoutAliasCandidate(const Image& image) {
+	return image.registered && !image.dormant && !image.depth_id && !image.info.data.Empty() &&
+	       image.backing.image != nullptr && image.backing.samples == 1 &&
+	       image.info.samples == 1 && !image.info.IsDepth() && !image.info.HasStencil() &&
+	       image.info.metadata.compression == VideoOutCompression::Uncompressed;
+}
+
+[[nodiscard]] bool SameAliasLayout(const ImageInfo& a, const ImageInfo& b) {
+	return a.data == b.data && a.extent == b.extent && a.resources == b.resources &&
+	       a.pitch == b.pitch && a.bytes_per_block == b.bytes_per_block &&
+	       a.tile_mode == b.tile_mode && a.type == b.type && a.IsBlock() == b.IsBlock() &&
+	       a.mip_layout == b.mip_layout;
+}
+
 } // namespace
 
 TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
@@ -1259,6 +1273,39 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
 	return expanded_id;
 }
 
+void TextureCache::SyncLayoutAlias(ImageId id, const ImageIds& candidates) {
+	const auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !LayoutAliasCandidate(*image)) {
+		return;
+	}
+	auto newest_epoch = image->ContentEpoch();
+	if (image->IsBufferModified()) {
+		newest_epoch = std::max(newest_epoch, image->BufferWriteEpoch());
+	}
+	ImageId newest {};
+	for (const auto candidate: candidates) {
+		const auto* alias = m_slot_images.try_get(candidate);
+		// A linear alias reaches its siblings through readback and guest memory instead.
+		if (candidate == id || alias == nullptr || !LayoutAliasCandidate(*alias) ||
+		    ImageOwnsGuestBytes(*alias) || !alias->IsGpuModified() || alias->IsBufferModified() ||
+		    alias->IsSuperseded() || !SameAliasLayout(alias->info, image->info) ||
+		    alias->ContentEpoch() <= newest_epoch) {
+			continue;
+		}
+		newest       = candidate;
+		newest_epoch = alias->ContentEpoch();
+	}
+	if (!newest) {
+		return;
+	}
+	CopyImage(id, newest);
+	auto& synced = m_slot_images[id];
+	if (synced.IsGpuModified()) {
+		synced.alias_stamp_epoch   = synced.GpuWriteEpoch();
+		synced.alias_content_epoch = newest_epoch;
+	}
+}
+
 struct TextureCache::TextureTransfer {
 	TextureUploadLayout              layout;
 	std::vector<vk::BufferImageCopy> regions;
@@ -1937,6 +1984,7 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 				inserted.MarkBufferModified();
 			}
 		}
+		SyncLayoutAlias(result, candidates);
 		auto& image = m_slot_images[result];
 		if (view_mip >= 0) {
 			desc.view_info.base_level = static_cast<uint32_t>(view_mip);

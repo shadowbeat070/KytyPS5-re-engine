@@ -133,6 +133,12 @@ public:
 	[[nodiscard]] uint64_t GpuWriteSerial() const noexcept { return m_gpu_write_serial; }
 	[[nodiscard]] uint64_t GpuWriteEpoch() const noexcept { return m_gpu_write_epoch; }
 	[[nodiscard]] uint64_t BufferWriteEpoch() const noexcept { return m_buffer_write_epoch; }
+	// After a same-layout alias copy, the copied write's epoch until this image is written again.
+	[[nodiscard]] uint64_t ContentEpoch() const noexcept {
+		return alias_stamp_epoch != 0 && m_gpu_write_epoch == alias_stamp_epoch
+		           ? alias_content_epoch
+		           : m_gpu_write_epoch;
+	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
 	void               MarkBufferModified() noexcept {
@@ -194,6 +200,8 @@ public:
 	uint64_t frame_accessed_last = 0;
 	uint64_t frame_touched_last  = 0;
 	size_t   lru_id              = 0;
+	uint64_t alias_stamp_epoch   = 0;
+	uint64_t alias_content_epoch = 0;
 
 	// One-shot: the next change to the tracked state appends state_watch_id here and disarms.
 	std::vector<ImageId>* state_watch = nullptr;
