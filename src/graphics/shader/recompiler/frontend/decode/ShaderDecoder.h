@@ -12,7 +12,7 @@ namespace Libs::Graphics::ShaderRecompiler::Decoder {
 
 // PS5 flat stack addresses use these SH_MEM_BASES aperture tags in VA[63:32].
 constexpr uint32_t PrivateApertureHigh = 0x70000000u;
-constexpr uint32_t SharedApertureHigh = 0x80000000u;
+constexpr uint32_t SharedApertureHigh  = 0x80000000u;
 
 enum class Family {
 	Unknown,
@@ -792,11 +792,11 @@ struct Program {
 // Code spans are trusted to contain complete instructions, valid branch targets, and 32-bit PCs.
 Family GetInstructionFamily(uint32_t word);
 // The output object must be freshly initialized.
-void DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
+void    DecodeInstruction(std::span<const uint32_t> code, uint32_t word_index, Instruction& inst);
 Program DecodeFrontProgram(std::span<const uint32_t> front);
-void DecodeProgram(std::span<const uint32_t> code, Program& program);
-bool IsConditionalBranch(Opcode opcode);
-bool IsDirectBranch(Opcode opcode);
+void    DecodeProgram(std::span<const uint32_t> code, Program& program);
+bool    IsConditionalBranch(Opcode opcode);
+bool    IsDirectBranch(Opcode opcode);
 
 void DecodeScalarSource(uint32_t code, uint32_t pc, Operand& operand);
 void DecodeScalarDestination(uint32_t code, uint32_t pc, Operand& operand);
@@ -809,7 +809,7 @@ std::string OperandToString(const Operand& operand);
 const char* ImageDimensionToString(ImageDimension dimension);
 
 // On an atomic, GLC returns the pre-operation value in VDATA and carries no cache meaning.
-bool GlcSelectsAtomicReturnValue(Opcode opcode);
+bool        GlcSelectsAtomicReturnValue(Opcode opcode);
 std::string InstructionToString(const Instruction& inst);
 std::string ProgramToString(const Program& program);
 
