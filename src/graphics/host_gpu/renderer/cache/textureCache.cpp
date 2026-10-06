@@ -1412,8 +1412,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!transfer.tiles.empty()) {
-			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                        transfer.LinearSize(), transfer.tiles, transfer.color_transform);
+			linear =
+			    m_tiler.Detile(source.Handle(), source_offset, info.data.size,
+			                   transfer.LinearSize(), transfer.tiles, transfer.color_transform);
 		} else if (transfer.color_transform != ColorTransform::None) {
 			linear = m_tiler.TransformColor(linear, transfer.color_transform, true);
 		}
@@ -1437,9 +1438,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
 		EXIT("TextureCache: invalid depth upload\n");
 	}
-	const auto          layers          = info.resources.layers;
-	const auto          full_slice_size = info.data.size / layers;
-	auto                copies = BuildDepthCopies(info, full_slice_size,
+	const auto layers          = info.resources.layers;
+	const auto full_slice_size = info.data.size / layers;
+	auto       copies          = BuildDepthCopies(info, full_slice_size,
 	                                              image.depth_id ? vk::ImageAspectFlagBits::eStencil
 	                                                             : vk::ImageAspectFlagBits::eDepth);
 	if (image.depth_id) {
@@ -2129,8 +2130,8 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 		EXIT_IF(slice_size == 0 || offset % slice_size != 0 || offset / slice_size >= layers ||
 		        desc.info.resources.layers > layers - offset / slice_size);
 		image.stencil_subresources = {0, desc.info.resources.levels,
-		                             static_cast<uint32_t>(offset / slice_size),
-		                             desc.info.resources.layers};
+		                              static_cast<uint32_t>(offset / slice_size),
+		                              desc.info.resources.layers};
 	}
 	image.info.stencil = desc.info.stencil;
 	if (desc.info.HasStencil()) {
@@ -2210,16 +2211,16 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		if (owner == nullptr || owner->dormant) {
 			continue;
 		}
-		vk::ImageAspectFlags candidate {};
-		ImageId              candidate_id = id;
-		ImageSubresourceRange candidate_subresources {
-		    0, owner->info.resources.levels, 0, owner->info.TransferLayers()};
+		vk::ImageAspectFlags  candidate {};
+		ImageId               candidate_id = id;
+		ImageSubresourceRange candidate_subresources {0, owner->info.resources.levels, 0,
+		                                              owner->info.TransferLayers()};
 		if (owner->depth_id && owner->info.data.address == address &&
 		    owner->info.data.size == size) {
 			candidate              = vk::ImageAspectFlagBits::eStencil;
 			candidate_id           = owner->depth_id;
 			candidate_subresources = owner->stencil_subresources;
-			owner        = m_slot_images.try_get(candidate_id);
+			owner                  = m_slot_images.try_get(candidate_id);
 			if (owner == nullptr || owner->backing.image == nullptr || !owner->info.HasStencil()) {
 				continue;
 			}
@@ -2230,10 +2231,11 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			if (!current_plane && bound.layer_count != 0 && plane.size % bound.layer_count == 0) {
 				const auto slice = plane.size / bound.layer_count;
 				const auto shift = uint64_t {bound.base_layer} * slice;
-				current_plane    = slice != 0 && plane.address >= shift &&
-				                address == plane.address - shift +
-				                               uint64_t {candidate_subresources.base_layer} * slice &&
-				                size == uint64_t {candidate_subresources.layer_count} * slice;
+				current_plane =
+				    slice != 0 && plane.address >= shift &&
+				    address == plane.address - shift +
+				                   uint64_t {candidate_subresources.base_layer} * slice &&
+				    size == uint64_t {candidate_subresources.layer_count} * slice;
 			}
 			if (!current_plane) {
 				continue;
@@ -2275,8 +2277,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 		clear.depthStencil.stencil = stencil_clear;
 	}
 	ClearImage(command, selected, image.backing.format,
-	           {aspect, subresources.base_level, subresources.level_count,
-	            subresources.base_layer, subresources.layer_count}, clear);
+	           {aspect, subresources.base_level, subresources.level_count, subresources.base_layer,
+	            subresources.layer_count},
+	           clear);
 	if (stencil_id) {
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
@@ -2600,9 +2603,9 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		regions           = transfer.texture.regions;
 		const auto extent = vk::blockExtent(image.backing.format);
 		block             = {extent[0], extent[1], vk::blockSize(image.backing.format)};
-		chunk_alignment   = transfer.texture.color_transform == ColorTransform::SwapBgra16        ? 8
-		                    : transfer.texture.color_transform == ColorTransform::Reverse10_11_11 ? 4
-		                                                                                         : 1;
+		chunk_alignment = transfer.texture.color_transform == ColorTransform::SwapBgra16        ? 8
+		                  : transfer.texture.color_transform == ColorTransform::Reverse10_11_11 ? 4
+		                                                                                        : 1;
 	}
 	if (regions.empty()) {
 		// A tiled colour transfer plans no regions: TileImage re-tiles the whole image, so there is
