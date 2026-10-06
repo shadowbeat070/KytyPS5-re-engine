@@ -188,7 +188,7 @@ public:
 	ImageId          depth_id {};
 	// The current stencil plane's mapping into the depth image, also retained by its association.
 	ImageSubresourceRange stencil_subresources;
-	uint64_t         tick_accessed_last = 0;
+	uint64_t              tick_accessed_last = 0;
 	// Counted in presented frames, not queue submissions: this title submits dozens of command
 	// buffers per frame, so a submission count cannot tell "used a moment ago" from "long dead".
 	uint64_t frame_accessed_last = 0;

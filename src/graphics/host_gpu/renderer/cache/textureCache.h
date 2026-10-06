@@ -261,8 +261,8 @@ private:
 	                   uint64_t destination_size, ImageDownload transfer);
 	void DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset);
 	void DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
-	                          ColorTransform transform, Buffer& destination, uint64_t destination_offset,
-	                          uint64_t destination_size);
+	                          ColorTransform transform, Buffer& destination,
+	                          uint64_t destination_offset, uint64_t destination_size);
 	void DownloadDepthRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,
 	                          Buffer& destination, uint64_t destination_offset,
 	                          uint64_t destination_size);
