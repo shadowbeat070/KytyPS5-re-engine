@@ -12,6 +12,7 @@ void Translator::EmitScalar(const Decoder::Instruction& inst) {
 		case O::S_WQM_B64: S_WQM(inst, true); return;
 		case O::S_GETPC_B64: S_GETPC_B64(inst); return;
 		case O::S_SETPC_B64: return;
+		case O::S_SWAPPC_B64: S_SWAPPC_B64(inst); return;
 		case O::S_SUBVECTOR_LOOP_BEGIN: S_SUBVECTOR_LOOP(inst, true); return;
 		case O::S_SUBVECTOR_LOOP_END: S_SUBVECTOR_LOOP(inst, false); return;
 		case O::S_CSELECT_B32: S_CSELECT_B32(inst); return;
