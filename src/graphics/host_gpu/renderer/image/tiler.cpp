@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstring>
 #include <limits>
 
@@ -133,22 +134,38 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		return size != 0 && offset <= capacity && size <= capacity - offset;
 	};
 
-	// ImageInfo owns the layout. Upload only the header and active mip records.
-	TilingParams params;
-	params.color_transform = static_cast<uint32_t>(transform);
-	for (uint32_t level = 0; level < levels; ++level) {
-		const auto& mip    = info.mip_layout[level];
-		const auto  extent = info.MipExtent(level);
-		const auto  width  = static_cast<uint32_t>(
-		    (uint64_t {extent.width} + info.tiling.texel_width - 1u) / info.tiling.texel_width);
-		const auto height = static_cast<uint32_t>(
-		    (uint64_t {extent.height} + info.tiling.texel_height - 1u) / info.tiling.texel_height);
-		const auto depth = extent.depth;
-		const bool tail  = level >= info.first_tail_level;
-		EXIT_NOT_IMPLEMENTED(width == 0 || height == 0 || depth == 0 || mip.linear_pitch < width ||
-		                     mip.linear_size == 0 || mip.size == 0 ||
-		                     (!tail && (mip.pitch < width || mip.height < height)) ||
-		                     (!info.IsVolume() && mip.size % depth != 0));
+	dispatches.clear();
+	dispatches.reserve(infos.size());
+	for (const auto& info: infos) {
+		EXIT_IF((transform == ColorTransform::SwapBgra16 && info.bytes_per_element != 8u) ||
+		        (transform == ColorTransform::Reverse10_11_11 && info.bytes_per_element != 4u));
+		TileBlockLayout block {};
+		const uint32_t  tiled_width  = info.tiled_width != 0 ? info.tiled_width : info.pitch;
+		const uint32_t  tiled_height = info.tiled_height != 0 ? info.tiled_height : info.height;
+		const uint64_t  groups_x     = (static_cast<uint64_t>(info.width) + 7u) / 8u;
+		const uint64_t  groups_y     = (static_cast<uint64_t>(info.height) + 7u) / 8u;
+		const bool      block_ok = TileGetBlockLayout(info.family, info.bytes_per_element, block);
+		const bool linear_ok = valid_range(info.linear_offset, info.linear_size, linear_capacity);
+		const bool tiled_ok  = valid_range(info.tiled_offset, info.tiled_size, tiled_capacity);
+		if (!block_ok || info.width == 0 || info.height == 0 || info.depth == 0 ||
+		    info.pitch < info.width || groups_x > limits.maxComputeWorkGroupCount[0] ||
+		    groups_y > limits.maxComputeWorkGroupCount[1] ||
+		    info.depth > limits.maxComputeWorkGroupCount[2] ||
+		    (!info.tail && (tiled_width < info.width || tiled_height < info.height)) ||
+		    !linear_ok || !tiled_ok || (block.block_depth == 1 && info.depth != 1)) {
+			EXIT("TileManager: invalid %s job %zu/%zu: family=%u bpe=%u block_ok=%u "
+			     "block=%ux%ux%u extent=%ux%ux%u pitch=%u tiled_extent=%ux%u surface_z=%u "
+			     "tail=%u tail_xy=%u,%u linear=0x%" PRIx64 "+0x%" PRIx64 "/0x%" PRIx64
+			     " ok=%u slice_stride=0x%" PRIx64 " tiled=0x%" PRIx64 "+0x%" PRIx64 "/0x%" PRIx64
+			     " ok=%u\n",
+			     tile ? "tile" : "detile", static_cast<size_t>(&info - infos.data()), infos.size(),
+			     static_cast<uint32_t>(info.family), info.bytes_per_element, block_ok ? 1u : 0u,
+			     block.block_width, block.block_height, block.block_depth, info.width, info.height,
+			     info.depth, info.pitch, tiled_width, tiled_height, info.surface_z,
+			     info.tail ? 1u : 0u, info.tail_x, info.tail_y, info.linear_offset,
+			     info.linear_size, linear_capacity, linear_ok ? 1u : 0u, info.linear_slice_stride,
+			     info.tiled_offset, info.tiled_size, tiled_capacity, tiled_ok ? 1u : 0u);
+		}
 
 		uint64_t pitch_bytes = 0;
 		EXIT_NOT_IMPLEMENTED(
