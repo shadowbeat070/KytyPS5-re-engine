@@ -183,6 +183,8 @@ struct EmitterState {
 	uint32_t                   loop_budget_limit                     = 0;
 	uint32_t                   loop_budget_guarded                   = 0;
 	uint32_t                   loop_budget_unguardable               = 0;
+	// Set when a pointer load read a page the host could not serve yet.
+	uint32_t                   bda_miss_variable                     = 0;
 	// Latch blocks whose terminator can carry the budget, to the loop header id, so the fold knows
 	// which arm is the back edge.
 	std::unordered_map<const IR::Block*, uint32_t> loop_budget_latch;

@@ -161,16 +161,37 @@ void ReportLoopBudget(const EmitterState& state) {
 	std::fflush(stdout);
 }
 
-// Charges one unit and returns "still under budget".
+// Returns "this invocation may keep looping": under budget and no BDA miss in its wave so far.
+// A wave leaves together: a lane that returns alone stays set in the guest's SGPR lane masks.
 uint32_t ChargeLoopBudget(EmitterState& state) {
-	const auto before  = state.builder.AllocateId();
-	const auto after   = state.builder.AllocateId();
-	const auto allowed = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpLoad, TypeU32(state), before, state.loop_budget_variable);
-	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), after, before, ConstantU32(state, 1));
-	state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, after);
-	state.builder.AddFunction(spv::OpULessThan, TypeBool(state), allowed, after,
-	                          ConstantU32(state, state.loop_budget_limit));
+	uint32_t allowed = 0;
+	if (state.loop_budget_variable != 0) {
+		const auto before = state.builder.AllocateId();
+		const auto after  = state.builder.AllocateId();
+		allowed           = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeU32(state), before, state.loop_budget_variable);
+		state.builder.AddFunction(spv::OpIAdd, TypeU32(state), after, before,
+		                          ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, after);
+		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), allowed, after,
+		                          ConstantU32(state, state.loop_budget_limit));
+	}
+	if (state.bda_miss_variable != 0) {
+		const auto missed      = state.builder.AllocateId();
+		const auto wave_missed = state.builder.AllocateId();
+		const auto served      = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, TypeBool(state), missed, state.bda_miss_variable);
+		state.builder.AddFunction(spv::OpGroupNonUniformAny, TypeBool(state), wave_missed,
+		                          ConstantU32(state, spv::ScopeSubgroup), missed);
+		state.builder.AddFunction(spv::OpLogicalNot, TypeBool(state), served, wave_missed);
+		if (allowed == 0) {
+			allowed = served;
+		} else {
+			const auto both = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(state), both, allowed, served);
+			allowed = both;
+		}
+	}
 	return allowed;
 }
 
@@ -460,7 +481,7 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 // out of the block the back edge targets.
 std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 	std::unordered_set<const IR::Block*> sites;
-	if (ctx.state.loop_budget_variable == 0) {
+	if (ctx.state.loop_budget_variable == 0 && ctx.state.bda_miss_variable == 0) {
 		return sites;
 	}
 	const auto& program = ctx.state.program;
@@ -857,12 +878,19 @@ void EmitProgram(EmitterState& state) {
 	// than truncating the loop.
 	state.loop_budget_limit =
 	    state.program.stage == ShaderType::Compute ? LoopBudgetLimit() : 0u;
-	if (state.loop_budget_limit != 0 &&
-	    std::ranges::any_of(program.block_info, [](const IR::BlockInfo& info) {
-		    return info.terminator.loop_header;
-	    })) {
+	const bool has_loops = std::ranges::any_of(
+	    program.block_info, [](const IR::BlockInfo& info) { return info.terminator.loop_header; });
+	if (state.loop_budget_limit != 0 && has_loops) {
 		state.loop_budget_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_budget_variable, "loop_budget");
+	}
+	if (state.program.stage == ShaderType::Compute && state.program.info.uses_dma && has_loops) {
+		state.bda_miss_variable = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeBool(state)),
+		    spv::StorageClassPrivate);
+		state.builder.AddName(state.bda_miss_variable, "bda_miss");
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+		state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
 	}
 	for (const auto* block: program.blocks) {
 		const auto label = state.builder.AllocateId();
@@ -1026,6 +1054,10 @@ void EmitProgram(EmitterState& state) {
 	}
 	if (state.loop_budget_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.loop_budget_variable, ConstantU32(state, 0));
+	}
+	if (state.bda_miss_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.bda_miss_variable,
+		                          ConstantBool(state, false));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
