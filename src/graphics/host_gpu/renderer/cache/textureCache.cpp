@@ -2566,9 +2566,8 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	const auto available  = buffer.Size() - buf_offset;
 	uint32_t   levels     = 0;
 	uint64_t   copy_size  = 0;
-	if (image.info.IsVolume()) {
-		// Volume mips contain strided block slices, so a mip's linear span cannot prove that
-		// every retained slice fits. Keep volume synchronization whole-image only.
+	if (image.info.IsVolume() || image.info.resources.layers > 1) {
+		// Volume and layered mips are strided across slices, so no per-level span covers them.
 		if (!buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
 			return false;
 		}
