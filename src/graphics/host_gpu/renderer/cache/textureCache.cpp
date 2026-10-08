@@ -2547,7 +2547,8 @@ void TextureCache::DownloadDepthRegions(Image& image, std::vector<vk::BufferImag
 	}
 }
 
-bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                             bool whole_image) {
 	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
 	if (!selected) {
 		return false;
@@ -2557,6 +2558,9 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	auto&            image = m_texture_cache.m_slot_images[selected];
 	// The GPU thread owns image retirement; CPU invalidation can dirty this image after lookup.
 	if (!image.SafeToDownload() || image.IsSuperseded()) {
+		return false;
+	}
+	if (whole_image && size < image.info.data.size) {
 		return false;
 	}
 	if (!buffer.IsInBounds(image.info.data.address, 1)) {
