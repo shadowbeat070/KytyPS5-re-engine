@@ -392,92 +392,86 @@ bool BindlessImageHeap::ReadHeap(const HeapKey& key, uint32_t records,
 	return true;
 }
 
+TextureBinding BindlessImageHeap::ResolveRecord(const Bindless::TSharp&      tsharp,
+                                                const Bindless::RecordShape& shape) {
+	IR::ImageResource resource;
+	resource.resource_class = IR::ImageResourceClass::Sampled;
+	resource.numeric_class  = shape.numeric;
+	resource.dimension      = shape.dimension;
+	resource.cube           = shape.cube;
+	resource.read           = true;
+	IR::DescriptorValue value;
+	value.dword_count = 8u;
+	value.dwords      = tsharp;
+	return m_executor.ResolveTexture(resource, value);
+}
+
+bool BindlessImageHeap::RecordImageUsable(const TextureBinding& binding) const {
+	const auto* image = m_context.GetTextureCache().m_slot_images.try_get(binding.image_id);
+	return image != nullptr && !binding.desc.info.data.Empty() && image->registered &&
+	       !image->dormant && !image->binding.needs_rebind && !image->depth_id &&
+	       image->backing.image != nullptr;
+}
+
+std::optional<uint32_t> BindlessImageHeap::AdmitRecord(const Bindless::TSharp&      tsharp,
+                                                       const Bindless::RecordShape& shape,
+                                                       const TextureBinding&        binding,
+                                                       bool&                        exhausted) {
+	auto& cache = m_context.GetTextureCache();
+	if (!RecordImageUsable(binding)) {
+		return std::nullopt;
+	}
+	const auto view = cache.FindTexture(binding.image_id, binding.desc);
+	if (view == nullptr) {
+		return std::nullopt;
+	}
+	const auto slot =
+	    m_slots.Assign(shape.array, reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
+	if (!slot.has_value()) {
+		exhausted = true;
+		return std::nullopt;
+	}
+	const auto array   = static_cast<size_t>(shape.array);
+	auto&      element = m_elements[array][*slot];
+	if (!element.live || element.view != view) {
+		const auto key = static_cast<uint32_t>(array) * IR::BindlessImageSlots + *slot;
+		if (element.live) {
+			Unwatch(key, element.id);
+		}
+		auto&       image = cache.m_slot_images[binding.image_id];
+		const auto& info  = binding.desc.view_info;
+		element.id        = binding.image_id;
+		element.view      = view;
+		element.desc      = binding.desc;
+		element.range     = {info.base_level, info.level_count, info.base_layer, info.layer_count};
+		element.layout    = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
+		                                         : vk::ImageLayout::eShaderReadOnlyOptimal;
+		element.live      = true;
+		image.usage.texture   = true;
+		m_infos[array][*slot] = {nullptr, view, element.layout};
+		m_set_dirty           = true;
+		Watch(key, element.id);
+	}
+	const auto word = Bindless::TranslationWord(shape, *slot);
+	m_cache[tsharp] = word;
+	return word;
+}
+
 bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
                                const std::vector<uint32_t>& dwords) {
-	auto&      cache = m_context.GetTextureCache();
 	const auto missing =
 	    Bindless::MissingRecords(dwords, key.stride, key.offset, heap.records, m_cache, m_integer);
-	struct Pending {
-		Bindless::TSharp      tsharp;
-		Bindless::RecordShape shape;
-		TextureBinding        binding;
-	};
-	const auto Resolve = [&](const Bindless::TSharp& tsharp, const Bindless::RecordShape& shape) {
-		IR::ImageResource resource;
-		resource.resource_class = IR::ImageResourceClass::Sampled;
-		resource.numeric_class  = shape.numeric;
-		resource.dimension      = shape.dimension;
-		resource.cube           = shape.cube;
-		resource.read           = true;
-		IR::DescriptorValue value;
-		value.dword_count = 8u;
-		value.dwords      = tsharp;
-		return m_executor.ResolveTexture(resource, value);
-	};
-	const auto Usable = [&](const TextureBinding& binding) {
-		const auto* image = cache.m_slot_images.try_get(binding.image_id);
-		return image != nullptr && !binding.desc.info.data.Empty() && image->registered &&
-		       !image->dormant && !image->binding.needs_rebind && !image->depth_id &&
-		       image->backing.image != nullptr;
-	};
-	std::vector<Pending> pending;
-	pending.reserve(missing.size());
 	for (const auto& tsharp: missing) {
 		const auto shape   = Bindless::ClassifyRecord(tsharp, m_integer);
-		auto       binding = Resolve(tsharp, *shape);
+		const auto binding = ResolveRecord(tsharp, *shape);
 		if (binding.desc.info.data.Empty()) {
 			m_cache[tsharp] = 0u;
 			continue;
 		}
-		pending.push_back({tsharp, *shape, std::move(binding)});
-	}
-	for (uint32_t pass = 0; pass < 4u; pass++) {
-		bool churn = false;
-		for (auto& entry: pending) {
-			if (!Usable(entry.binding)) {
-				entry.binding = Resolve(entry.tsharp, entry.shape);
-				churn         = true;
-			}
-		}
-		if (!churn) {
-			break;
-		}
-	}
-	for (auto& entry: pending) {
-		if (!Usable(entry.binding)) {
-			continue;
-		}
-		const auto view = cache.FindTexture(entry.binding.image_id, entry.binding.desc);
-		if (view == nullptr) {
-			continue;
-		}
-		const auto slot = m_slots.Assign(
-		    entry.shape.array, reinterpret_cast<uint64_t>(static_cast<VkImageView>(view)));
-		if (!slot.has_value()) {
+		bool exhausted = false;
+		if (!AdmitRecord(tsharp, *shape, binding, exhausted).has_value() && exhausted) {
 			return false;
 		}
-		const auto array   = static_cast<size_t>(entry.shape.array);
-		auto&      element = m_elements[array][*slot];
-		if (!element.live || element.view != view) {
-			const auto key = static_cast<uint32_t>(array) * IR::BindlessImageSlots + *slot;
-			if (element.live) {
-				Unwatch(key, element.id);
-			}
-			auto&       image = cache.m_slot_images[entry.binding.image_id];
-			const auto& info  = entry.binding.desc.view_info;
-			element.id        = entry.binding.image_id;
-			element.view      = view;
-			element.desc      = entry.binding.desc;
-			element.range  = {info.base_level, info.level_count, info.base_layer, info.layer_count};
-			element.layout = image.info.IsDepth() ? vk::ImageLayout::eDepthStencilReadOnlyOptimal
-			                                      : vk::ImageLayout::eShaderReadOnlyOptimal;
-			element.live   = true;
-			image.usage.texture   = true;
-			m_infos[array][*slot] = {nullptr, view, element.layout};
-			m_set_dirty           = true;
-			Watch(key, element.id);
-		}
-		m_cache[entry.tsharp] = Bindless::TranslationWord(entry.shape, *slot);
 	}
 	heap.words.assign(heap.records, 0u);
 	Bindless::TranslateHeap(

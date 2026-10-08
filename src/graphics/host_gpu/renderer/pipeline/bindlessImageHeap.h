@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "graphics/host_gpu/renderer/cache/bindlessTranslation.h"
 #include "graphics/host_gpu/renderer/cache/textureCache.h"
+#include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/ir/ResourceSnapshot.h"
 
@@ -11,6 +12,7 @@
 #include <cstdint>
 #include <deque>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -113,8 +115,15 @@ private:
 	void                         TouchLiveElements();
 	void                         EvictIdleHeaps(uint64_t frame);
 	void                         RefreshLiveElements();
-	[[nodiscard]] bool           ReadHeap(const HeapKey& key, uint32_t records,
-	                                      std::vector<uint32_t>& dwords) const;
+	[[nodiscard]] TextureBinding ResolveRecord(const Bindless::TSharp&      tsharp,
+	                                           const Bindless::RecordShape& shape);
+	[[nodiscard]] bool           RecordImageUsable(const TextureBinding& binding) const;
+	[[nodiscard]] std::optional<uint32_t> AdmitRecord(const Bindless::TSharp&      tsharp,
+	                                                  const Bindless::RecordShape& shape,
+	                                                  const TextureBinding&        binding,
+	                                                  bool&                        exhausted);
+	[[nodiscard]] bool                    ReadHeap(const HeapKey& key, uint32_t records,
+	                                               std::vector<uint32_t>& dwords) const;
 	[[nodiscard]] bool Rescan(const HeapKey& key, Heap& heap, const std::vector<uint32_t>& dwords);
 	void               ResetElements();
 	void               BuildArena();
