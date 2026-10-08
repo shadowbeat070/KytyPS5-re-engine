@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <cinttypes>
 #include <cstring>
 #include <limits>
 
@@ -126,16 +127,28 @@ void TileManager::Prepare(bool tile, uint64_t tiled_capacity, uint64_t linear_ca
 		const uint32_t  tiled_height = info.tiled_height != 0 ? info.tiled_height : info.height;
 		const uint64_t  groups_x     = (static_cast<uint64_t>(info.width) + 7u) / 8u;
 		const uint64_t  groups_y     = (static_cast<uint64_t>(info.height) + 7u) / 8u;
-		EXIT_NOT_IMPLEMENTED(
-		    !TileGetBlockLayout(info.family, info.bytes_per_element, block) || info.width == 0 ||
-		    info.height == 0 || info.depth == 0 || info.pitch < info.width ||
-		    groups_x > limits.maxComputeWorkGroupCount[0] ||
+		const bool      block_ok = TileGetBlockLayout(info.family, info.bytes_per_element, block);
+		const bool linear_ok = valid_range(info.linear_offset, info.linear_size, linear_capacity);
+		const bool tiled_ok  = valid_range(info.tiled_offset, info.tiled_size, tiled_capacity);
+		if (!block_ok || info.width == 0 || info.height == 0 || info.depth == 0 ||
+		    info.pitch < info.width || groups_x > limits.maxComputeWorkGroupCount[0] ||
 		    groups_y > limits.maxComputeWorkGroupCount[1] ||
 		    info.depth > limits.maxComputeWorkGroupCount[2] ||
 		    (!info.tail && (tiled_width < info.width || tiled_height < info.height)) ||
-		    !valid_range(info.linear_offset, info.linear_size, linear_capacity) ||
-		    !valid_range(info.tiled_offset, info.tiled_size, tiled_capacity) ||
-		    (block.block_depth == 1 && info.depth != 1));
+		    !linear_ok || !tiled_ok || (block.block_depth == 1 && info.depth != 1)) {
+			EXIT("TileManager: invalid %s job %zu/%zu: family=%u bpe=%u block_ok=%u "
+			     "block=%ux%ux%u extent=%ux%ux%u pitch=%u tiled_extent=%ux%u surface_z=%u "
+			     "tail=%u tail_xy=%u,%u linear=0x%" PRIx64 "+0x%" PRIx64 "/0x%" PRIx64
+			     " ok=%u slice_stride=0x%" PRIx64 " tiled=0x%" PRIx64 "+0x%" PRIx64 "/0x%" PRIx64
+			     " ok=%u\n",
+			     tile ? "tile" : "detile", static_cast<size_t>(&info - infos.data()), infos.size(),
+			     static_cast<uint32_t>(info.family), info.bytes_per_element, block_ok ? 1u : 0u,
+			     block.block_width, block.block_height, block.block_depth, info.width, info.height,
+			     info.depth, info.pitch, tiled_width, tiled_height, info.surface_z,
+			     info.tail ? 1u : 0u, info.tail_x, info.tail_y, info.linear_offset,
+			     info.linear_size, linear_capacity, linear_ok ? 1u : 0u, info.linear_slice_stride,
+			     info.tiled_offset, info.tiled_size, tiled_capacity, tiled_ok ? 1u : 0u);
+		}
 
 		uint64_t pitch_bytes = 0;
 		EXIT_NOT_IMPLEMENTED(!checked_multiply(info.pitch, info.bytes_per_element, pitch_bytes) ||
