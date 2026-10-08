@@ -137,6 +137,9 @@ uint64_t ReadGuestMemoryPartial(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] const char* DescribeGpuBackingRefusal(uint64_t vaddr, uint64_t size);
 // Clips to the contiguous committed mapping at vaddr; 0 when nothing is mapped there.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// The committed virtual range holding vaddr, as one mapping call left it; false when nothing
+// committed is mapped there.
+[[nodiscard]] bool QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size);
 
 // How often a short or unmapped buffer range is worth reporting. A resource descriptor is re-bound
 // every draw, so one guest allocation that outlives its committed extent repeats the same outcome
