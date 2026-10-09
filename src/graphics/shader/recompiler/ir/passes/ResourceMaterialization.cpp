@@ -2496,10 +2496,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	CyclicPhiEntryCache                   cyclic_entries {.program = &program};
 	std::unordered_map<const Inst*, bool> validated;
+	// Exec chains reuse each subterm on both sides of an AND, so an unmemoized walk is exponential.
+	std::unordered_map<const Inst*, Value> predicates;
 	Value                                 unknown;
-	std::function<Value(Value)>           ClonePredicate = [&](Value value) -> Value {
-		value = value.Resolve();
-		if (value.IsEmpty()) return {};
+	std::function<Value(Value)>            ClonePredicate;
+	const auto                             ClonePredicateUncached = [&](Value value) -> Value {
 		const auto* inst = value.TryInstruction();
 		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
 			return Value(true);
@@ -2542,6 +2543,18 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		node.SetArg(0, left);
 		node.SetArg(1, right);
 		return Value(&node);
+	};
+	ClonePredicate = [&](Value value) -> Value {
+		value = value.Resolve();
+		if (value.IsEmpty()) return {};
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return ClonePredicateUncached(value);
+		if (const auto found = predicates.find(inst); found != predicates.end()) {
+			return found->second;
+		}
+		const auto result = ClonePredicateUncached(value);
+		predicates.emplace(inst, result);
+		return result;
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);
