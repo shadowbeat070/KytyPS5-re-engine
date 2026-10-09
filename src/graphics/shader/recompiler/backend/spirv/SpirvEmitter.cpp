@@ -477,6 +477,10 @@ Emitter::SpirvRequirements Emitter::AnalyzeProgramRequirements(const IR::Program
 						continue;
 					}
 					requirements.coherent_buffers |= memory.coherent;
+					// A glc DWORDX2 goes through the u64 alias as one access, see LoadWideBuffer.
+					if (memory.glc && IR::BufferComponentCount(inst.GetOpcode()) == 2u) {
+						requirements.buffer_int64_atomics = true;
+					}
 
 					if (memory.resource >= program.info.buffers.size()) {
 						Fail(program, "buffer operation has invalid resource metadata");

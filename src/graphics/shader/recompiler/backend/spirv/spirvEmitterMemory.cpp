@@ -1365,12 +1365,54 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 			StoreFormattedPrepared(ctx, inst, mem, resource, info, composite, components);
 			return;
 		}
-		for (uint32_t component = 0; component < components; component++) {
-			const uint32_t c    = mem.glc ? (components - 1u - component) : component;
-			const auto     data = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite, c);
-			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, c), resource, data);
+		const auto store_words = [&]() {
+			for (uint32_t component = 0; component < components; component++) {
+				const uint32_t c    = mem.glc ? (components - 1u - component) : component;
+				const auto     data = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
+				                          c);
+				StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, c), resource, data);
+			}
+		};
+		// A glc DWORDX2 is one 64-bit access: look-back scans publish a {flag, value} pair with it.
+		if (components == 2 && mem.glc && mem.kind == IR::ResourceKind::Buffer &&
+		    state.storage_buffer_u64_variable != 0) {
+			const auto u32           = TypeU32(state);
+			const auto u64           = TypeU64(state);
+			const auto byte_address  = ByteAddress(ctx, inst, mem);
+			const auto wide_resource = PrepareStorageBufferResourceAccess(
+			    state, mem, state.storage_buffer_u64_variable, TypeStorageBufferPointer(state, 64));
+			const auto index =
+			    Binary(state, spv::OpShiftRightLogical, u32, byte_address, ConstantU32(state, 3u));
+			const auto whole = Binary(
+			    state, spv::OpLogicalAnd, TypeBool(state),
+			    Binary(state, spv::OpIEqual, TypeBool(state),
+			           Binary(state, spv::OpBitwiseAnd, u32, byte_address, ConstantU32(state, 7u)),
+			           ConstantU32(state, 0u)),
+			    EmitMemoryElementInBounds(state, wide_resource, index));
+			EmitIfCondition(state, whole, [&]() {
+				std::array<uint32_t, 2> words {};
+				for (uint32_t c = 0; c < 2; c++) {
+					words[c] = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, u32, words[c], composite, c);
+				}
+				const auto value = Binary(
+				    state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, words[0]),
+				    Binary(state, spv::OpShiftLeftLogical, u64,
+				           Unary(state, spv::OpUConvert, u64, words[1]), ConstantU32(state, 32u)));
+				const auto pointer = EmitStorageBufferElementPointer(
+				    state, wide_resource, index, TypeStorageBufferElementPointer(state, 64));
+				state.builder.AddFunction(
+				    spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice),
+				    ConstantU32(state, spv::MemorySemanticsReleaseMask |
+				                           spv::MemorySemanticsUniformMemoryMask),
+				    value);
+			});
+			EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), whole),
+			                store_words);
+			return;
 		}
+		store_words();
 	});
 }
 
