@@ -1300,6 +1300,43 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::M
 			    values[component] =
 			        LoadWordPrepared(ctx, inst, RebaseRawComponent(mem, component), resource);
 		    }
+		    // A glc DWORDX2 is one 64-bit access: look-back scans poll a SWAP_X2 pair.
+		    if (components == 2 && mem.glc && mem.kind == IR::ResourceKind::Buffer &&
+		        state.storage_buffer_u64_variable != 0) {
+			    const auto u32          = TypeU32(state);
+			    const auto byte_address = ByteAddress(ctx, inst, mem);
+			    const auto aligned      = Binary(
+			        state, spv::OpIEqual, TypeBool(state),
+			        Binary(state, spv::OpBitwiseAnd, u32, byte_address, ConstantU32(state, 7u)),
+			        ConstantU32(state, 0u));
+			    const auto wide_resource = PrepareStorageBufferResourceAccess(
+			        state, mem, state.storage_buffer_u64_variable,
+			        TypeStorageBufferPointer(state, 64));
+			    const auto index = Binary(state, spv::OpShiftRightLogical, u32, byte_address,
+			                              ConstantU32(state, 3u));
+			    const auto wide  = EmitValueOrDefaultIfCondition(
+			        state,
+			        Binary(state, spv::OpLogicalAnd, TypeBool(state), aligned,
+			               EmitMemoryElementInBounds(state, wide_resource, index)),
+			        TypeU64(state), ConstantU64(state, 0), [&]() {
+				        const auto pointer = EmitStorageBufferElementPointer(
+				            state, wide_resource, index,
+				            TypeStorageBufferElementPointer(state, 64));
+				        const auto loaded = state.builder.AllocateId();
+				        state.builder.AddFunction(
+				            spv::OpAtomicLoad, TypeU64(state), loaded, pointer,
+				            ConstantU32(state, spv::ScopeDevice),
+				            ConstantU32(state, spv::MemorySemanticsAcquireMask |
+				                                   spv::MemorySemanticsUniformMemoryMask));
+				        return loaded;
+			        });
+			    const auto low  = Unary(state, spv::OpUConvert, u32, wide);
+			    const auto high = Unary(state, spv::OpUConvert, u32,
+			                            Binary(state, spv::OpShiftRightLogical, TypeU64(state),
+			                                   wide, ConstantU32(state, 32u)));
+			    values[0]       = Select(state, u32, aligned, low, values[0]);
+			    values[1]       = Select(state, u32, aligned, high, values[1]);
+		    }
 		    return ConstructU32Composite(state, components, values);
 	    });
 }
