@@ -828,11 +828,8 @@ void ForEachLocalFlatAccess(ValueEmitContext& ctx, const IR::Inst& inst, Fn&& em
 		const auto resource = PrepareMemoryResourceAccess(state, mem);
 		const auto aperture = kind == IR::ResourceKind::Scratch ? Decoder::PrivateApertureHigh
 		                                                       : Decoder::SharedApertureHigh;
-		// The aperture is matched on address bits [63:48].
-		const auto selected = Binary(
-		    state, spv::OpIEqual, TypeBool(state),
-		    Binary(state, spv::OpShiftRightLogical, TypeU32(state), high, ConstantU32(state, 16)),
-		    ConstantU32(state, aperture >> 16));
+		const auto selected =
+		    Binary(state, spv::OpIEqual, TypeBool(state), high, ConstantU32(state, aperture));
 		const auto valid = AndCondition(state, aligned,
 		    AndCondition(state, selected, EmitMemoryElementInBounds(state, resource, index)));
 		emit(resource, index, valid);
