@@ -195,7 +195,8 @@ uint32_t BdaAccessMask(bool coherent) {
 	                : spv::MemoryAccessAlignedMask;
 }
 
-// glc rides as Volatile, and the barrier keeps a coherent read from being hoisted.
+// glc rides as Volatile through a Coherent member, and the barrier keeps a coherent read from
+// being hoisted.
 uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = false) {
 	auto&      state   = ctx.state;
 	const auto bda     = GetBdaPointer(state, address);
@@ -205,9 +206,23 @@ uint32_t LoadBdaDword(ValueEmitContext& ctx, uint32_t address, bool coherent = f
 		if (coherent) {
 			EmitAtomicMemoryBarrier(state, IR::ResourceKind::Buffer);
 		}
-		const auto pointer = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
-		                          bda);
+		auto pointer = state.builder.AllocateId();
+		if (coherent) {
+			const auto block = state.builder.DecoratedType(
+			    spv::OpTypeStruct, {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}},
+			                        {spv::OpMemberDecorate, {0, spv::DecorationCoherent}},
+			                        {spv::OpDecorate, {spv::DecorationBlock}}}, TypeU32(state));
+			state.builder.AddFunction(
+			    spv::OpConvertUToPtr, TypePointer(state, spv::StorageClassPhysicalStorageBuffer, block),
+			    pointer, bda);
+			const auto base = pointer;
+			pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, TypePhysicalU32Pointer(state), pointer,
+			                          base, ConstantU32(state, 0));
+		} else {
+			state.builder.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer,
+			                          bda);
+		}
 		const auto         value     = state.builder.AllocateId();
 		constexpr uint32_t alignment = sizeof(uint32_t);
 		state.builder.AddFunction(spv::OpLoad, TypeU32(state), value, pointer,
@@ -520,8 +535,8 @@ uint32_t ByteAddress(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 		                     mem.resource == state.dynamic_buffer_resource;
 		const auto prefix =
 		    dynamic ? state.dynamic_buffer_byte_offset
-		            : state.memory_byte_offsets[ResourceForDescriptor(
-		                  state, IR::DescriptorBindingKind::Buffers, mem.resource)];
+		            : state.memory_byte_offsets[state.program.info.buffers.at(mem.resource)
+		                                            .descriptor_index];
 		const auto address = Binary(state, spv::OpIAdd, TypeU32(state),
 		                            BufferByteAddress(ctx, inst, mem), prefix);
 		// The host binding prefix must not wrap an out-of-range guest address into the buffer.
@@ -1049,6 +1064,18 @@ void StoreFormattedPrepared(ValueEmitContext& ctx, const IR::Inst& inst,
 					                              value, data, component);
 				}
 			}
+			// D16 stores carry the low half of each VGPR.
+			if (mem.data_bits == 16u) {
+				if (info.type == Format::ComponentType::Uint) {
+					value = EmitBitFieldUExtract(ctx.state, value, ConstantU32(ctx.state, 0),
+					                             ConstantU32(ctx.state, 16));
+				} else if (info.type == Format::ComponentType::Sint) {
+					value = EmitBitFieldSExtract(ctx.state, value, ConstantU32(ctx.state, 0),
+					                             ConstantU32(ctx.state, 16));
+				} else {
+					value = EmitBitCastU32F32(ctx.state, EmitF16BitsToF32(ctx.state, value));
+				}
+			}
 			value = EncodeFormatComponent(ctx.state, info, component, value);
 			const auto bits = info.component_bits[component];
 			if (info.packed_bitfield) {
@@ -1312,16 +1339,15 @@ uint32_t LoadWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::M
 		    }
 		    // A glc DWORDX2 is one 64-bit access: look-back scans poll a SWAP_X2 pair.
 		    if (components == 2 && mem.glc && mem.kind == IR::ResourceKind::Buffer &&
-		        state.storage_buffer_u64_variable != 0) {
+		        state.storage_buffers[3].variable != 0) {
 			    const auto u32          = TypeU32(state);
 			    const auto byte_address = ByteAddress(ctx, inst, mem);
 			    const auto aligned      = Binary(
 			        state, spv::OpIEqual, TypeBool(state),
 			        Binary(state, spv::OpBitwiseAnd, u32, byte_address, ConstantU32(state, 7u)),
 			        ConstantU32(state, 0u));
-			    const auto wide_resource = PrepareStorageBufferResourceAccess(
-			        state, mem, state.storage_buffer_u64_variable,
-			        TypeStorageBufferPointer(state, 64));
+			    const auto wide_resource =
+			        PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
 			    const auto index = Binary(state, spv::OpShiftRightLogical, u32, byte_address,
 			                              ConstantU32(state, 3u));
 			    const auto wide  = EmitValueOrDefaultIfCondition(
@@ -1378,12 +1404,54 @@ void StoreWideBuffer(ValueEmitContext& ctx, const IR::Inst& inst, const IR::Memo
 			StoreFormattedPrepared(ctx, inst, mem, resource, info, composite, components);
 			return;
 		}
-		for (uint32_t component = 0; component < components; component++) {
-			const uint32_t c    = mem.glc ? (components - 1u - component) : component;
-			const auto     data = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite, c);
-			StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, c), resource, data);
+		const auto store_words = [&]() {
+			for (uint32_t component = 0; component < components; component++) {
+				const uint32_t c    = mem.glc ? (components - 1u - component) : component;
+				const auto     data = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), data, composite,
+				                          c);
+				StoreWordPrepared(ctx, inst, RebaseRawComponent(mem, c), resource, data);
+			}
+		};
+		// A glc DWORDX2 is one 64-bit access: look-back scans publish a {flag, value} pair with it.
+		if (components == 2 && mem.glc && mem.kind == IR::ResourceKind::Buffer &&
+		    state.storage_buffers[3].variable != 0) {
+			const auto u32           = TypeU32(state);
+			const auto u64           = TypeU64(state);
+			const auto byte_address  = ByteAddress(ctx, inst, mem);
+			const auto wide_resource =
+			    PrepareStorageBufferResourceAccess(state, mem, state.storage_buffers[3]);
+			const auto index =
+			    Binary(state, spv::OpShiftRightLogical, u32, byte_address, ConstantU32(state, 3u));
+			const auto whole = Binary(
+			    state, spv::OpLogicalAnd, TypeBool(state),
+			    Binary(state, spv::OpIEqual, TypeBool(state),
+			           Binary(state, spv::OpBitwiseAnd, u32, byte_address, ConstantU32(state, 7u)),
+			           ConstantU32(state, 0u)),
+			    EmitMemoryElementInBounds(state, wide_resource, index));
+			EmitIfCondition(state, whole, [&]() {
+				std::array<uint32_t, 2> words {};
+				for (uint32_t c = 0; c < 2; c++) {
+					words[c] = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, u32, words[c], composite, c);
+				}
+				const auto value = Binary(
+				    state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, words[0]),
+				    Binary(state, spv::OpShiftLeftLogical, u64,
+				           Unary(state, spv::OpUConvert, u64, words[1]), ConstantU32(state, 32u)));
+				const auto pointer = EmitStorageBufferElementPointer(
+				    state, wide_resource, index, TypeStorageBufferElementPointer(state, 64));
+				state.builder.AddFunction(
+				    spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice),
+				    ConstantU32(state, spv::MemorySemanticsReleaseMask |
+				                           spv::MemorySemanticsUniformMemoryMask),
+				    value);
+			});
+			EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), whole),
+			                store_words);
+			return;
 		}
+		store_words();
 	});
 }
 
@@ -1664,11 +1732,10 @@ uint32_t EmitIndirectBufferSwitch(ValueEmitContext& ctx, const IR::Inst& inst,
 		               return size > 1u;
 	               });
 	const auto first_slot =
-	    count >= 2u ? ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, candidates[1])
-	                : 0u;
+	    count >= 2u ? state.program.info.buffers.at(candidates[1]).descriptor_index : 0u;
 	for (uint32_t ordinal = 2; indexed && ordinal < count; ordinal++) {
-		indexed = ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers,
-		                                candidates[ordinal]) == first_slot + ordinal - 1u;
+		indexed = state.program.info.buffers.at(candidates[ordinal]).descriptor_index ==
+		          first_slot + ordinal - 1u;
 	}
 	if (!indexed) {
 		group_ordinal.resize(count);
@@ -1687,8 +1754,7 @@ uint32_t EmitIndirectBufferSwitch(ValueEmitContext& ctx, const IR::Inst& inst,
 	uint32_t slot        = 0;
 	uint32_t byte_offset = 0;
 	if (indexed) {
-		const auto root_slot =
-		    ResourceForDescriptor(state, IR::DescriptorBindingKind::Buffers, candidates[0]);
+		const auto root_slot = state.program.info.buffers.at(candidates[0]).descriptor_index;
 		slot = Select(state, u32,
 		              Binary(state, spv::OpIEqual, TypeBool(state), selected, ConstantU32(state, 0u)),
 		              ConstantU32(state, root_slot),
@@ -2071,26 +2137,25 @@ void EmitLoadMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto load              = [&](const IR::MemoryInfo& access) -> uint32_t {
         if (access.kind == IR::ResourceKind::FlatLocal)
             return LoadLocalFlat(ctx, inst);
-        if (buffer_components > 1u ||
-            (buffer_components == 1u && access.kind == IR::ResourceKind::IndirectBuffer &&
-             !access.formatted))
-            return LoadWideBuffer(ctx, inst, access, buffer_components);
-        if (shared_components > 1u)
-            return LoadWideShared(ctx, inst, shared_components);
-        if (access.kind == IR::ResourceKind::ScalarAddress)
-            return LoadBdaDword(ctx, GuestAddress(ctx, inst, access));
-        if (address_info.access == IR::AddressAccess::Read &&
-            access.kind != IR::ResourceKind::Scratch)
-            return LoadBda(ctx, GuestAddress(ctx, inst, access), ctx.Arg(inst, inst.NumArgs() - 1),
-                           address_info.data_bits, CoherentBufferAccess(access));
-        // A formatted access needs a host-decoded descriptor; a dynamic V# has none.
-        if (op == IR::ValueOpcode::LoadBufferU32 && access.formatted && !access.dynamic_buffer)
-            return access.kind == IR::ResourceKind::IndirectBuffer
-                       ? LoadIndirectFormattedX(ctx, inst)
-                       : FormattedLoad(ctx, inst, access);
-        if (inst.GetType() == IR::Type::U8) return LoadSubword(ctx, inst, access, 8, false);
-        if (inst.GetType() == IR::Type::U16) return LoadSubword(ctx, inst, access, 16, false);
-        return LoadWord(ctx, inst, access);
+		if (buffer_components > 1u ||
+		    (buffer_components == 1u && access.kind == IR::ResourceKind::IndirectBuffer &&
+		     !access.formatted))
+			return LoadWideBuffer(ctx, inst, access, buffer_components);
+		if (shared_components > 1u) return LoadWideShared(ctx, inst, shared_components);
+		if (access.kind == IR::ResourceKind::ScalarAddress)
+			return LoadBdaDword(ctx, GuestAddress(ctx, inst, access));
+		if (address_info.access == IR::AddressAccess::Read &&
+		    access.kind != IR::ResourceKind::Scratch)
+			return LoadBda(ctx, GuestAddress(ctx, inst, access), ctx.Arg(inst, inst.NumArgs() - 1),
+			               address_info.data_bits, CoherentBufferAccess(access) || access.coherent);
+		// A formatted access needs a host-decoded descriptor; a dynamic V# has none.
+		if (op == IR::ValueOpcode::LoadBufferU32 && access.formatted && !access.dynamic_buffer)
+			return access.kind == IR::ResourceKind::IndirectBuffer
+			           ? LoadIndirectFormattedX(ctx, inst)
+			           : FormattedLoad(ctx, inst, access);
+		if (inst.GetType() == IR::Type::U8) return LoadSubword(ctx, inst, access, 8, false);
+		if (inst.GetType() == IR::Type::U16) return LoadSubword(ctx, inst, access, 16, false);
+		return LoadWord(ctx, inst, access);
 	};
 	if (IsIndirectBufferRoot(ctx, mem)) {
 		const auto result_type = buffer_components > 1u
