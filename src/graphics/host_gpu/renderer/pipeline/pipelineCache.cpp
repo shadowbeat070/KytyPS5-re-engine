@@ -835,6 +835,20 @@ struct PipelineCache::ProgramCache {
 	}
 
 	template <typename InputInfo>
+	ShaderProgram Relearned(const ShaderParams& params, InputInfo& input_info,
+	                        uint32_t& push_data_cursor) {
+		static thread_local uint32_t depth    = 0;
+		static const bool            disabled = EnvSwitch("KYTY_NO_UNFOLDABLE_RETRY");
+		if (disabled || depth >= 8) {
+			return {};
+		}
+		++depth;
+		auto program = Get(params, input_info, push_data_cursor);
+		--depth;
+		return program;
+	}
+
+	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
 		ShaderType stage;
@@ -904,7 +918,9 @@ struct PipelineCache::ProgramCache {
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization, &reported_unfoldable)) {
 				ReportUnmaterialized(stage, params.hash);
-				unfoldable.Learn(code_size, key(), reported_unfoldable);
+				if (unfoldable.Learn(code_size, key(), reported_unfoldable)) {
+					return Relearned(params, input_info, push_data_cursor);
+				}
 				return {};
 			}
 			KYTY_PROFILER_BLOCK("ProgramCache permutation search");
@@ -1042,7 +1058,9 @@ struct PipelineCache::ProgramCache {
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization, &reported_unfoldable)) {
 				ReportUnmaterialized(stage, params.hash);
-				unfoldable.Learn(code_size, key(), reported_unfoldable);
+				if (unfoldable.Learn(code_size, key(), reported_unfoldable)) {
+					return Relearned(params, input_info, push_data_cursor);
+				}
 				return {};
 			}
 		}
