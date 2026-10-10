@@ -255,6 +255,11 @@ struct TextureCacheTestAccess {
     return std::unique_lock(cache.m_lock);
   }
 
+  static uint64_t GcCollections(const TextureCache &cache) { return cache.m_gc_collections; }
+  static uint64_t SwapPressure(TextureCache &cache, uint64_t pressure) {
+    return std::exchange(cache.m_pressure_gc_memory, pressure);
+  }
+
   static void ClearImage(TextureCache &cache, CommandBuffer &command, ImageId id,
                          const vk::ImageSubresourceRange &range,
                          const vk::ClearValue &clear) {
@@ -3119,6 +3124,26 @@ public:
     auto &context = Renderer();
     context.InitializeGpu(nullptr);
     auto &gpu = context.GetGpu();
+
+    // Below memory pressure the texture-cache collector runs once per presented frame.
+    gpu.SendCommandSync([&] {
+      auto &cache = context.GetTextureCache();
+      const auto pressure = TextureCacheTestAccess::SwapPressure(cache, UINT64_MAX);
+      cache.AdvanceFrame();
+      const auto before = TextureCacheTestAccess::GcCollections(cache);
+      for (u32 call = 0; call < 3; call++) {
+        cache.RunGarbageCollector(true);
+      }
+      Require("GpuCommandLane", "one texture collection per frame",
+              TextureCacheTestAccess::GcCollections(cache) == before + 1,
+              "the texture-cache collector ran more than once inside one frame");
+      cache.AdvanceFrame();
+      cache.RunGarbageCollector(true);
+      Require("GpuCommandLane", "next frame collects again",
+              TextureCacheTestAccess::GcCollections(cache) == before + 2,
+              "the texture-cache collector skipped a new frame");
+      TextureCacheTestAccess::SwapPressure(cache, pressure);
+    });
 
     const auto caller_thread = std::this_thread::get_id();
     std::thread::id gpu_thread;

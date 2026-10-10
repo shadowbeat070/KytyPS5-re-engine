@@ -3147,9 +3147,16 @@ bool TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 	return freed;
 }
 
-void TextureCache::RunGarbageCollector() {
+void TextureCache::RunGarbageCollector(bool per_frame) {
 	std::scoped_lock lock {m_lock};
-	const uint64_t   tick = m_gc_tick++;
+	const uint64_t   tick     = m_gc_tick++;
+	const uint64_t   gc_frame = m_frame_index.load(std::memory_order_relaxed);
+	if (per_frame && gc_frame == m_gc_frame && m_total_used_memory < m_pressure_gc_memory) {
+		FreePublishedEvictions();
+		return;
+	}
+	m_gc_frame = gc_frame;
+	m_gc_collections++;
 	if (m_graphics.CanReportMemoryUsage()) {
 		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
 		// Idle pooled images go before any live one does.

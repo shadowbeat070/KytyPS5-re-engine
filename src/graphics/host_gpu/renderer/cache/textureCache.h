@@ -151,7 +151,7 @@ public:
 
 	bool UnmapMemory(uint64_t address, uint64_t size);
 	void ProcessDownloadImages();
-	void RunGarbageCollector();
+	void RunGarbageCollector(bool per_frame = false);
 
 private:
 	void FreePublishedEvictions();
@@ -323,6 +323,8 @@ private:
 	uint64_t                               m_pressure_gc_memory = 1536ull * 1024 * 1024;
 	uint64_t                               m_critical_gc_memory = 3ull * 1024 * 1024 * 1024;
 	uint64_t                               m_gc_tick            = 0;
+	uint64_t                               m_gc_frame           = UINT64_MAX;
+	uint64_t                               m_gc_collections     = 0;
 	// Advances whenever a registered image stops being servable: unregistered, parked, stencil
 	// proxy.
 	uint64_t         m_retire_epoch           = 0;
