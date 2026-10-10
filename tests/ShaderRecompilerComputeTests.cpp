@@ -31474,6 +31474,76 @@ TestCase CvtF32ToIntSaturatesNaNAndOutOfRange() {
            O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// Run-time inputs, so the converts reach the GPU; no denormals, whose rounding is host-defined.
+TestCase CvtF32ToIntSaturatesPerLane(u32 wave_size) {
+  using O = ShaderOpcode;
+  static constexpr u32 values[] = {
+      0x00000000u, 0x80000000u, 0x3f000000u, 0xbf000000u, 0x3f800000u, 0xbf800000u,
+      0x3fc00000u, 0xbfc00000u, 0x40200000u, 0xc0200000u, 0x47f120e6u, 0xc7f120e6u,
+      0x3effffffu, 0xbeffffffu, 0x4affffffu, 0xcaffffffu, 0x4b800001u, 0x4effffffu,
+      0x4f000000u, 0xcf000000u, 0xcf000001u, 0x4f7fffffu, 0x4f800000u, 0x60ad78ecu,
+      0xe0ad78ecu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0xffc00001u, 0x7fa00001u};
+  constexpr u32 lanes = static_cast<u32>(std::size(values));
+  constexpr u32 out = 32;
+  const auto saturate_i32 = [](float value) -> u32 {
+    if (std::isnan(value)) {
+      return 0u;
+    }
+    if (value <= -2147483648.0f) {
+      return 0x80000000u;
+    }
+    if (value >= 2147483648.0f) {
+      return 0x7fffffffu;
+    }
+    return static_cast<u32>(static_cast<int32_t>(value));
+  };
+  const auto saturate_u32 = [](float value) -> u32 {
+    if (std::isnan(value) || value <= 0.0f) {
+      return 0u;
+    }
+    if (value >= 4294967296.0f) {
+      return 0xffffffffu;
+    }
+    return static_cast<u32>(value);
+  };
+
+  std::vector<u32> code;
+  AppendLoadLaneInput(&code, 1, 0);
+  code.push_back(EncodeVop1(0x07, 10, Vgpr(1)));
+  code.push_back(EncodeVop1(0x08, 11, Vgpr(1)));
+  code.push_back(EncodeVop1(0x0c, 12, Vgpr(1)));
+  code.push_back(EncodeVop1(0x0d, 13, Vgpr(1)));
+  for (u32 i = 0; i < 4; i++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 10 + i, 0, out + i * lanes);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 64 ? "CvtF32ToIntSaturatesPerLane64" : "CvtF32ToIntSaturatesPerLane32";
+  test.code = std::move(code);
+  test.initial.assign(out + 4 * lanes, 0);
+  std::copy(std::begin(values), std::end(values), test.initial.begin());
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const float value = std::bit_cast<float>(values[lane]);
+    test.expected[out + lane] = saturate_u32(value);
+    test.expected[out + lanes + lane] = saturate_i32(value);
+    test.expected[out + 2 * lanes + lane] = saturate_i32(std::floor(value + 0.5f));
+    test.expected[out + 3 * lanes + lane] = saturate_i32(std::floor(value));
+  }
+  test.opcodes = {O::V_MOV_B32,         O::V_ADD_NC_U32,       O::V_LSHLREV_B32,
+                  O::BUFFER_LOAD_DWORD, O::V_CVT_U32_F32,      O::V_CVT_I32_F32,
+                  O::V_CVT_RPI_I32_F32, O::V_CVT_FLR_I32_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorSpecialF32FlushesDenormalInputs() {
   using O = ShaderOpcode;
 
@@ -44382,6 +44452,8 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
+  AddMade(CvtF32ToIntSaturatesPerLane(32));
+  AddMade(CvtF32ToIntSaturatesPerLane(64));
   AddCase(VectorSpecialF32FlushesDenormalInputs);
   AddCase(VectorRcpIflagF32IntegerReciprocal);
   AddCase(VectorCompareF64Edges);

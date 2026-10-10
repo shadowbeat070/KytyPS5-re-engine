@@ -21,8 +21,8 @@ uint32_t              EmitConvertU16U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertU8U32(EmitterState& state, uint32_t arg0);
 uint32_t              EmitConvertF16F32(EmitterState& state, uint32_t arg0);
 inline constexpr auto EmitConvertF32F16 = EmitF16BitsToF32;
-uint32_t              EmitConvertS32F32(EmitterState& state, uint32_t arg0);
-uint32_t              EmitConvertU32F32(EmitterState& state, uint32_t arg0);
+uint32_t              EmitConvertS32F32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitConvertU32F32(ValueEmitContext& ctx, const IR::Inst& inst);
 template <IR::Type type>
 uint32_t EmitConvertSigned32ToFloat(EmitterState& state, uint32_t arg0) {
 	const auto signed_value = Unary(state, spv::OpBitcast, TypeI32(state), arg0);

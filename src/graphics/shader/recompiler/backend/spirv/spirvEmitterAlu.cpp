@@ -1,6 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
 #include <array>
+#include <cmath>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -203,12 +205,44 @@ uint32_t EmitConvertF16F32(EmitterState& state, uint32_t arg0) {
 	return EmitPackHalf2x16(state, pair);
 }
 
-uint32_t EmitConvertS32F32(EmitterState& state, uint32_t arg0) {
-	return EmitF32ToU32(state, arg0, true);
+static bool SaturatedConvertFoldDisabled() {
+	static const bool disabled = [] {
+		const char* text = std::getenv("KYTY_NO_SATURATED_CVT_FOLD");
+		return text != nullptr && text[0] != '\0' && text[0] != '0';
+	}();
+	return disabled;
 }
 
-uint32_t EmitConvertU32F32(EmitterState& state, uint32_t arg0) {
-	return EmitF32ToU32(state, arg0, false);
+// Convert.cpp saturates first; its final SelectF32 is always finite, integral and in range.
+static bool ConvertSourceSaturated(const IR::Inst& inst, bool signed_value) {
+	if (SaturatedConvertFoldDisabled()) {
+		return false;
+	}
+	const auto source = inst.Arg(0).Resolve();
+	if (source.IsImmediate()) {
+		const float value = source.F32Value();
+		return std::trunc(value) == value &&
+		       (signed_value ? value >= -2147483648.0f && value < 2147483648.0f
+		                     : value >= 0.0f && value < 4294967296.0f);
+	}
+	const auto* producer = source.ResolveInstruction();
+	return producer != nullptr && producer->GetOpcode() == IR::ValueOpcode::SelectF32;
+}
+
+uint32_t EmitConvertS32F32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ConvertSourceSaturated(inst, true)) {
+		const auto converted =
+		    Unary(ctx.state, spv::OpConvertFToS, TypeI32(ctx.state), ctx.Arg(inst, 0));
+		return Unary(ctx.state, spv::OpBitcast, TypeU32(ctx.state), converted);
+	}
+	return EmitF32ToU32(ctx.state, ctx.Arg(inst, 0), true);
+}
+
+uint32_t EmitConvertU32F32(ValueEmitContext& ctx, const IR::Inst& inst) {
+	if (ConvertSourceSaturated(inst, false)) {
+		return Unary(ctx.state, spv::OpConvertFToU, TypeU32(ctx.state), ctx.Arg(inst, 0));
+	}
+	return EmitF32ToU32(ctx.state, ctx.Arg(inst, 0), false);
 }
 
 uint32_t EmitConvertF32F64(EmitterState& state, uint32_t arg0) {
