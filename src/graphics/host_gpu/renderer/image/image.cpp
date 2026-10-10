@@ -136,6 +136,38 @@ bool Image::FormatHasStencil(vk::Format format) noexcept {
 	return static_cast<bool>(FullAspectMask(format) & vk::ImageAspectFlagBits::eStencil);
 }
 
+bool Image::DepthColorCopyCompatible(vk::Format source, vk::Format destination) noexcept {
+	const auto depth_bits = [](vk::Format format) -> uint32_t {
+		switch (format) {
+			case vk::Format::eD16Unorm:
+			case vk::Format::eD16UnormS8Uint: return 16;
+			case vk::Format::eD32Sfloat:
+			case vk::Format::eD32SfloatS8Uint: return 32;
+			default: return 0;
+		}
+	};
+	const auto color_bits = [](vk::Format format) -> uint32_t {
+		switch (format) {
+			case vk::Format::eR16Sfloat:
+			case vk::Format::eR16Unorm:
+			case vk::Format::eR16Snorm:
+			case vk::Format::eR16Uint:
+			case vk::Format::eR16Sint: return 16;
+			case vk::Format::eR32Sfloat:
+			case vk::Format::eR32Sint:
+			case vk::Format::eR32Uint: return 32;
+			default: return 0;
+		}
+	};
+	const auto source_depth      = depth_bits(source);
+	const auto destination_depth = depth_bits(destination);
+	if ((source_depth != 0) == (destination_depth != 0)) {
+		return false;
+	}
+	return source_depth != 0 ? source_depth == color_bits(destination)
+	                         : destination_depth == color_bits(source);
+}
+
 bool Image::CopyCarriesStencil(vk::Format source, vk::Format destination) noexcept {
 	return source == destination && FormatHasStencil(source);
 }

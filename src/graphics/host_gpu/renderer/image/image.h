@@ -177,6 +177,9 @@ public:
 	// is depth/stencil, so stencil can only ride along when the two backing formats are identical.
 	[[nodiscard]] static bool CopyCarriesStencil(vk::Format source,
 	                                             vk::Format destination) noexcept;
+	// Bit-identical under VK_KHR_maintenance8; 24-bit depth keeps the buffered copy's packing.
+	[[nodiscard]] static bool DepthColorCopyCompatible(vk::Format source,
+	                                                   vk::Format destination) noexcept;
 
 	ImageInfo                    info;
 	VulkanImage                  backing;
