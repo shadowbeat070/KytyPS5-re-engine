@@ -327,6 +327,43 @@ std::vector<std::string> Search(int32_t user, const SceSaveDataTitleId* title = 
 	return found;
 }
 
+void TestDirNamePatterns() {
+	CHECK(dir_name_match("saveservice-line-0-4slot", "saveservice-line-0-%slot%"));
+	CHECK(dir_name_match("saveservice-line-0-14slot", "saveservice-line-0-%slot%"));
+	CHECK(!dir_name_match("saveservice-line-0--1", "saveservice-line-0-%slot%"));
+	CHECK(dir_name_match("saveservice-line-0--1", "saveservice-line-0-%"));
+	CHECK(dir_name_match("slot", "%slot%"));
+	CHECK(dir_name_match("", "%"));
+	CHECK(dir_name_match("slota", "slot_"));
+	CHECK(!dir_name_match("slot", "slot_"));
+	CHECK(!dir_name_match("slotab", "slot_"));
+
+	Reset("PATTERN");
+	for (const char* text: {"LINE-0-1Slot", "LINE-0-14Slot", "LINE-0--1"}) {
+		auto                  name = DirName(text);
+		struct SaveDataMount3 mount {};
+		mount.user_id    = 1;
+		mount.dir_name   = &name;
+		mount.mount_mode = 4;
+		mount.blocks     = 48;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	}
+	auto                      pattern = DirName("LINE-0-%Slot%");
+	SaveDataDirNameSearchCond cond {};
+	cond.user_id  = 1;
+	cond.dir_name = &pattern;
+	std::array<SceSaveDataDirName, 8> names {};
+	SaveDataDirNameSearchResult       result {};
+	result.dir_names     = names.data();
+	result.dir_names_num = names.size();
+	CHECK(SaveDataDirNameSearch(&cond, &result) == OK);
+	CHECK(result.hit_num == 2);
+	CHECK(std::string(names[0].data) == "LINE-0-14Slot");
+	CHECK(std::string(names[1].data) == "LINE-0-1Slot");
+}
+
 void TestClassicSavePaths() {
 	Reset("CLASSIC");
 	const std::vector<std::string> names {"save.1", "save1", "slot@A", "slotA"};
@@ -616,6 +653,7 @@ int main(int argc, char** argv) {
 	TestValidationAndScatter();
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
+	TestDirNamePatterns();
 	TestClassicSavePaths();
 	TestSaveAllocations();
 	TestClassicSaveParams();
