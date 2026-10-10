@@ -367,13 +367,12 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	if (write_one_address) {
-		for (uint32_t i = 0; i < dw_num; i++) {
-			dst[0] = src[i];
-		}
-	} else {
-		memcpy(dst, src, static_cast<size_t>(dw_num) * sizeof(uint32_t));
-	}
+	const auto* data = write_one_address ? src + dw_num - 1 : src;
+	WriteMemory(dst, data, uint64_t {write_one_address ? 1u : dw_num} * sizeof(uint32_t));
+}
+
+void CommandProcessor::WriteMemory(void* dst, const void* src, uint64_t size) {
+	m_renderer.GetBufferCache().WriteMemory(reinterpret_cast<uint64_t>(dst), src, size);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -383,7 +382,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	WriteMemory(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -1221,7 +1220,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 	auto write32 = [&](bool with_writeback) {
 		auto* dst  = static_cast<uint32_t*>(dst_gpu_addr);
 		auto  data = static_cast<uint32_t>(value);
-		std::memcpy(dst, &data, sizeof(data));
+		WriteMemory(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			if (with_writeback) {
@@ -1275,7 +1274,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 				}
 				auto write64 = [&](bool with_writeback) {
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
-					std::memcpy(dst, &value, sizeof(value));
+					WriteMemory(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						if (with_writeback) {
