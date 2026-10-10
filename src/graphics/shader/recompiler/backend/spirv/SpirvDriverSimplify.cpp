@@ -14,7 +14,7 @@ constexpr size_t MaxSpeculatedBlocks       = 8;
 constexpr size_t MaxSpeculatedInstructions = 64;
 constexpr int    MaxObservationDepth       = 64;
 
-std::atomic<uint32_t> g_min_words {8192};
+std::atomic<uint32_t> g_min_words {0};
 
 struct Inst {
 	spv::Op               op     = spv::OpNop;

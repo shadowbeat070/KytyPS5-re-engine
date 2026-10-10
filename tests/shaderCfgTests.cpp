@@ -17232,6 +17232,9 @@ int main() {
   using namespace Libs::Graphics;
 
   EnsureConfigInitialized();
+  // These cases assert on the shape the structurizer emits, so they read the module before the
+  // driver simplification; CheckSpirvBinaryValidates still validates the simplified form.
+  ShaderRecompiler::Spirv::SetDriverSimplifyMinWords(UINT32_MAX);
   TestRayTracingInstructions();
   TestStructurizedCfgIsCachedByBody();
   TestResourceDescriptorClassification();
