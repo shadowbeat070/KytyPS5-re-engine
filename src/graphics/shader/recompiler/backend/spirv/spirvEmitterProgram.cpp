@@ -896,21 +896,6 @@ void EmitProgram(EmitterState& state) {
 		const auto label = state.builder.AllocateId();
 		state.labels.emplace(block, label);
 	}
-	if (state.lane_count == 2) {
-		std::unordered_set<uint32_t> loop_merges;
-		for (const auto& info: program.block_info) {
-			if (info.terminator.loop_header && info.terminator.merge_block != UINT32_MAX) {
-				loop_merges.insert(info.terminator.merge_block);
-			}
-		}
-		for (size_t index = 0; index < program.blocks.size(); index++) {
-			const auto& term = program.block_info[index].terminator;
-			if (term.kind == CFG::TerminatorKind::ConditionalBranch &&
-			    (loop_merges.contains(term.true_block) || loop_merges.contains(term.false_block))) {
-				state.loop_exit_blocks.insert(program.blocks[index]);
-			}
-		}
-	}
 	if (state.program.dispatcher_fallback) {
 		auto& dispatch = dispatcher.emplace();
 		for (const auto* block: program.blocks) {

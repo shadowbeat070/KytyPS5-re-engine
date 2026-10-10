@@ -23777,6 +23777,15 @@ void CheckWave64ExecZeroLoopExit(VulkanHarness *vulkan) {
   std::string text;
   Require(test.name, "SPIR-V disassembly", tools.Disassemble(compiled.spirv, &text),
           "failed to disassemble emitted SPIR-V");
+  // One vote per emulated half decides the scalar branch, instead of a materialized wave mask
+  // compared against the active lanes; KYTY_NO_LANE_VOTE_BRANCH=1 keeps the mask form.
+  const bool mask_branch = std::getenv("KYTY_NO_LANE_VOTE_BRANCH") != nullptr;
+  Require(test.name, "scalar branch votes",
+          mask_branch ? (CountText(text, "OpGroupNonUniformAll ") == 0 &&
+                         CountText(text, "OpGroupNonUniformBallot ") != 0)
+                      : (CountText(text, "OpGroupNonUniformAll ") == 2 &&
+                         CountText(text, "OpGroupNonUniformBallot ") == 0),
+          "the execz branch did not take the configured scalar-branch form");
   if (text.find("loop_budget") == std::string::npos) {
     std::printf("[compute] %-32s skipped (needs KYTY_CS_LOOP_BUDGET: --execz-loop-exit-only)\n",
                 test.name);

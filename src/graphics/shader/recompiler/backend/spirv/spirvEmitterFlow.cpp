@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
@@ -818,14 +819,29 @@ uint32_t EmitDppUpdateU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	                                                ctx.Arg(inst, 1));
 }
 
-// An EXECZ/VCCZ branch is one decision per wave: the region may re-enable lanes and read them.
-static uint32_t EmitUniformLaneCondition(ValueEmitContext& ctx, const IR::Inst& inst,
-                                         CFG::BranchCondition kind) {
+static bool LaneVoteBranchDisabled() {
+	static const bool disabled = [] {
+		const char* text = std::getenv("KYTY_NO_LANE_VOTE_BRANCH");
+		return text != nullptr && text[0] != '\0' && text[0] != '0';
+	}();
+	return disabled;
+}
+
+static uint32_t EmitLaneVote(EmitterState& state, uint32_t predicate, bool all) {
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
+	state.builder.RequireCapability(spv::CapabilityGroupNonUniformVote);
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(all ? spv::OpGroupNonUniformAll : spv::OpGroupNonUniformAny,
+	                          TypeBool(state), result, ConstantU32(state, spv::ScopeSubgroup),
+	                          predicate);
+	return result;
+}
+
+static uint32_t EmitUniformLaneConditionFromMask(ValueEmitContext& ctx, const IR::Inst& inst,
+                                                 bool zero) {
 	auto&      state  = ctx.state;
 	const auto ballot = ctx.Ballot(inst.Arg(0));
-	const bool zero =
-	    kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero;
-	uint32_t words[2] {};
+	uint32_t   words[2] {};
 	for (uint32_t i = 0; i < 2; i++) {
 		words[i] = state.builder.AllocateId();
 		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), words[i], ballot, i);
@@ -852,6 +868,45 @@ static uint32_t EmitUniformLaneCondition(ValueEmitContext& ctx, const IR::Inst& 
 	return result;
 }
 
+// An EXECZ/VCCZ branch is one decision per wave: the region may re-enable lanes and read them.
+static uint32_t EmitUniformLaneCondition(ValueEmitContext& ctx, const IR::Inst& inst,
+                                         CFG::BranchCondition kind) {
+	const bool zero =
+	    kind == CFG::BranchCondition::ExecZero || kind == CFG::BranchCondition::VccZero;
+	if (LaneVoteBranchDisabled()) {
+		return EmitUniformLaneConditionFromMask(ctx, inst, zero);
+	}
+	return EmitLaneVote(ctx.state, ctx.Arg(inst, 0), zero);
+}
+
+static uint32_t EmitHalvesConditionFromMask(ValueEmitContext& ctx, const IR::Inst& inst,
+                                            bool zero) {
+	const auto ballot   = ctx.Ballot(inst.Arg(0));
+	const auto low      = ctx.state.builder.AllocateId();
+	const auto high     = ctx.state.builder.AllocateId();
+	const auto combined = ctx.state.builder.AllocateId();
+	const auto result   = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
+	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
+	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, TypeU32(ctx.state),
+	                              combined, low, high);
+	uint32_t reference = 0;
+	if (zero) {
+		const auto active = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(ctx.state, 4),
+		                              active, ConstantU32(ctx.state, spv::ScopeSubgroup),
+		                              ConstantBool(ctx.state, true));
+		reference = ctx.state.builder.AllocateId();
+		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), reference,
+		                              active, 0);
+	} else {
+		reference = ConstantU32(ctx.state, 0u);
+	}
+	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
+	                              result, combined, reference);
+	return result;
+}
+
 uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.other_half == nullptr) {
 		const auto kind = inst.Flags<CFG::BranchCondition>();
@@ -867,32 +922,17 @@ uint32_t EmitConditionRef(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (ctx.half != 0) return ctx.other_half->Def(IR::Value(&inst));
 	const auto kind = inst.Flags<CFG::BranchCondition>();
 	if (kind == CFG::BranchCondition::ScalarInstruction) return ctx.Arg(inst, 0);
-	const auto ballot   = ctx.Ballot(inst.Arg(0));
-	const auto low      = ctx.state.builder.AllocateId();
-	const auto high     = ctx.state.builder.AllocateId();
-	const auto combined = ctx.state.builder.AllocateId();
-	const auto result   = ctx.state.builder.AllocateId();
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), low, ballot, 0);
-	ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), high, ballot, 1);
 	const bool zero = kind == CFG::BranchCondition::ExecZero ||
 	                  kind == CFG::BranchCondition::VccZero ||
 	                  kind == CFG::BranchCondition::SccZero;
-	ctx.state.builder.AddFunction(zero ? spv::OpBitwiseAnd : spv::OpBitwiseOr, TypeU32(ctx.state),
-	                              combined, low, high);
-	uint32_t reference = 0;
-	if (zero && ctx.state.loop_exit_blocks.contains(inst.Parent())) {
-		const auto active = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(ctx.state, 4),
-		                              active, ConstantU32(ctx.state, spv::ScopeSubgroup),
-		                              ConstantBool(ctx.state, true));
-		reference = ctx.state.builder.AllocateId();
-		ctx.state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(ctx.state), reference,
-		                              active, 0);
-	} else {
-		reference = ConstantU32(ctx.state, zero ? ~0u : 0u);
+	if (LaneVoteBranchDisabled()) {
+		return EmitHalvesConditionFromMask(ctx, inst, zero);
 	}
-	ctx.state.builder.AddFunction(zero ? spv::OpIEqual : spv::OpINotEqual, TypeBool(ctx.state),
-	                              result, combined, reference);
+	const auto low    = EmitLaneVote(ctx.state, ctx.HalfArg(inst, 0, 0), zero);
+	const auto high   = EmitLaneVote(ctx.state, ctx.HalfArg(inst, 0, 1), zero);
+	const auto result = ctx.state.builder.AllocateId();
+	ctx.state.builder.AddFunction(zero ? spv::OpLogicalAnd : spv::OpLogicalOr, TypeBool(ctx.state),
+	                              result, low, high);
 	return result;
 }
 
