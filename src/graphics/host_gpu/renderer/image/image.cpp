@@ -496,6 +496,37 @@ void Image::CopyImage(Image& source) {
 	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
 }
 
+void Image::CopyLayers(Image& source, uint32_t base_layer, uint32_t layer_count) {
+	EXIT_IF(source.backing.samples != backing.samples ||
+	        source.backing.image_type != vk::ImageType::e2D ||
+	        backing.image_type != vk::ImageType::e2D || source.backing.extent != backing.extent ||
+	        source.backing.mip_levels != backing.mip_levels ||
+	        source.backing.layers != backing.layers || layer_count == 0 ||
+	        base_layer + layer_count > backing.layers);
+	m_scheduler.EndRendering();
+	const auto source_aspect =
+	    FullAspectMask(source.backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	const auto destination_aspect =
+	    FullAspectMask(backing.format) & ~vk::ImageAspectFlagBits::eStencil;
+	std::vector<vk::ImageCopy> copies(backing.mip_levels);
+	for (uint32_t level = 0; level < backing.mip_levels; level++) {
+		auto& copy          = copies[level];
+		copy.srcSubresource = {source_aspect, level, base_layer, layer_count};
+		copy.dstSubresource = {destination_aspect, level, base_layer, layer_count};
+		copy.extent         = {std::max(backing.extent.width >> level, 1u),
+		                       std::max(backing.extent.height >> level, 1u), 1};
+	}
+	auto command = m_scheduler.Current().Handle();
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, {},
+	               command);
+	Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {}, command);
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, backing.image,
+	                  vk::ImageLayout::eTransferDstOptimal, static_cast<uint32_t>(copies.size()),
+	                  copies.data());
+	Transit(vk::ImageLayout::eGeneral,
+	        vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eTransferRead, {}, command);
+}
+
 void Image::Resolve(Image& source, const ImageSubresourceRange& source_range,
                     const ImageSubresourceRange& destination_range) {
 	EXIT_IF(backing.samples != 1 || source.backing.image_type != vk::ImageType::e2D ||

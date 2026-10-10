@@ -4456,6 +4456,128 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  void CheckDepthColorTwin() {
+    constexpr const char *name = "DepthColorTwin";
+    constexpr uintptr_t base = 0x0000000209e00000ull;
+    constexpr uint64_t allocation_size = 0x200000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    EnsureRuntimeContext();
+    if (!m_runtime_context.depth_color_copy_enabled) {
+      std::printf("[gpu]     %-32s skipped (no maintenance8)\n", name);
+      return;
+    }
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "twin test direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed twin test mapping failed");
+    auto *memory = static_cast<uint8_t *>(mapped);
+    constexpr std::array<float, 4> initial{0.25f, 0.75f, 0.5f, 0.125f};
+    std::memcpy(memory, initial.data(), sizeof(initial));
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      auto &texture_cache = resources.GetTextureCache();
+      resources.MapMemory(base, allocation_size);
+      auto depth = MakeLinearDesc(base, sizeof(initial), vk::Format::eD32Sfloat,
+                                  Prospero::BufferFormat::k32Float,
+                                  Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
+                                  sizeof(float), 1);
+      depth.type = BindingType::DepthTarget;
+      depth.view_info.aspect = vk::ImageAspectFlagBits::eDepth;
+      depth.view_info.usage = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+      auto storage = MakeLinearDesc(base, sizeof(initial), vk::Format::eR32Uint,
+                                    Prospero::BufferFormat::k32UInt,
+                                    Prospero::ImageType::kColor2D, {2, 1, 1}, 2,
+                                    sizeof(uint32_t), 1);
+      storage.type = BindingType::Storage;
+      storage.view_info.usage = vk::ImageUsageFlagBits::eStorage;
+
+      auto depth_desc = depth;
+      const auto depth_id = texture_cache.FindImage(depth_desc);
+      (void)texture_cache.FindDepthTarget(depth_id, depth_desc);
+      auto storage_desc = storage;
+      const auto color_id = texture_cache.FindImage(storage_desc);
+      Require(name, "first switch parks the depth surface",
+              color_id && color_id != depth_id &&
+                  TextureCacheTestAccess::Contains(texture_cache, depth_id) &&
+                  texture_cache.GetImage(depth_id).dormant &&
+                  texture_cache.GetImage(color_id).depth_twin == depth_id &&
+                  texture_cache.GetImage(depth_id).depth_twin == color_id,
+              "a storage binding over depth freed the depth image instead of parking it");
+
+      // The dispatch binds layer 1 only; layer 0 is scribbled on behind the cache's back, so
+      // only the layer the binding wrote may travel back to the depth twin.
+      storage_desc.view_info.base_layer = 1;
+      storage_desc.view_info.layer_count = 1;
+      (void)texture_cache.FindTexture(color_id, storage_desc);
+      auto &color = texture_cache.GetImage(color_id);
+      scheduler.Current().EndRendering();
+      color.Transit(vk::ImageLayout::eTransferDstOptimal,
+                    vk::AccessFlagBits2::eTransferWrite, {},
+                    scheduler.Current().Handle());
+      vk::ClearColorValue written{};
+      written.uint32[0] = 0x3f800000u;
+      vk::ClearColorValue scribble{};
+      scribble.uint32[0] = 0x3e000000u;
+      const vk::ImageSubresourceRange layer0{vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+      const vk::ImageSubresourceRange layer1{vk::ImageAspectFlagBits::eColor, 0, 1, 1, 1};
+      scheduler.Current().Handle().clearColorImage(
+          color.backing.image, vk::ImageLayout::eTransferDstOptimal, &written, 1, &layer1);
+      scheduler.Current().Handle().clearColorImage(
+          color.backing.image, vk::ImageLayout::eTransferDstOptimal, &scribble, 1, &layer0);
+
+      auto depth_again = depth;
+      const auto revived = texture_cache.FindImage(depth_again);
+      Require(name, "second switch revives the twin",
+              revived == depth_id && !texture_cache.GetImage(depth_id).dormant &&
+                  texture_cache.GetImage(color_id).dormant,
+              "a depth binding over the colour surface rebuilt instead of reviving its twin");
+      const auto layer0_texels =
+          ReadCachedTexel(name, context, depth_id, {}, {2, 1, 1}, 0);
+      const auto layer1_texels =
+          ReadCachedTexel(name, context, depth_id, {}, {2, 1, 1}, 1);
+      Require(name, "only the written layer travels",
+              layer0_texels ==
+                      std::vector<u32>{std::bit_cast<u32>(0.25f), std::bit_cast<u32>(0.75f)} &&
+                  layer1_texels == std::vector<u32>{0x3f800000u, 0x3f800000u},
+              "the twin sync copied an unwritten layer or lost the written one");
+
+      auto storage_again = storage;
+      const auto color_again = texture_cache.FindImage(storage_again);
+      Require(name, "third switch reuses the colour twin",
+              color_again == color_id && texture_cache.GetImage(depth_id).dormant,
+              "the colour twin was not reused");
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "twin test mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "twin test allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckTextureCacheCollectorProgress() {
     constexpr const char *name = "TextureCacheCollectorProgress";
     constexpr uintptr_t base = 0x0000000208800000ull;
@@ -7707,8 +7829,12 @@ public:
           texture_cache.GetImage(layered_raw_d16_depth_image);
       Require(name, "layered raw D16 owner layout",
               layered_raw_d16_depth_image != layered_d16_color_image &&
-                  !TextureCacheTestAccess::Contains(texture_cache,
-                                                    layered_d16_color_image) &&
+                  // A depth binding over the colour surface parks it as the depth twin.
+                  (!TextureCacheTestAccess::Contains(texture_cache,
+                                                     layered_d16_color_image) ||
+                   (texture_cache.GetImage(layered_d16_color_image).dormant &&
+                    texture_cache.GetImage(layered_d16_color_image).depth_twin ==
+                        layered_raw_d16_depth_image)) &&
                   layered_depth_owner.info.resources.layers == 6 &&
                   layered_depth_owner.info.data.size ==
                       sizeof(layered_raw_d16_values) &&
@@ -50525,6 +50651,11 @@ int main(int argc, char **argv) {
     vulkan.CheckRenderExecutorColor1DArrayDiscovery();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--depth-twin-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDepthColorTwin();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
     VulkanHarness vulkan;
     CheckImageTransitionState(vulkan.RuntimeRenderer());
@@ -50709,6 +50840,7 @@ int main(int argc, char **argv) {
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckUnifiedTextureCacheFlow();
+  vulkan.CheckDepthColorTwin();
   vulkan.CheckMetaSliceClears();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();
