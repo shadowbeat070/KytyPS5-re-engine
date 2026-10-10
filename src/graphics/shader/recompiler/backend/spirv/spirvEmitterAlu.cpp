@@ -74,6 +74,13 @@ uint32_t EmitMed3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, bool 
 }
 
 uint32_t EmitFMinMax3(EmitterState& state, uint32_t a, uint32_t b, uint32_t c, bool max_value) {
+	if (FastF32MinMax()) {
+		auto a_operand = EmitMinMaxOperandF32(state, a);
+		auto b_operand = EmitMinMaxOperandF32(state, b);
+		auto c_operand = EmitMinMaxOperandF32(state, c);
+		auto ab        = EmitMinMaxF32Operands(state, a_operand, b_operand, max_value, false);
+		return EmitMinMaxF32Operands(state, ab, c_operand, max_value, false).value;
+	}
 	return EmitMinMaxF32Value(state, EmitMinMaxF32Value(state, a, b, max_value), c, max_value);
 }
 
@@ -142,6 +149,21 @@ uint32_t EmitFPMad32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
 }
 
 uint32_t EmitFPMedTri32(EmitterState& state, uint32_t a, uint32_t b, uint32_t c) {
+	if (FastF32MinMax()) {
+		auto       a_operand = EmitMinMaxOperandF32(state, a);
+		auto       b_operand = EmitMinMaxOperandF32(state, b);
+		auto       c_operand = EmitMinMaxOperandF32(state, c);
+		auto       min_ab    = EmitMinMaxF32Operands(state, a_operand, b_operand, false, false);
+		const auto min3      = EmitMinMaxF32Operands(state, min_ab, c_operand, false, false);
+		// The median is only selected when no operand is NaN, so its steps need no NaN arms.
+		auto       max_ab   = EmitMinMaxF32Operands(state, a_operand, b_operand, true, true);
+		auto       high_min = EmitMinMaxF32Operands(state, max_ab, c_operand, false, true);
+		const auto median   = EmitMinMaxF32Operands(state, min_ab, high_min, true, true);
+		const auto any_nan  = EmitLogicalOrBool(
+		    state, EmitLogicalOrBool(state, a_operand.nan, b_operand.nan), c_operand.nan);
+		return EmitBitcastU32ToF32(state,
+		                           EmitSelectValueU32(state, any_nan, min3.bits, median.bits));
+	}
 	const auto min_ab   = EmitMinMaxF32Value(state, a, b, false);
 	const auto min3     = EmitMinMaxF32Value(state, min_ab, c, false);
 	const auto max_ab   = EmitMinMaxF32Value(state, a, b, true);

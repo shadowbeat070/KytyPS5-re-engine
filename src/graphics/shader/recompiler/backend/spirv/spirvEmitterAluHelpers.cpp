@@ -1,5 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h"
 
+#include <cstdlib>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 
 uint32_t EmitAndConstant(EmitterState& state, uint32_t value, uint32_t mask) {
@@ -190,6 +192,11 @@ uint32_t EmitClassMaskF16(EmitterState& state, uint32_t bits, uint32_t mask) {
 }
 
 uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, bool max_value) {
+	if (FastF32MinMax()) {
+		auto lhs_operand = EmitMinMaxOperandF32(state, lhs);
+		auto rhs_operand = EmitMinMaxOperandF32(state, rhs);
+		return EmitMinMaxF32Operands(state, lhs_operand, rhs_operand, max_value, false).value;
+	}
 	const auto lhs_class = EmitClassifyF32(state, lhs);
 	const auto rhs_class = EmitClassifyF32(state, rhs);
 
@@ -208,6 +215,56 @@ uint32_t EmitMinMaxF32Value(EmitterState& state, uint32_t lhs, uint32_t rhs, boo
 	    EmitSelectValueU32(state, rhs_class.nan, lhs_class.bits, numeric_bits);
 	const auto result_bits = EmitSelectValueU32(state, lhs_class.nan, rhs_class.bits, rhs_nan_bits);
 	return EmitBitcastU32ToF32(state, result_bits);
+}
+
+bool FastF32MinMax() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_FAST_FMINMAX");
+		return text == nullptr || text[0] == '\0' || text[0] == '0';
+	}();
+	return enabled;
+}
+
+F32MinMaxOperand EmitMinMaxOperandF32(EmitterState& state, uint32_t value) {
+	F32MinMaxOperand operand;
+	operand.value = value;
+	operand.bits  = EmitBitcastF32ToU32(state, value);
+	operand.abs   = EmitAndConstant(state, operand.bits, 0x7fffffffu);
+	operand.nan   = EmitCompareU32Constant(state, spv::OpUGreaterThan, operand.abs, 0x7f800000u);
+	return operand;
+}
+
+F32MinMaxOperand EmitMinMaxF32Operands(EmitterState& state, F32MinMaxOperand& lhs,
+                                       F32MinMaxOperand& rhs, bool max_value, bool nan_free) {
+	const auto ordered_cond =
+	    Binary(state, max_value ? spv::OpFOrdGreaterThanEqual : spv::OpFOrdLessThan,
+	           TypeBool(state), lhs.value, rhs.value);
+	const auto ordered_bits = EmitSelectValueU32(state, ordered_cond, lhs.bits, rhs.bits);
+	uint32_t   zero_bits    = 0;
+	uint32_t   both_zero    = 0;
+	if (max_value) {
+		for (auto* operand: {&lhs, &rhs}) {
+			if (operand->abs == 0) {
+				operand->abs = EmitAndConstant(state, operand->bits, 0x7fffffffu);
+			}
+		}
+		zero_bits = EmitAndU32(state, lhs.bits, rhs.bits);
+		both_zero =
+		    EmitCompareU32Constant(state, spv::OpIEqual, EmitOrU32(state, lhs.abs, rhs.abs), 0);
+	} else {
+		zero_bits = EmitOrU32(state, lhs.bits, rhs.bits);
+		both_zero = EmitCompareU32Constant(state, spv::OpIEqual,
+		                                   EmitAndConstant(state, zero_bits, 0x7fffffffu), 0);
+	}
+	F32MinMaxOperand result;
+	result.bits = EmitSelectValueU32(state, both_zero, zero_bits, ordered_bits);
+	if (!nan_free) {
+		result.bits = EmitSelectValueU32(state, rhs.nan, lhs.bits, result.bits);
+		result.bits = EmitSelectValueU32(state, lhs.nan, rhs.bits, result.bits);
+		result.nan  = EmitLogicalAndBool(state, lhs.nan, rhs.nan);
+	}
+	result.value = EmitBitcastU32ToF32(state, result.bits);
+	return result;
 }
 
 uint32_t EmitFlushF32DenormToSignedZero(EmitterState& state, uint32_t value) {

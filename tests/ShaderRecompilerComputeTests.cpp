@@ -31216,6 +31216,94 @@ TestCase VectorMed3F32NanUsesMin3Path() {
           {O::V_MOV_B32, O::V_MED3_F32, O::BUFFER_STORE_DWORD, O::S_ENDPGM}};
 }
 
+// Denormals are left out: the ordering compare runs in the host's default FP32 denormal mode.
+u32 ModelMinMaxF32(u32 a, u32 b, bool max_value) {
+  const auto nan = [](u32 bits) { return (bits & 0x7fffffffu) > 0x7f800000u; };
+  if (nan(a)) {
+    return b;
+  }
+  if (nan(b)) {
+    return a;
+  }
+  if (((a | b) & 0x7fffffffu) == 0u) {
+    return max_value ? (a & b) : (a | b);
+  }
+  const float fa = std::bit_cast<float>(a);
+  const float fb = std::bit_cast<float>(b);
+  return (max_value ? fa >= fb : fa < fb) ? a : b;
+}
+
+u32 ModelMed3F32(u32 a, u32 b, u32 c) {
+  const auto nan = [](u32 bits) { return (bits & 0x7fffffffu) > 0x7f800000u; };
+  const u32 min_ab = ModelMinMaxF32(a, b, false);
+  if (nan(a) || nan(b) || nan(c)) {
+    return ModelMinMaxF32(min_ab, c, false);
+  }
+  const u32 high_min = ModelMinMaxF32(ModelMinMaxF32(a, b, true), c, false);
+  return ModelMinMaxF32(min_ab, high_min, true);
+}
+
+TestCase VectorMinMaxF32ClassTriples(u32 slice, u32 wave_size) {
+  using O = ShaderOpcode;
+  static constexpr u32 values[] = {
+      0x00000000u, 0x80000000u, 0x00800000u, 0x3f800000u, 0xbf800000u, 0x40000000u,
+      0x7f7fffffu, 0x7f800000u, 0xff800000u, 0x7fc00000u, 0x7fa00001u, 0xffc00001u};
+  constexpr u32 count = static_cast<u32>(std::size(values));
+  constexpr u32 lanes = 1024;
+  constexpr u32 in_a = 0, in_b = lanes, in_c = 2 * lanes, out = 3 * lanes;
+
+  std::vector<u32> code;
+  AppendLoadLaneInput(&code, 1, in_a);
+  AppendLoadLaneInput(&code, 2, in_b);
+  AppendLoadLaneInput(&code, 3, in_c);
+  code.push_back(EncodeVop2(0x0f, 10, Vgpr(1), 2));
+  code.push_back(EncodeVop2(0x10, 11, Vgpr(1), 2));
+  AppendVop3(&code, 0x151, 12, Vgpr(1), Vgpr(2), Vgpr(3));
+  AppendVop3(&code, 0x154, 13, Vgpr(1), Vgpr(2), Vgpr(3));
+  AppendVop3(&code, 0x157, 14, Vgpr(1), Vgpr(2), Vgpr(3));
+  for (u32 i = 0; i < 5; i++) {
+    AppendStoreVgprAtLaneDwordOffset(&code, 10 + i, 0, out + i * lanes);
+  }
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = wave_size == 64 ? (slice == 0 ? "VectorMinMaxF32ClassTriples64a"
+                                            : "VectorMinMaxF32ClassTriples64b")
+                              : (slice == 0 ? "VectorMinMaxF32ClassTriples32a"
+                                            : "VectorMinMaxF32ClassTriples32b");
+  test.code = std::move(code);
+  test.initial.assign(out + 5 * lanes, 0);
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const u32 triple = slice * lanes + lane;
+    if (triple < count * count * count) {
+      test.initial[in_a + lane] = values[triple / (count * count)];
+      test.initial[in_b + lane] = values[(triple / count) % count];
+      test.initial[in_c + lane] = values[triple % count];
+    }
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const u32 a = test.initial[in_a + lane];
+    const u32 b = test.initial[in_b + lane];
+    const u32 c = test.initial[in_c + lane];
+    test.expected[out + lane] = ModelMinMaxF32(a, b, false);
+    test.expected[out + lanes + lane] = ModelMinMaxF32(a, b, true);
+    test.expected[out + 2 * lanes + lane] = ModelMinMaxF32(ModelMinMaxF32(a, b, false), c, false);
+    test.expected[out + 3 * lanes + lane] = ModelMinMaxF32(ModelMinMaxF32(a, b, true), c, true);
+    test.expected[out + 4 * lanes + lane] = ModelMed3F32(a, b, c);
+  }
+  test.opcodes = {O::V_MOV_B32,     O::V_ADD_NC_U32,      O::V_LSHLREV_B32, O::BUFFER_LOAD_DWORD,
+                  O::V_MIN_F32,     O::V_MAX_F32,         O::V_MIN3_F32,    O::V_MAX3_F32,
+                  O::V_MED3_F32,    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorFloatConversionOps() {
   using O = ShaderOpcode;
 
@@ -44286,6 +44374,11 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatArithmeticOps);
   AddCase(VectorMinMaxF32NanAndSignedZeroEdges);
   AddCase(VectorMed3F32NanUsesMin3Path);
+  for (u32 wave_size : {32u, 64u}) {
+    for (u32 slice = 0; slice < 2; slice++) {
+      AddMade(VectorMinMaxF32ClassTriples(slice, wave_size));
+    }
+  }
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
