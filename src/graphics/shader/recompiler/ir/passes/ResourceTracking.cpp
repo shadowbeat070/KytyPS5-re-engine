@@ -978,6 +978,38 @@ private:
 					need(inst->Arg(arg));
 			}
 		};
+		// A BDA store miss is dropped, so a handle written through must be bound by the host.
+		std::unordered_set<const Inst*> written;
+		{
+			std::vector<const Inst*> pending;
+			for (auto* block: m_program.blocks) {
+				for (auto& inst: *block) {
+					const auto op     = inst.GetOpcode();
+					const auto buffer = BufferAccessOf(op);
+					if (buffer == BufferAccess::Write || buffer == BufferAccess::Atomic ||
+					    AddressOpcodeInfoOf(op).access == AddressAccess::Write) {
+						if (const auto* handle = inst.Arg(0).Resolve().TryInstruction())
+							pending.push_back(handle);
+					}
+				}
+			}
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				if (!written.insert(inst).second) continue;
+				const auto op = inst->GetOpcode();
+				if (op == ValueOpcode::GetAddressResource || op == ValueOpcode::GetBufferResource)
+					continue;
+				for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
+					const auto operand = inst->Arg(arg).Resolve();
+					if (operand.GetType() == Type::BufferResource ||
+					    operand.GetType() == Type::AddressResource) {
+						if (const auto* handle = operand.TryInstruction())
+							pending.push_back(handle);
+					}
+				}
+			}
+		}
 		const auto handles = [&](bool decodable) {
 			return [&, decodable](auto&& need) {
 				for (auto* block: m_program.blocks) {
@@ -987,7 +1019,9 @@ private:
 						                               op == ValueOpcode::GetBufferResource;
 						const bool image_or_sampler  = op == ValueOpcode::GetImageResource ||
 						                               op == ValueOpcode::GetSamplerResource;
-						if (decodable ? buffer_or_address : image_or_sampler) {
+						const bool strict =
+						    image_or_sampler || (buffer_or_address && written.contains(&inst));
+						if (decodable ? buffer_or_address && !strict : strict) {
 							for (uint32_t arg = 0; arg < inst.NumArgs(); ++arg)
 								need(inst.Arg(arg));
 						}
