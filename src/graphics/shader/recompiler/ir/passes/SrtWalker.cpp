@@ -37,6 +37,29 @@ private:
 
 } // namespace
 
+namespace {
+
+thread_local const RawReadEvent* g_raw_read_event = nullptr;
+
+class RawReadEventScope {
+public:
+	explicit RawReadEventScope(const RawReadEvent& event): m_saved(g_raw_read_event) {
+		g_raw_read_event = &event;
+	}
+	~RawReadEventScope() { g_raw_read_event = m_saved; }
+	RawReadEventScope(const RawReadEventScope&)            = delete;
+	RawReadEventScope& operator=(const RawReadEventScope&) = delete;
+
+private:
+	const RawReadEvent* m_saved;
+};
+
+} // namespace
+
+const RawReadEvent* CurrentRawReadEvent() {
+	return g_raw_read_event;
+}
+
 uint32_t CurrentSrtReadSlot() {
 	return g_srt_read_slot;
 }
@@ -1224,6 +1247,10 @@ RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
 	return RawReadReject::None;
 }
 
+size_t RawReadOffsetArgument(ValueOpcode op) {
+	return RawReadOffsetArg(op);
+}
+
 bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t component_bytes) {
 	const auto RefuseRawRead = [&](RawReadReject reason) {
 		if (m_raw_read_reject == RawReadReject::None) {
@@ -1268,17 +1295,18 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t com
 	if (!Arg(inst, offset_arg, offset)) {
 		return refuse_operand("offset", inst.Arg(offset_arg));
 	}
-	std::array<uint64_t, 5> operands {low, high, offset, 0u, 0u};
+	RawReadEvent event {&inst, component_bytes, {low, high, offset, 0u, 0u}};
 	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
 	    inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
 	    DescriptorLoadDwords(inst.GetOpcode()) != 0u) {
-		if (handle->NumArgs() != 4u || !Arg(*handle, 2, operands[3]) ||
-		    !Arg(*handle, 3, operands[4])) {
+		if (handle->NumArgs() != 4u || !Arg(*handle, 2, event.operands[3]) ||
+		    !Arg(*handle, 3, event.operands[4])) {
 			return RefuseRawRead(RawReadReject::DescriptorOperandUnavailable);
 		}
 	}
 	uint64_t address = 0;
-	if (const auto reject = RawReadAddress(m_program, inst, component_bytes, operands, address);
+	if (const auto reject =
+	        RawReadAddress(m_program, inst, component_bytes, event.operands, address);
 	    reject != RawReadReject::None) {
 		return RefuseRawRead(reject);
 	}
@@ -1288,6 +1316,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t com
 	    m_runtime.gpu_owned(m_runtime.userdata, address, sizeof(uint32_t))) {
 		return RefuseRawRead(RawReadReject::GpuOwned);
 	}
+	const RawReadEventScope event_scope(event);
 	uint32_t word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {

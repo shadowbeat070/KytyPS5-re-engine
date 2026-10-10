@@ -2674,6 +2674,25 @@ static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan& program,
 	return true;
 }
 
+bool ImageServedBindless(const ResourcePlan& program, uint32_t image_index) {
+	return image_index < program.info.images.size() && ServedBindless(program, image_index);
+}
+
+bool ReadOverlapsWrittenBuffer(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                               uint64_t address, uint64_t bytes) {
+	for (uint32_t i = 0; i < program.info.buffers.size() && i < snapshot.buffers.size(); ++i) {
+		if (!program.info.buffers[i].written) continue;
+		ShaderBufferResource buffer;
+		if (!DecodeBufferDescriptor(snapshot.buffers[i], buffer)) continue;
+		const auto base = buffer.Base48();
+		const auto size = buffer.GetSize();
+		if (size != 0u && bytes != 0u && address < base + size && base < address + bytes) {
+			return true;
+		}
+	}
+	return false;
+}
+
 bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
                      ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                      std::vector<uint32_t>* refused_tables, bool prune = true) {

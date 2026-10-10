@@ -20,6 +20,7 @@
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/shader/recompiler/ir/passes/ResourceMaterializationMemo.h"
 #include "graphics/shader/shaderCompiler.h"
 #include "kernel/memory.h"
 #include "loader/systemContent.h"
@@ -280,7 +281,15 @@ bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t
 	return true;
 }
 
+bool                                  ReadShaderLine(uint64_t address, void* data, uint64_t size);
+bool                                  EnvSwitch(const char* name);
+Libs::Graphics::ShaderGuestReadCache& ShaderReadCache();
+
 bool ShaderReadGpuOwned(void*, uint64_t address, uint64_t size) {
+	static const bool no_line_cache = EnvSwitch("KYTY_NO_OWNERSHIP_LINE_CACHE");
+	if (!no_line_cache && ShaderReadCache().CleanCovered(address, size, ReadShaderLine)) {
+		return false;
+	}
 	return Libs::LibKernel::Memory::HasGpuOwnedBytes(address, size);
 }
 
@@ -679,7 +688,19 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSnapshot       resources;
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                     permutations;
+		ShaderRecompiler::IR::MaterializeMemoWays    memo;
 	};
+
+	static bool MaterializeMemoEnabled() {
+		static const bool enabled = !EnvSwitch("KYTY_NO_MATERIALIZE_MEMO");
+		return enabled;
+	}
+
+	static bool MaterializeMemoHit(SourceEntry&                            entry,
+	                               const ShaderRecompiler::IR::SrtRuntime& runtime) {
+		return MaterializeMemoEnabled() && entry.memo.Replay(entry.resource_plan, runtime,
+		                                                     entry.resources, entry.specialization);
+	}
 
 	static const char* StageShortName(ShaderType stage) {
 		switch (stage) {
@@ -912,10 +933,12 @@ struct PipelineCache::ProgramCache {
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 		}
-		if (entry != programs.end()) {
+		if (entry != programs.end() && !MaterializeMemoHit(entry->second, runtime)) {
+			auto&      memo     = entry->second.memo;
+			const auto recorded = MaterializeMemoEnabled() ? memo.Record(runtime) : runtime;
 			// Call unconditionally: EXIT_IF drops its argument under KYTY_FINAL.
 			if (!ShaderRecompiler::IR::MaterializeResources(
-			        entry->second.resource_plan, runtime, entry->second.resources,
+			        entry->second.resource_plan, recorded, entry->second.resources,
 			        entry->second.specialization, &reported_unfoldable)) {
 				ReportUnmaterialized(stage, params.hash);
 				if (unfoldable.Learn(code_size, key(), reported_unfoldable)) {
@@ -923,6 +946,12 @@ struct PipelineCache::ProgramCache {
 				}
 				return {};
 			}
+			if (MaterializeMemoEnabled()) {
+				memo.Commit(entry->second.resource_plan, entry->second.resources,
+				            entry->second.specialization);
+			}
+		}
+		if (entry != programs.end()) {
 			KYTY_PROFILER_BLOCK("ProgramCache permutation search");
 			const auto search = [&](bool exact_start) {
 				return std::ranges::find_if(

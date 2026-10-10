@@ -174,10 +174,17 @@ SrtRuntime CleanRuntime(SrtRuntime runtime);
 
 uint32_t CurrentSrtReadSlot();
 
-[[nodiscard]] RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
-                                           uint32_t                       component_bytes,
-                                           const std::array<uint64_t, 5>& operands,
-                                           uint64_t&                      address);
+struct RawReadEvent {
+	const Inst*             inst            = nullptr;
+	uint32_t                component_bytes = 0;
+	std::array<uint64_t, 5> operands {}; // base low, base high, offset, num_records, word3
+};
+[[nodiscard]] const RawReadEvent* CurrentRawReadEvent();
+[[nodiscard]] size_t              RawReadOffsetArgument(ValueOpcode op);
+[[nodiscard]] RawReadReject       RawReadAddress(const ResourcePlan& program, const Inst& inst,
+                                                 uint32_t                       component_bytes,
+                                                 const std::array<uint64_t, 5>& operands,
+                                                 uint64_t&                      address);
 
 // One pass of the per-lane sweep a readfirstlane runs. `dependent` stays clear for an operand
 // that never asks for the lane, which is every shader that does not go through the mask model,
