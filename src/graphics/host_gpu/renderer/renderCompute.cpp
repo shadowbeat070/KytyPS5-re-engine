@@ -649,7 +649,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	if (has_storage_writes) {
+	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly();
+	if (hazard_barrier) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
@@ -662,8 +663,10 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	m_context.GetIndirectKeyFeedback().Flush(vk_buffer);
 
 	// The removed host fence also ordered read-only dispatches before later writers.
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+	if (!GuestSyncOnly()) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+	}
 	ResetBindings();
 }
 
@@ -741,7 +744,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.written &&
 		           image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	if (has_storage_writes) {
+	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly();
+	if (hazard_barrier) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
 	vk::MemoryBarrier barrier {};
@@ -756,8 +760,10 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		PushThreadLimit(vk_buffer, pipeline, dispatch_record);
 	}
 	vk_buffer.dispatchIndirect(dispatch_record.buffer, dispatch_record.groups_offset);
-	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+	if (!GuestSyncOnly()) {
+		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+	}
 	ResetBindings();
 }
 
