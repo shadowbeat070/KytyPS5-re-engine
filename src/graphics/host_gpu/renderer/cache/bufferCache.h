@@ -179,6 +179,7 @@ private:
 	void                   PruneGpuWriteMarks();
 	// Downloads without submitting the recording in progress; false leaves all state unchanged.
 	[[nodiscard]] bool TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	[[nodiscard]] uint64_t PrepareDetachedDownload(uint64_t vaddr, uint64_t size);
 
 	struct ClassifiedMetadata {
 		uint64_t size  = 0;

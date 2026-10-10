@@ -604,6 +604,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		tracy::ScopedZone zone(is_write ? &guest_write : &guest_read, TRACY_CALLSTACK,
 		                       guest_access && tracy::ProfilerAvailable());
 		zone.Value(vaddr);
+		if (guest_access && PrepareDetachedDownload(vaddr, size) != 0) {
+			return;
+		}
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -618,6 +621,32 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (guest_access && m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
+		m_scheduler.GetMasterSemaphore().Wait(m_scheduler.CurrentTick() - 1);
+		m_scheduler.Context().GetGpu().SendCommandSync(
+		    [this, vaddr, size, is_write] { ReadMemory(vaddr, size, is_write); });
+	}
+}
+
+uint64_t BufferCache::PrepareDetachedDownload(uint64_t vaddr, uint64_t size) {
+	uint64_t newest = 0;
+	bool     dirty  = false;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    dirty  = true;
+			    newest = std::max(newest, NewestGpuWriteTick(start, end - start));
+		    });
+	    });
+	if (!dirty || !m_scheduler.Active() || m_scheduler.Current().IsInvalid()) {
+		return 0;
+	}
+	const auto current = m_scheduler.CurrentTick();
+	if (newest >= current || m_bda_store_tick >= current) {
+		m_scheduler.Flush();
+		return current;
+	}
+	return m_scheduler.IsFree(newest) ? 0 : newest;
 }
 
 BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
