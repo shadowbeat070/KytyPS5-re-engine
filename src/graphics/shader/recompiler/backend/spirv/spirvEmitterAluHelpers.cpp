@@ -32,9 +32,50 @@ uint32_t EmitSubConstantMinusU32(EmitterState& state, uint32_t constant, uint32_
 	return ret;
 }
 
+static bool FastF16RtzDisabled() {
+	static const bool disabled = [] {
+		const char* text = std::getenv("KYTY_NO_FAST_PKRTZ");
+		return text != nullptr && text[0] != '\0' && text[0] != '0';
+	}();
+	return disabled;
+}
+
+static uint32_t EmitF32ToF16RtzBitsFast(EmitterState& state, uint32_t bits) {
+	const auto magnitude = EmitAndConstant(state, bits, 0x7fffffffu);
+	const auto sign      = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
+	const auto normal    = EmitShiftRightConstant(
+	    state,
+	    Binary(state, spv::OpISub, TypeU32(state), magnitude, ConstantU32(state, 0x38000000u)), 13);
+	const auto exponent = EmitShiftRightConstant(state, magnitude, 23);
+	const auto shift    = EmitGlsl<GLSLstd450UMin, IR::Type::U32>(
+	    state, EmitSubConstantMinusU32(state, 126, exponent), ConstantU32(state, 31));
+	const auto mantissa  = EmitOrU32(state, EmitAndConstant(state, magnitude, 0x007fffffu),
+	                                 ConstantU32(state, 0x00800000u));
+	const auto subnormal = Binary(state, spv::OpShiftRightLogical, TypeU32(state), mantissa, shift);
+	const auto finite    = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpULessThan, magnitude, 0x38800000u), subnormal,
+	    normal);
+	const auto nan = EmitOrU32(
+	    state, EmitAndConstant(state, EmitShiftRightConstant(state, magnitude, 13), 0x3ffu),
+	    ConstantU32(state, 0x7e00u));
+	const auto inf_or_max = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpIEqual, magnitude, 0x7f800000u),
+	    ConstantU32(state, 0x7c00u), ConstantU32(state, 0x7bffu));
+	const auto special = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThan, magnitude, 0x7f800000u), nan,
+	    inf_or_max);
+	const auto result = EmitSelectValueU32(
+	    state, EmitCompareU32Constant(state, spv::OpUGreaterThanEqual, magnitude, 0x47800000u),
+	    special, finite);
+	return EmitOrU32(state, sign, result);
+}
+
 uint32_t EmitF32ToF16RtzBits(EmitterState& state, uint32_t f32) {
 	const auto bits = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpBitcast, TypeU32(state), bits, f32);
+	if (!FastF16RtzDisabled()) {
+		return EmitF32ToF16RtzBitsFast(state, bits);
+	}
 
 	const auto sign = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 16), 0x8000u);
 	const auto exp  = EmitAndConstant(state, EmitShiftRightConstant(state, bits, 23), 0xffu);
