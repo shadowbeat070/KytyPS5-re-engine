@@ -190,6 +190,7 @@ struct AudioOut2ContextState {
 	uint32_t               queued      = 0;
 	uint32_t               num_grains  = 512;
 	uint64_t               last_update = 0;
+	uint64_t               last_update_frac = 0; // in 1/48000 us, so grains need not be whole us
 	bool                   idle        = true;
 	std::deque<AudioOut2Grain> advanced;
 	bool                       uses_advance        = false;
@@ -265,6 +266,14 @@ static AudioOut2ContextState* audioout2_find_context_locked(AudioOut2ContextHand
 	}
 
 	return nullptr;
+}
+
+static constexpr uint64_t AUDIO_OUT2_CLOCK_RATE = 48000;
+
+// Grain length in 1/48000 us units, i.e. samples * 1000000.
+static uint64_t audioout2_grain_scaled(uint32_t grains) {
+	const auto sample_count = static_cast<uint64_t>(grains == 0 ? 512u : grains);
+	return std::max<uint64_t>(sample_count * 1000000u, 1000u * AUDIO_OUT2_CLOCK_RATE);
 }
 
 static uint32_t audioout2_grain_micros(uint32_t grains) {
@@ -343,29 +352,32 @@ static void audioout2_update_context_locked(AudioOut2ContextState* state) {
 		return;
 	}
 
-	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state->num_grains));
-	if (now <= state->last_update || grain_micros == 0) {
+	const auto grain = audioout2_grain_scaled(state->num_grains);
+	if (now <= state->last_update) {
 		return;
 	}
-
-	const auto ticks = (now - state->last_update) / grain_micros;
-	if (ticks == 0) {
+	const auto elapsed = (now - state->last_update) * AUDIO_OUT2_CLOCK_RATE;
+	if (elapsed < state->last_update_frac + grain) {
 		return;
 	}
+	const auto ticks = (elapsed - state->last_update_frac) / grain;
 
 	const auto drained = std::min<uint64_t>(state->queued, ticks);
 	state->queued -= static_cast<uint32_t>(drained);
 	if (ticks > drained) {
 		state->idle = true;
 	}
-	state->last_update += ticks * grain_micros;
+	const auto advance = state->last_update_frac + ticks * grain;
+	state->last_update += advance / AUDIO_OUT2_CLOCK_RATE;
+	state->last_update_frac = advance % AUDIO_OUT2_CLOCK_RATE;
 }
 
 static void audioout2_accept_grain_locked(AudioOut2ContextState* state) {
 	if (state->queued == 0 && state->idle) {
 		// The output ran dry, so its clock restarts with this grain.
-		state->last_update = LibKernel::KernelGetProcessTime();
-		state->idle        = false;
+		state->last_update      = LibKernel::KernelGetProcessTime();
+		state->last_update_frac = 0;
+		state->idle             = false;
 	}
 	if (state->queued < state->queue_depth) {
 		state->queued++;
@@ -375,8 +387,11 @@ static void audioout2_accept_grain_locked(AudioOut2ContextState* state) {
 static uint64_t audioout2_micros_to_next_tick_locked(const AudioOut2ContextState& state) {
 	const auto grain_micros = static_cast<uint64_t>(audioout2_grain_micros(state.num_grains));
 	const auto now          = LibKernel::KernelGetProcessTime();
-	const auto next_tick    = state.last_update + grain_micros;
-	return next_tick > now ? std::min(next_tick - now, grain_micros) : 1;
+	const auto next_tick =
+	    state.last_update + (state.last_update_frac + audioout2_grain_scaled(state.num_grains) +
+	                         AUDIO_OUT2_CLOCK_RATE - 1) /
+	                            AUDIO_OUT2_CLOCK_RATE;
+	return next_tick > now ? std::min(next_tick - now, grain_micros + 1) : 1;
 }
 
 // A synchronous push returns once the queue can take another grain; RE Engine yield-polls otherwise.
@@ -661,7 +676,7 @@ static bool audioout2_take_advanced_grain(AudioOut2ContextHandle ctx, AudioOut2G
 	return true;
 }
 
-static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking) {
+static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool blocking, bool cushion) {
 	std::shared_lock output_lock(g_audioout2_output_mutex);
 
 	AudioOut2Grain     grain;
@@ -684,7 +699,7 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 	}
 	if (!params.empty()) {
 		(void)AudioInternal::AudioOutOutputs(params.data(), static_cast<uint32_t>(params.size()),
-		                                     blocking);
+		                                     blocking, cushion);
 	}
 }
 
@@ -895,7 +910,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 				audioout2_accept_grain_locked(state);
 				g_audioout2_context_mutex.Unlock();
 				// Without a device the modelled queue is the only clock; don't sleep twice.
-				audioout2_queue_context_audio(ctx, use_device_clock);
+				audioout2_queue_context_audio(ctx, use_device_clock, blocking == 0);
 				if (blocking != 0 && !use_device_clock) {
 					audioout2_wait_for_free_slot(ctx);
 				}
