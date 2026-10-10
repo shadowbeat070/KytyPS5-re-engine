@@ -143,22 +143,6 @@ LIB_VERSION("AudioOut2", 1, "AudioOut", 1, 1);
 
 namespace AudioOut2 = Audio::AudioOut2;
 
-// Real name and signature unverified. This returns what the unresolved-import stub already
-// returned, so audio behaviour is unchanged; the first calls' arguments are logged to identify it.
-static int KYTY_SYSV_ABI AudioOut2UnknownIE8trxPKnAg(uint64_t arg0, uint64_t arg1, uint64_t arg2,
-                                                     uint64_t arg3, uint64_t arg4, uint64_t arg5) {
-	PRINT_NAME();
-
-	static std::atomic_uint32_t logged {0};
-	if (logged.fetch_add(1) < 4) {
-		LOGF("\t args = (0x%016" PRIx64 ", 0x%016" PRIx64 ", 0x%016" PRIx64 ", 0x%016" PRIx64
-		     ", 0x%016" PRIx64 ", 0x%016" PRIx64 ")\n",
-		     arg0, arg1, arg2, arg3, arg4, arg5);
-	}
-
-	return OK;
-}
-
 LIB_DEFINE(InitAudio_1_AudioOut2) {
 	LIB_FUNC("g2tViFIohHE", AudioOut2::AudioOut2Initialize);
 	LIB_FUNC("pDmme7Bgm6E", AudioOut2::AudioOut2ContextQueryMemory);
@@ -189,7 +173,6 @@ LIB_DEFINE(InitAudio_1_AudioOut2) {
 	LIB_FUNC("v8iOE+j8a5o", AudioOut2::AudioOut2MasteringSetParam);
 	LIB_FUNC("VZidxi2cYh0", AudioOut2::AudioOut2MasteringGetState);
 	LIB_FUNC("2bbBBOkH4CY", AudioOut2::AudioOut2MasteringTerm);
-	LIB_FUNC("iE8trxPKnAg", LibAudioOut2::AudioOut2UnknownIE8trxPKnAg);
 }
 
 } // namespace LibAudioOut2
