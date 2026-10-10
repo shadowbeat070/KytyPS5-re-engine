@@ -825,6 +825,7 @@ struct ResourcePlan {
 	std::vector<SrtRead>           srt_reads;
 	std::vector<SrtReadWriteOrder> srt_read_order;
 	std::vector<uint8_t>           clean_flat_slots;
+	std::vector<uint8_t>           data_flat_slots;
 	bool                           requires_specialization_memory = false;
 	bool                           capture_specialization_reads   = false;
 	bool                           srt_plan_complete              = false;

@@ -280,6 +280,10 @@ bool ReadShaderGuestMemoryPermissive(void*, uint64_t address, std::span<uint32_t
 	return true;
 }
 
+bool ShaderReadGpuOwned(void*, uint64_t address, uint64_t size) {
+	return Libs::LibKernel::Memory::HasGpuOwnedBytes(address, size);
+}
+
 bool ReadShaderLine(uint64_t address, void* data, uint64_t size) {
 	return Libs::Graphics::GuestRange {address, size}.Valid() &&
 	       Libs::LibKernel::Memory::TryReadGpuCleanBacking(address, data, size);
@@ -876,6 +880,7 @@ struct PipelineCache::ProgramCache {
 		read_cache.Reset();
 		static const bool no_read_cache = EnvSwitch("KYTY_NO_SHADER_READ_CACHE");
 		static const bool no_heap_hash  = EnvSwitch("KYTY_NO_HEAP_HASH_IN_PLACE");
+		static const bool                no_gpu_owned  = EnvSwitch("KYTY_NO_GPU_OWNED_NATIVE");
 		ShaderRecompiler::IR::SrtRuntime runtime {
 		    .user_data   = user_data,
 		    .shader_base = params.Base(),
@@ -888,6 +893,7 @@ struct PipelineCache::ProgramCache {
 		    .describe_read_refusal     = DescribeShaderReadRefusal,
 		    .hash_specialization_block = no_heap_hash ? nullptr : HashShaderGuestBlock,
 		    .read_condition_memory     = ReadShaderGuestMemoryClean,
+		    .gpu_owned                 = no_gpu_owned ? nullptr : ShaderReadGpuOwned,
 		};
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;

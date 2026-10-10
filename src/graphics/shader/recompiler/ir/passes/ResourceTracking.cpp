@@ -956,6 +956,72 @@ private:
 		return false;
 	}
 
+	struct HostEvaluated {
+		std::unordered_set<const Inst*> strict;
+		std::unordered_set<const Inst*> decodable;
+	};
+
+	HostEvaluated HostEvaluatedValues() const {
+		HostEvaluated result;
+		const auto    close = [](std::unordered_set<const Inst*>& needed, auto&& roots) {
+			std::vector<const Inst*> pending;
+			const auto               need = [&](Value value) {
+				if (value.IsEmpty()) return;
+				const auto* inst = value.Resolve().TryInstruction();
+				if (inst != nullptr && needed.insert(inst).second) pending.push_back(inst);
+			};
+			roots(need);
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+					need(inst->Arg(arg));
+			}
+		};
+		const auto handles = [&](bool decodable) {
+			return [&, decodable](auto&& need) {
+				for (auto* block: m_program.blocks) {
+					for (auto& inst: *block) {
+						const auto op                = inst.GetOpcode();
+						const bool buffer_or_address = op == ValueOpcode::GetAddressResource ||
+						                               op == ValueOpcode::GetBufferResource;
+						const bool image_or_sampler  = op == ValueOpcode::GetImageResource ||
+						                               op == ValueOpcode::GetSamplerResource;
+						if (decodable ? buffer_or_address : image_or_sampler) {
+							for (uint32_t arg = 0; arg < inst.NumArgs(); ++arg)
+								need(inst.Arg(arg));
+						}
+					}
+				}
+				if (!decodable) {
+					for (const auto& info: m_program.block_info)
+						need(info.indirect_target);
+				}
+			};
+		};
+		close(result.strict, handles(false));
+		close(result.decodable, handles(true));
+		return result;
+	}
+
+	bool ReadsUnfoldableScalar(const Inst& handle) const {
+		std::vector<const Inst*>        pending {&handle};
+		std::unordered_set<const Inst*> seen;
+		while (!pending.empty() && seen.size() < 256u) {
+			const auto* inst = pending.back();
+			pending.pop_back();
+			if (!seen.insert(inst).second) continue;
+			if (inst != &handle && inst->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+			    std::ranges::find(m_program.unfoldable_pcs, inst->Flags<MemoryFlags>().pc) !=
+			        m_program.unfoldable_pcs.end())
+				return true;
+			for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg)
+				if (const auto* operand = inst->Arg(arg).Resolve().TryInstruction())
+					pending.push_back(operand);
+		}
+		return false;
+	}
+
 	void PlanScalarReads() {
 		m_program.srt_plan_complete = false;
 		m_program.srt_reads.clear();
@@ -1016,6 +1082,8 @@ private:
 			}
 		}
 		m_cyclic_entries = {};
+		const auto host_needed = HostEvaluatedValues();
+		m_program.data_flat_slots.clear();
 		for (auto* read: m_scalar_reads) {
 			const auto flags = read->Flags<MemoryFlags>();
 			if (std::ranges::find(m_program.unfoldable_pcs, flags.pc) !=
@@ -1045,7 +1113,19 @@ private:
 				if (same) break;
 			}
 			const bool keep = slot == m_program.srt_reads.size();
-			if (keep) m_program.srt_reads.push_back({Value(read), slot});
+			// 0: the host needs the word; 1: data only; 2: a buffer or address handle word.
+			const uint8_t kind = read->GetOpcode() != ValueOpcode::LoadAddressU32 ||
+			                             host_needed.strict.contains(read)
+			                         ? 0u
+			                     : host_needed.decodable.contains(read) ? 2u
+			                                                            : 1u;
+			if (keep) {
+				m_program.srt_reads.push_back({Value(read), slot});
+				m_program.data_flat_slots.push_back(kind);
+			} else {
+				auto& merged = m_program.data_flat_slots[slot];
+				merged       = merged == 0u || kind == 0u ? 0u : std::max(merged, kind);
+			}
 			auto*      block = read->Parent();
 			auto&      list  = block->Instructions();
 			const auto where =
@@ -3448,6 +3528,11 @@ private:
 					source = planned->source;
 					m_applied_indirect_buffers.insert(carried);
 				}
+			}
+			if (handle != nullptr && !m_applied_indirect_buffers.contains(handle) &&
+			    ReadsUnfoldableScalar(*handle) &&
+			    TakeDynamicBuffer(handle, memory, flags.index, buffer, flags.pc)) {
+				return true;
 			}
 			// A descriptor materialization named as unprovable is decoded in the shader on rebuild.
 			if (handle != nullptr && !m_applied_indirect_buffers.contains(handle) &&

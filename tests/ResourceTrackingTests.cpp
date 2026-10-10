@@ -2649,6 +2649,148 @@ void TestDynamicStorageMipTracking() {
         "an inverted dynamic storage mip range was accepted");
 }
 
+// RESIDENT EVIL 3's cs 0x9ff42d53da1c03e7 reads a record the dispatch before wrote: an element
+// count at +144 that bounds its threads, and at +168 the V# of the buffer it rewrites. Neither
+// needs the host once the count stays a native load and the V# is decoded in the shader; a word
+// that only an image descriptor uses still has to be read on the host.
+struct OwnedTestMemory {
+  LinearTestMemory memory;
+  uint64_t owned_begin = 0;
+  uint64_t owned_end = 0;
+};
+
+bool ReadOwnedTestMemory(void *userdata, uint64_t address, std::span<uint32_t> values) {
+  return ReadLinearTestMemory(&static_cast<OwnedTestMemory *>(userdata)->memory, address,
+                              values);
+}
+
+bool OwnedTestRange(void *userdata, uint64_t address, uint64_t size) {
+  const auto *memory = static_cast<OwnedTestMemory *>(userdata);
+  return address < memory->owned_end && memory->owned_begin < address + size;
+}
+
+void TestGpuOwnedScalarDataStaysNative() {
+  constexpr uint32_t count_pc = 8;
+  constexpr uint32_t descriptor_pc = 12;
+  constexpr uint32_t image_word_pc = 16;
+  struct Shape {
+    std::unique_ptr<Fixture> fixture;
+    Value count;
+    std::array<Value, 4> descriptor;
+    Value image_word;
+    uint32_t buffer_memory = 0;
+  };
+  const auto build = [](std::vector<uint32_t> unfoldable) {
+    Shape shape;
+    shape.fixture = std::make_unique<Fixture>();
+    auto &fixture = *shape.fixture;
+    fixture.program.unfoldable_pcs = std::move(unfoldable);
+    const auto record = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+    const auto scalar = [&](uint32_t offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = offset;
+      return fixture.Emit(ValueOpcode::LoadAddressU32,
+                          {record, Value(0u), Value(0u), Value(true)},
+                          fixture.AddMemory(memory, pc));
+    };
+    shape.count = scalar(144, count_pc);
+    for (uint32_t word = 0; word < 4; ++word) {
+      shape.descriptor[word] = scalar(168 + word * 4u, descriptor_pc);
+    }
+    shape.image_word = scalar(200, image_word_pc);
+    fixture.program.block_info[0].condition =
+        fixture.Emit(ValueOpcode::SGreaterThan32, {shape.count, Value(3u)});
+    fixture.Emit(ValueOpcode::IAdd32, {shape.count, Value(1u)});
+    MemoryInfo buffer;
+    buffer.kind = ResourceKind::Buffer;
+    shape.buffer_memory = static_cast<uint32_t>(fixture.program.memory_info.size());
+    fixture.Emit(ValueOpcode::LoadBufferU32,
+                 {fixture.Buffer(shape.descriptor, 20), Value(0u), Value(0u), Value(0u),
+                  Value(true)},
+                 fixture.AddMemory(buffer, 20));
+    std::array<Value, 8> image_words{shape.image_word};
+    for (uint32_t word = 1; word < image_words.size(); ++word) {
+      image_words[word] = fixture.UserData(word + 1u);
+    }
+    MemoryInfo image;
+    image.kind = ResourceKind::Image;
+    image.image_dimension = Decoder::ImageDimension::Dim2D;
+    fixture.Emit(ValueOpcode::ImageSampleRaw,
+                 {fixture.Image(image_words, 24),
+                  fixture.Sampler({Value(0u), Value(1u), Value(2u), Value(0x1111u)}, 24),
+                  fixture.ImageAddress()},
+                 fixture.AddMemory(image, 24));
+    fixture.PlanAndTrack();
+    return shape;
+  };
+  const auto kind_of = [](const Program &program, Value value) {
+    for (uint32_t slot = 0; slot < program.srt_reads.size(); ++slot) {
+      if (program.srt_reads[slot].value.Resolve() == value.Resolve()) {
+        return static_cast<int>(program.data_flat_slots[slot]);
+      }
+    }
+    return -1;
+  };
+
+  auto shape = build({});
+  const auto &program = shape.fixture->program;
+  Check(program.data_flat_slots.size() == program.srt_reads.size() &&
+            kind_of(program, shape.count) == 1 && kind_of(program, shape.image_word) == 0,
+        "the count was not forwarded data or the image word was not the host's");
+  for (const auto &word : shape.descriptor) {
+    Check(kind_of(program, word) == 2, "a V# word was not classified decodable");
+  }
+
+  std::array<uint32_t, 10> user_data{0x1000u, 0u};
+  OwnedTestMemory owned;
+  const auto word = [&](uint32_t offset) -> uint32_t & {
+    return owned.memory.words[offset / sizeof(uint32_t)];
+  };
+  word(144) = 64u;
+  word(168) = 0x4000u;
+  word(176) = 256u;
+  word(200) = 0x8000u;
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadOwnedTestMemory,
+                     .userdata = &owned,
+                     .gpu_owned = OwnedTestRange};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  auto plan = ExtractResourcePlan(program);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "the clean record was not materialized");
+
+  owned.owned_begin = 0x1000u;
+  owned.owned_end = 0x1100u;
+  std::vector<uint32_t> refused;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization, &refused),
+        "a record the GPU owns was read on the host");
+  std::ranges::sort(refused);
+  const auto last = std::ranges::unique(refused);
+  refused.erase(last.begin(), last.end());
+  Check(refused == std::vector<uint32_t>{count_pc, descriptor_pc},
+        "one walk did not name both the count and the V# for a native load, or named the "
+        "image word");
+
+  auto rebuilt = build(refused);
+  const auto &rebuilt_program = rebuilt.fixture->program;
+  Check(kind_of(rebuilt_program, rebuilt.count) == -1 &&
+            kind_of(rebuilt_program, rebuilt.descriptor[0]) == -1 &&
+            kind_of(rebuilt_program, rebuilt.image_word) == 0,
+        "the rebuild still flattened a refused read, or lost the image word");
+  Check(rebuilt_program.memory_info[rebuilt.buffer_memory].dynamic_buffer &&
+            rebuilt_program.info.uses_dma,
+        "the buffer whose V# the GPU owned was not decoded in the shader");
+  const auto reads = owned.memory.reads;
+  ResourceSnapshot rebuilt_snapshot;
+  ResourceSpecialization rebuilt_specialization;
+  Check(MaterializeResources(ExtractResourcePlan(rebuilt_program), runtime, rebuilt_snapshot,
+                             rebuilt_specialization) &&
+            owned.memory.reads > reads && rebuilt_snapshot.images.size() == 1,
+        "the rebuilt shader did not materialize, or skipped the image word the host needs");
+}
+
 void TestSrtFlatteningAndRuntimeMemoization() {
   Fixture fixture;
   const auto base =
@@ -5876,6 +6018,7 @@ int main() {
     Run("bounded relative register writes", TestBoundedRelativeRegisterWrites);
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("DMA pointer from SRT", TestDmaPointerFromSrt);
+    Run("GPU-owned scalar data stays native", TestGpuOwnedScalarDataStaysNative);
     Run("scalar read slot order", TestScalarReadSlotOrder);
     Run("deep planning value chain", TestDeepPlanningValueChain);
     Run("deep uniform value chain", TestDeepUniformValueChain);

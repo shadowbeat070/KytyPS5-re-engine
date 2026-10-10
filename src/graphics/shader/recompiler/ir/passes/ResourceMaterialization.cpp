@@ -2491,6 +2491,7 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	for (const auto& read: program.srt_reads) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
+	plan.data_flat_slots = program.data_flat_slots;
 	plan.srt_read_order = OrderSrtReadsAgainstWrites(program);
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
@@ -2709,9 +2710,16 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 	                              observed.read_condition_memory != nullptr ? &conditions
 	                                                                        : nullptr)) {
 		// A hoisted read whose own address never evaluates stays a native load on rebuild.
+		if (refused_tables != nullptr) {
+			for (const auto slot: flat_failure.gpu_owned_slots) {
+				const auto* read = program.srt_reads[slot].value.Resolve().TryInstruction();
+				refused_tables->push_back(read->Flags<MemoryFlags>().pc);
+			}
+		}
 		if (refused_tables != nullptr &&
 		    flat_failure.stage == FlatRefreshFailure::Stage::ValueUnevaluable &&
-		    flat_failure.raw_read == RawReadReject::HandleOperandUnavailable &&
+		    (flat_failure.raw_read == RawReadReject::HandleOperandUnavailable ||
+		     flat_failure.raw_read == RawReadReject::GpuOwned) &&
 		    flat_failure.flat_offset < program.srt_reads.size()) {
 			if (const auto* read =
 			        program.srt_reads[flat_failure.flat_offset].value.Resolve().TryInstruction();
