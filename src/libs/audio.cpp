@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <vector>
@@ -127,6 +128,7 @@ private:
 		bool        queue_primed = false;
 		int         channels_num = 0;
 		int         volume[12]   = {};
+		bool        downmix_stereo = false;
 
 		SDL_AudioStream*                      stream  = nullptr;
 		Controller::DualSenseHaptics::Stream* haptics = nullptr;
@@ -167,6 +169,17 @@ private:
 };
 
 static Audio* g_audio = nullptr;
+
+static double g_audio_lfe_mix = [] {
+	const char* value = std::getenv("KYTY_AUDIO_LFE_MIX");
+	return value != nullptr && value[0] == '1' ? 0.31622776601683794 : 0.0;
+}();
+
+static double g_audio_output_gain = [] {
+	const char* value = std::getenv("KYTY_AUDIO_GAIN_DB");
+	const auto  db    = value != nullptr && value[0] != '\0' ? std::strtod(value, nullptr) : 0.0;
+	return std::pow(10.0, std::clamp(db, -40.0, 20.0) / 20.0);
+}();
 
 static double audio_soft_limit(double sample) {
 	constexpr double knee      = 0.9;
@@ -264,7 +277,7 @@ uint32_t Audio::BytesPerSample(Format format) {
 
 uint32_t Audio::OutputChannels(const PortOut& port) {
 	// SDL only takes up to 8 channels. Keep the guest buffer's channel count separate.
-	return std::min(port.channels_num, 8);
+	return port.downmix_stereo ? 2u : static_cast<uint32_t>(std::min(port.channels_num, 8));
 }
 
 SDL_AudioFormat Audio::SdlFormat(Format format) {
@@ -278,6 +291,14 @@ bool Audio::OpenSdlDevice(PortOut* port) {
 		LOGF("AudioOut: SDL audio init failed: %s\n", SDL_GetError());
 		return false;
 	}
+
+	// SDL's own surround-to-stereo matrix is normalized (front -13.5 dB, centre -16.5 dB).
+	SDL_AudioSpec device {};
+	int           device_frames = 0;
+	port->downmix_stereo =
+	    port->channels_num > 2 &&
+	    SDL_GetAudioDeviceFormat(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &device, &device_frames) &&
+	    device.channels > 0 && device.channels <= 2;
 
 	SDL_AudioSpec desired {};
 	desired.freq     = static_cast<int>(port->freq);
@@ -334,7 +355,7 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		volume_changed |= scales[ch] != 1.0;
 	}
 
-	if (!volume_changed && !reorder) {
+	if (!volume_changed && !reorder && !port.downmix_stereo) {
 		return data;
 	}
 
@@ -342,6 +363,45 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 
 	// SDL wants back speakers before side speakers; non-STD PCM has them reversed.
 	static constexpr uint32_t SDL_8CH_MAP[8] = {0, 1, 2, 3, 6, 7, 4, 5};
+
+	if (port.downmix_stereo) {
+		// ITU-R BS.775 fold of the SDL-ordered 7.1 frame (FL FR FC LFE BL BR SL SR).
+		constexpr double half_power = 0.70710678118654752;
+		const bool       is_float   = FormatIsFloat(port.format);
+		const auto       read       = [&](uint32_t frame, uint32_t ch) {
+			const auto   index  = frame * channels + ch;
+			const double sample = is_float ? static_cast<const float*>(data)[index]
+			                               : static_cast<const int16_t*>(data)[index] / 32768.0;
+			return sample * scales[ch];
+		};
+		for (uint32_t frame = 0; frame < frames; frame++) {
+			std::array<double, 8> surround {};
+			for (uint32_t ch = 0; ch < std::min(channels, 8u); ch++) {
+				surround[ch] = read(frame, reorder ? SDL_8CH_MAP[ch] : ch);
+			}
+			if (channels == 12) {
+				static constexpr uint32_t HEIGHT_DST[4] = {0, 1, 4, 5};
+				for (uint32_t ch = 0; ch < 4; ch++) {
+					surround[HEIGHT_DST[ch]] += read(frame, 8 + ch);
+				}
+			}
+			const double lfe      = g_audio_lfe_mix * surround[3];
+			const double mixed[2] = {
+			    surround[0] + half_power * (surround[2] + surround[4] + surround[6]) + lfe,
+			    surround[1] + half_power * (surround[2] + surround[5] + surround[7]) + lfe};
+			for (uint32_t ch = 0; ch < 2; ch++) {
+				const double sample = audio_soft_limit(mixed[ch]);
+				if (is_float) {
+					reinterpret_cast<float*>(buffer->data())[frame * 2 + ch] =
+					    static_cast<float>(sample);
+				} else {
+					reinterpret_cast<int16_t*>(buffer->data())[frame * 2 + ch] =
+					    static_cast<int16_t>(std::clamp(sample * 32768.0, -32768.0, 32767.0));
+				}
+			}
+		}
+		return buffer->data();
+	}
 
 	if (FormatIsFloat(port.format)) {
 		auto*       dst = reinterpret_cast<float*>(buffer->data());
@@ -571,7 +631,7 @@ uint32_t Audio::AudioOutOutputs(OutputParam* params, uint32_t num, bool blocking
 		        ? Controller::GetSettingScale(Controller::Setting::SpeakerVolume)
 		    : port.type == AUDIO_OUT_PORT_TYPE_VIBRATION
 		        ? Controller::GetSettingScale(Controller::Setting::VibrationIntensity)
-		        : 1.0f;
+		        : static_cast<float>(g_audio_output_gain);
 
 		uint64_t controller_queued_us = 0;
 		bool controller_uses_bluetooth = false;
