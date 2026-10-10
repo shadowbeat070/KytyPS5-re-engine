@@ -156,6 +156,10 @@ public:
 	[[nodiscard]] std::span<const std::pair<uint64_t, uint64_t>> SupersededRanges() const noexcept {
 		return m_superseded;
 	}
+	[[nodiscard]] bool SupersededAfterLastGpuWrite() const noexcept {
+		return IsSuperseded() && m_superseded_epoch > m_gpu_write_epoch;
+	}
+	void ClearSuperseded() noexcept { m_superseded.clear(); }
 	void ClearBufferModified() noexcept { m_buffer_modified = false; }
 
 	[[nodiscard]] bool Overlaps(uint64_t address, uint64_t size,
@@ -235,6 +239,7 @@ private:
 	uint64_t                                   m_gpu_write_epoch    = 0;
 	uint64_t                                   m_buffer_write_epoch = 0;
 	std::vector<std::pair<uint64_t, uint64_t>> m_superseded;
+	uint64_t                                   m_superseded_epoch = 0;
 	bool                                       m_gpu_modified    = false;
 	bool                                       m_buffer_modified = false;
 	bool                                       m_backing_failed  = false;

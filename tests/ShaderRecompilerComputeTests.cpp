@@ -4603,6 +4603,188 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // A partial GPU buffer write over a GPU image leaves the overwritten bytes superseded. Those
+  // ranges are newer than the image only until the image is written again, and must never stop
+  // the rest of the image from reaching the buffer.
+  void CheckSupersedeReconcile() {
+    constexpr const char *name = "SupersedeReconcile";
+    constexpr uintptr_t base = 0x000000020b600000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t allocation_alignment = 0x10000;
+    constexpr uint32_t texels = 64;
+    constexpr uint64_t image_bytes = texels * sizeof(uint32_t);
+    EnsureRuntimeContext();
+    RenderContext context(m_runtime_context);
+    auto &scheduler = context.GetCommandScheduler();
+    HW::Context registers{};
+    HW::UserConfig user_config{};
+    HW::Shader shaders{};
+    scheduler.Begin(registers, user_config, shaders);
+    context.InitializeGpu(nullptr);
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_alignment, 0, &direct_offset) == 0,
+            "supersede test direct-memory allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset,
+                allocation_alignment) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "fixed supersede test mapping failed");
+    std::memset(mapped, 0, allocation_size);
+    {
+      auto &resources = context;
+      LibKernel::Memory::InstallGpuResources(&resources);
+      auto &texture_cache = resources.GetTextureCache();
+      auto &buffer_cache = resources.GetBufferCache();
+      resources.MapMemory(base, allocation_size);
+
+      const auto Desc = [&](uint64_t address) {
+        return MakeLinearDesc(address, image_bytes, vk::Format::eR32Uint,
+                              Prospero::BufferFormat::k32UInt,
+                              Prospero::ImageType::kColor2D, {texels, 1, 1}, 1,
+                              sizeof(uint32_t), 1);
+      };
+      const auto Paint = [&](ImageId id, uint32_t value) {
+        vk::ClearValue clear{};
+        clear.color.uint32 = std::array{value, 0u, 0u, 0u};
+        TextureCacheTestAccess::ClearImage(texture_cache, scheduler.Current(), id,
+                                           {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1},
+                                           clear);
+      };
+      const auto BufferWrite = [&](uint64_t address, uint64_t size, uint32_t value) {
+        auto writable = buffer_cache.ObtainBuffer(address, size, true, false);
+        writable.first->Fill(writable.second, size, value);
+        texture_cache.InvalidateMemoryFromGPU(address, size);
+      };
+      const auto ReadDevice = [&](const Libs::Graphics::Buffer &source, uint64_t offset = 0) {
+        auto readback = CreateHostBuffer(name, image_bytes,
+                                         vk::BufferUsageFlagBits::eTransferDst, {});
+        auto &command = scheduler.Current();
+        command.EndRendering();
+        vk::MemoryBarrier before{};
+        before.srcAccessMask = vk::AccessFlagBits::eMemoryWrite;
+        before.dstAccessMask = vk::AccessFlagBits::eTransferRead;
+        command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+                                         vk::PipelineStageFlagBits::eTransfer, {}, 1, &before,
+                                         0, nullptr, 0, nullptr);
+        const vk::BufferCopy copy{offset, 0, image_bytes};
+        command.Handle().copyBuffer(source.Handle(), readback.buffer, 1, &copy);
+        vk::MemoryBarrier after{};
+        after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+        after.dstAccessMask = vk::AccessFlagBits::eHostRead;
+        command.Handle().pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+                                         vk::PipelineStageFlagBits::eHost, {}, 1, &after, 0,
+                                         nullptr, 0, nullptr);
+        scheduler.Finish();
+        auto values = ReadBuffer(name, readback, texels);
+        DestroyBuffer(&readback);
+        return values;
+      };
+      const auto Expect = [&](uint32_t value, uint32_t first, uint32_t count,
+                              uint32_t inner) {
+        std::vector<u32> expected(texels, value);
+        std::fill_n(expected.begin() + first, count, inner);
+        return expected;
+      };
+
+      // Kill switch: a superseded image refuses its write-back, as it always did.
+      TextureCache::OverrideSupersedeReconcile(false);
+      {
+        auto desc = Desc(base);
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(id, desc);
+        Paint(id, 0x11111111u);
+        BufferWrite(base + 128, 16, 0x22222222u);
+        Paint(id, 0x33333333u);
+        Libs::Graphics::Buffer target(m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+                                      base, AllFlags, image_bytes);
+        Require(name, "kill switch keeps the old refusal",
+                texture_cache.GetImage(id).IsSuperseded() &&
+                    !BufferCacheTestAccess::SynchronizeBufferFromImage(buffer_cache, target, base,
+                                                                       image_bytes),
+                "KYTY_NO_SUPERSEDE_RECONCILE did not restore the superseded refusal");
+        texture_cache.UnmapMemory(base, image_bytes);
+      }
+      TextureCache::OverrideSupersedeReconcile(true);
+
+      // The RE3 refraction copy: the image is drawn again after the partial buffer write, so it
+      // owns every byte once more and a raw read must see the new frame.
+      {
+        const uint64_t address = base + 0x10000;
+        auto desc = Desc(address);
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(id, desc);
+        Paint(id, 0x11111111u);
+        BufferWrite(address + 128, 16, 0x22222222u);
+        Require(name, "partial write supersedes",
+                texture_cache.GetImage(id).SupersededAfterLastGpuWrite(),
+                "a partial buffer write did not supersede the GPU image bytes");
+        Paint(id, 0x33333333u);
+        Libs::Graphics::Buffer target(m_runtime_context, scheduler, MemoryUsage::DeviceLocal,
+                                      address, AllFlags, image_bytes);
+        const bool synced = BufferCacheTestAccess::SynchronizeBufferFromImage(
+            buffer_cache, target, address, image_bytes);
+        Require(name, "redrawn image writes back",
+                synced && !texture_cache.GetImage(id).IsSuperseded() &&
+                    ReadDevice(target) == std::vector<u32>(texels, 0x33333333u),
+                "an image drawn after a partial buffer write still refused its write-back, or "
+                "wrote back the stale superseded bytes");
+        texture_cache.UnmapMemory(address, image_bytes);
+      }
+
+      // No draw since the buffer write: the write-back keeps the newer buffer bytes, and the
+      // next lookup folds them into the image before anything draws over part of it.
+      {
+        const uint64_t address = base + 0x20000;
+        auto desc = Desc(address);
+        const auto id = texture_cache.FindImage(desc);
+        (void)texture_cache.FindTexture(id, desc);
+        Paint(id, 0x44444444u);
+        BufferWrite(address + 64, 32, 0x55555555u);
+        // The guest buffer the partial write landed in, as a raw read of the range would see it.
+        auto guest = buffer_cache.ObtainBuffer(address, image_bytes, false, false);
+        const bool synced = BufferCacheTestAccess::SynchronizeBufferFromImage(
+            buffer_cache, *guest.first, address, image_bytes);
+        Require(name, "write-back rides around superseded bytes",
+                synced && texture_cache.GetImage(id).SupersededAfterLastGpuWrite() &&
+                    ReadDevice(*guest.first, guest.second) ==
+                        Expect(0x44444444u, 16, 8, 0x55555555u),
+                "a write-back overwrote bytes a newer buffer write owns");
+
+        auto again = Desc(address);
+        const auto reconciled = texture_cache.FindImage(again);
+        const auto &image = texture_cache.GetImage(reconciled);
+        Require(name, "lookup reconciles",
+                reconciled == id && !image.IsSuperseded() && image.IsBufferModified() &&
+                    !image.IsGpuModified(),
+                "a lookup left the superseded image split between buffer and image");
+        (void)texture_cache.FindTexture(reconciled, again);
+        Require(name, "reconciled image holds both writes",
+                ReadCachedTexel(name, context, reconciled, {}, {texels, 1, 1}) ==
+                    Expect(0x44444444u, 16, 8, 0x55555555u),
+                "the refreshed image lost its own pixels or the newer buffer bytes");
+        texture_cache.UnmapMemory(address, image_bytes);
+      }
+      TextureCache::OverrideSupersedeReconcile(std::nullopt);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+      LibKernel::Memory::InstallGpuResources(nullptr);
+    }
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "supersede test mapping release failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "supersede test allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   void CheckTextureCacheCollectorProgress() {
     constexpr const char *name = "TextureCacheCollectorProgress";
     constexpr uintptr_t base = 0x0000000208800000ull;
@@ -50684,6 +50866,11 @@ int main(int argc, char **argv) {
     vulkan.CheckDepthColorTwin();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--supersede-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckSupersedeReconcile();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--image-transition-only") == 0) {
     VulkanHarness vulkan;
     CheckImageTransitionState(vulkan.RuntimeRenderer());
@@ -50869,6 +51056,7 @@ int main(int argc, char **argv) {
   vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckUnifiedTextureCacheFlow();
   vulkan.CheckDepthColorTwin();
+  vulkan.CheckSupersedeReconcile();
   vulkan.CheckMetaSliceClears();
   vulkan.CheckUnifiedImageViewCache();
   vulkan.CheckPackedTextureComponents();

@@ -94,6 +94,8 @@ public:
 	enum class BindingType : uint8_t { Texture, Storage, RenderTarget, DepthTarget, VideoOut };
 
 	static void OverrideStencilPlaneRedirect(std::optional<bool> enabled);
+	static void OverrideSupersedeReconcile(std::optional<bool> enabled,
+	                                       std::optional<bool> at_base = std::nullopt);
 
 	struct ImageDesc {
 		ImageInfo     info;

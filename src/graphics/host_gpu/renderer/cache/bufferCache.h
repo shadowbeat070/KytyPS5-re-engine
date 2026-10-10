@@ -85,6 +85,7 @@ public:
 	}
 	[[nodiscard]] std::pair<Buffer*, uint64_t> ObtainBufferForImage(uint64_t vaddr, uint64_t size);
 	void FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool is_gds);
+	void ReconcileSupersededImage(Common::SlotId id);
 	// Repeats a pattern of `words` dwords over the range; size is a multiple of the pattern.
 	void FillBufferPattern(uint64_t vaddr, uint64_t size, const uint32_t* pattern, uint32_t words);
 	void WriteMemory(uint64_t vaddr, const void* data, uint64_t size);
@@ -165,6 +166,8 @@ private:
 	                                      std::vector<std::pair<uint64_t, uint64_t>>& unbacked);
 	[[nodiscard]] bool SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                              bool whole_image = false);
+	[[nodiscard]] bool       WriteBackImage(Buffer& buffer, Common::SlotId id, uint64_t size,
+	                                        bool whole_image);
 	// Synchronous downloads publish before returning; asynchronous callers wait before reuse.
 	template <bool async>
 	[[nodiscard]] bool DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t size);
