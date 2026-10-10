@@ -4,6 +4,7 @@
 #include "graphics/shader/shader.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <cstdlib>
 #include <cstring>
 
 namespace Libs::Graphics {
@@ -106,6 +107,14 @@ bool HasShaderBufferWrites(const ShaderStageRuntime& runtime) {
 		has_writes |= descriptor.Base48() != 0 && descriptor.NumRecords() != 0;
 	}
 	return has_writes;
+}
+
+bool GuestSyncOnly() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_GUEST_SYNC_ONLY");
+		return text != nullptr && std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
 }
 
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
