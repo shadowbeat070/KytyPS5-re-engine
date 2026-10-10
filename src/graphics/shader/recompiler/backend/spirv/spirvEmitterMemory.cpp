@@ -560,9 +560,17 @@ uint32_t LoadSubwordInBounds(ValueEmitContext& ctx, const MemoryResourceAccess& 
                              uint32_t address, uint32_t index, uint32_t bits, bool sign_extend,
                              bool is_volatile = false);
 
+bool DeviceBoundsChecked(const EmitterState& state, const MemoryResourceAccess& resource) {
+	return state.program.robust_buffer_access2 && (resource.kind == IR::ResourceKind::Buffer ||
+	                                               resource.kind == IR::ResourceKind::ScalarBuffer);
+}
+
 uint32_t LoadWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                           const MemoryResourceAccess& resource) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (DeviceBoundsChecked(ctx.state, resource)) {
+		return LoadWordInBounds(ctx, resource, index, mem.glc);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index),
 	    [&]() { return LoadWordInBounds(ctx, resource, index, mem.glc); });
@@ -586,6 +594,9 @@ uint32_t LoadSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const 
 	const auto address = ByteAddress(ctx, inst, mem);
 	const auto index   = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	                            ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
+	if (DeviceBoundsChecked(ctx.state, resource)) {
+		return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend, mem.glc);
+	}
 	return EmitValueOrZeroIfCondition(
 	    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		    return LoadSubwordInBounds(ctx, resource, address, index, bits, sign_extend, mem.glc);
@@ -787,6 +798,11 @@ void StoreSubwordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR:
 	const auto address = ByteAddress(ctx, inst, mem);
 	const auto index   = Binary(ctx.state, spv::OpShiftRightLogical, TypeU32(ctx.state), address,
 	                            ConstantU32(ctx.state, std::countr_zero(resource.element_bits / 8u)));
+	// A wider element is stored by an atomic loop, which robustness leaves undefined out of range.
+	if (DeviceBoundsChecked(ctx.state, resource) && resource.element_bits < 32u) {
+		StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
+		return;
+	}
 	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		StoreSubwordInBounds(ctx, mem, resource, address, index, bits, data);
 	});
@@ -862,6 +878,10 @@ void StoreLocalFlat(ValueEmitContext& ctx, const IR::Inst& inst) {
 void StoreWordPrepared(ValueEmitContext& ctx, const IR::Inst& inst, const IR::MemoryInfo& mem,
                        const MemoryResourceAccess& resource, uint32_t data) {
 	const auto index = DwordIndex(ctx, inst, mem);
+	if (DeviceBoundsChecked(ctx.state, resource)) {
+		StoreWordInBounds(ctx, resource, index, data);
+		return;
+	}
 	EmitIfCondition(ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
 		StoreWordInBounds(ctx, resource, index, data);
 	});
@@ -2073,6 +2093,7 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto element   = Binary(state, spv::OpIAdd, TypeU32(state), index,
 		                              Binary(state, spv::OpShiftRightLogical, TypeU32(state),
 		                                     access.byte_offset, ConstantU32(state, 2)));
+		// Kept under robustness2: a scalar offset that wraps 32 bits lands back in range.
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
 		return EmitValueOrZeroIfCondition(state, condition, [&]() {
 			return LoadResourceWord(state, access, state.builder.AllocateId(),

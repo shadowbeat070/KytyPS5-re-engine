@@ -1301,14 +1301,15 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 		}
 	}
 	Frontend::TranslateOptions translate_options {
-	    .stage              = options.stage,
-	    .wave_size          = options.wave_size,
-	    .host_subgroup_size = options.host_subgroup_size,
-	    .shader_hash        = options.shader_hash,
-	    .user_data_base     = options.user_data_base,
-	    .user_data_count    = static_cast<uint32_t>(options.user_data.size()),
-	    .input_info         = options.input_info,
-	    .embedded_fetch     = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
+	    .stage                 = options.stage,
+	    .wave_size             = options.wave_size,
+	    .host_subgroup_size    = options.host_subgroup_size,
+	    .robust_buffer_access2 = options.robust_buffer_access2,
+	    .shader_hash           = options.shader_hash,
+	    .user_data_base        = options.user_data_base,
+	    .user_data_count       = static_cast<uint32_t>(options.user_data.size()),
+	    .input_info            = options.input_info,
+	    .embedded_fetch        = embedded_fetch.loads.empty() ? nullptr : &embedded_fetch,
 	};
 	LOGF("%s phase begin: stage=%s hash=0x%016" PRIx64 " IR TranslateProgram\n",
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash);
