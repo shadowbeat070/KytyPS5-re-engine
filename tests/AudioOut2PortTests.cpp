@@ -552,6 +552,68 @@ void TestAdvancedGrainsPushInOrder() {
 	AudioOut2::AudioOut2ContextDestroy(context);
 }
 
+void TestAdvanceWithoutNewPcmIsSilent() {
+	const auto                     context = CreateContext();
+	const auto                     param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle port    = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "port create failed");
+
+	std::vector<float> pcm(512 * 2, 0.25f);
+	const auto         pcm_bytes = pcm.size() * sizeof(float);
+	CaptureOutputPcm(pcm_bytes);
+
+	SetPcm(port, pcm.data());
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "first advance failed");
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "stale advance failed");
+	SetPcm(port, pcm.data());
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "refreshed advance failed");
+	for (int push = 0; push < 3; push++) {
+		Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "push failed");
+	}
+
+	const auto output = OutputPcm();
+	Check(output.size() == 3, "every advance should output a grain");
+	Check(std::memcmp(output[0].data(), pcm.data(), pcm_bytes) == 0,
+	      "first advance did not output its PCM");
+	Check(std::all_of(output[1].begin(), output[1].end(), [](uint8_t b) { return b == 0; }),
+	      "an advance without new PCM replayed the previous grain");
+	Check(std::memcmp(output[2].data(), pcm.data(), pcm_bytes) == 0,
+	      "PCM set after a stale advance was not output");
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
+void TestPushWithoutAdvanceIsSilent() {
+	const auto                     context = CreateContext();
+	const auto                     param   = MakeParam();
+	AudioOut2::AudioOut2PortHandle port    = 0;
+	Check(AudioOut2::AudioOut2PortCreate(context, AsParam(&param), &port) == OK,
+	      "port create failed");
+
+	std::vector<float> pcm(512 * 2, 0.25f);
+	const auto         pcm_bytes = pcm.size() * sizeof(float);
+	CaptureOutputPcm(pcm_bytes);
+
+	SetPcm(port, pcm.data());
+	Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "advance failed");
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "advanced push failed");
+	Check(AudioOut2::AudioOut2ContextPush(context, 1) == OK, "underrun push failed");
+
+	const auto output = OutputPcm();
+	Check(output.size() == 2, "both pushes should output a grain");
+	Check(std::memcmp(output[0].data(), pcm.data(), pcm_bytes) == 0,
+	      "advanced push did not output the committed grain");
+	Check(std::all_of(output[1].begin(), output[1].end(), [](uint8_t b) { return b == 0; }),
+	      "a push without a new advance replayed the previous grain");
+
+	CaptureOutputPcm(0);
+	AudioOut2::AudioOut2PortDestroy(port);
+	AudioOut2::AudioOut2ContextDestroy(context);
+}
+
 void TestPortGainAndValidation() {
 	const auto context = CreateContext();
 	const auto port = CreatePort(context, MakeParam());
@@ -643,10 +705,10 @@ void TestObjectGainAndAmbisonics() {
 			const float gain = 0.5f;
 			const Attribute attributes[] {{0, 0, &input, sizeof(input)}, {1, 0, &gain, sizeof(gain)},
 			                              {8, 0, &test.channel, sizeof(test.channel)}};
-			Check(AudioOut2::AudioOut2PortSetAttributes(object, AsAttribute(attributes), 3) == OK,
-			      "object attributes could not be set atomically with PCM first");
-			Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "context advance failed");
 			for (int push = 0; push < 2; push++) {
+				Check(AudioOut2::AudioOut2PortSetAttributes(object, AsAttribute(attributes), 3) == OK,
+				      "object attributes could not be set atomically with PCM first");
+				Check(AudioOut2::AudioOut2ContextAdvance(context) == OK, "context advance failed");
 				CheckSamples(PushPcm(context, output_bytes).at(0), {0.25f * test.left, 0.25f * test.right},
 				             "object gain or ambisonics decoded incorrectly or accumulated across pushes");
 			}
@@ -925,6 +987,8 @@ int main() {
 	TestSynchronousPushWithoutDeviceLeavesRoom();
 	TestPcmCopiedBeforeScratchBufferReuse();
 	TestAdvancedGrainsPushInOrder();
+	TestPushWithoutAdvanceIsSilent();
+	TestAdvanceWithoutNewPcmIsSilent();
 	TestPortGainAndValidation();
 	TestObjectGainAndAmbisonics();
 	TestObjectBusRouting();
