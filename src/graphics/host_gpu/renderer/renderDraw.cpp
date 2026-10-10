@@ -1384,15 +1384,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 			                          }
 		                          });
 	}
-	if (m_context.GetIndirectKeyFeedback().HasQueued()) {
-		// Reading a table's key bitmap is a buffer copy, and a copy cannot be recorded inside a
-		// render pass instance - which is exactly where a draw leaves the command buffer. Close the
-		// pass first; the next draw reopens it. Every other transfer in the renderer already ends
-		// rendering before recording, and the compute path reaches its own Flush with rendering
-		// already ended, which is why buffer tables observe keys where image tables do not.
-		m_context.GetCommandScheduler().EndRendering();
-		m_context.GetIndirectKeyFeedback().Flush(vk_buffer);
-	}
+	// Key bitmap copies cannot sit in a render pass; the next pass end or End records them.
 
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x600u);

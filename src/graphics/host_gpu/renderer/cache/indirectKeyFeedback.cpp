@@ -26,6 +26,19 @@ void IndirectKeyFeedback::Queue(uint64_t signature, vk::Buffer source, uint64_t 
 }
 
 void IndirectKeyFeedback::Flush(vk::CommandBuffer command) {
+	if (m_queued.empty()) {
+		return;
+	}
+	if (!m_scheduler.AcceptsOperations()) {
+		m_queued.clear();
+		return;
+	}
+	vk::MemoryBarrier2 barrier {};
+	barrier.srcStageMask  = vk::PipelineStageFlagBits2::eAllCommands;
+	barrier.srcAccessMask = vk::AccessFlagBits2::eShaderWrite;
+	barrier.dstStageMask  = vk::PipelineStageFlagBits2::eTransfer;
+	barrier.dstAccessMask = vk::AccessFlagBits2::eTransferRead;
+	bool barrier_recorded = false;
 	for (size_t entry = 0; entry < m_queued.size(); entry++) {
 		const auto& pending = m_queued[entry];
 		const auto slot = m_next_slot;
@@ -40,18 +53,13 @@ void IndirectKeyFeedback::Flush(vk::CommandBuffer command) {
 		const auto bytes  = static_cast<uint64_t>(pending.words) * sizeof(uint32_t);
 		const auto offset = static_cast<uint64_t>(slot) * SlotBytes;
 
-		vk::BufferMemoryBarrier2 barrier {};
-		barrier.srcStageMask     = vk::PipelineStageFlagBits2::eAllCommands;
-		barrier.srcAccessMask    = vk::AccessFlagBits2::eShaderWrite;
-		barrier.dstStageMask     = vk::PipelineStageFlagBits2::eTransfer;
-		barrier.dstAccessMask    = vk::AccessFlagBits2::eTransferRead;
-		barrier.buffer           = pending.source;
-		barrier.offset           = pending.offset;
-		barrier.size             = bytes;
-		vk::DependencyInfo dependency {};
-		dependency.bufferMemoryBarrierCount = 1;
-		dependency.pBufferMemoryBarriers    = &barrier;
-		command.pipelineBarrier2(dependency);
+		if (!barrier_recorded) {
+			vk::DependencyInfo dependency {};
+			dependency.memoryBarrierCount = 1;
+			dependency.pMemoryBarriers    = &barrier;
+			command.pipelineBarrier2(dependency);
+			barrier_recorded = true;
+		}
 
 		vk::BufferCopy region {};
 		region.srcOffset = pending.offset;

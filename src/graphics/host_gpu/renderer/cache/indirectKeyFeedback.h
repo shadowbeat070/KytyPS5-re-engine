@@ -25,6 +25,7 @@ public:
 
 	// Records the copies for everything queued since the last call. Must follow the draw or
 	// dispatch in the same command buffer, or the bitmap is read before the shader writes it.
+	// Outside a render pass only: CommandBuffer runs it whenever a pass ends and before End.
 	void Flush(vk::CommandBuffer command);
 
 	[[nodiscard]] bool HasQueued() const noexcept { return !m_queued.empty(); }
