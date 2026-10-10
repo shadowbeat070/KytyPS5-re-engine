@@ -340,12 +340,17 @@ void CommandProcessor::WriteData(uint32_t* dst, const uint32_t* src, uint32_t dw
 		return;
 	}
 
-	// Completion labels can be reused immediately; memcpy may write a destination twice.
-	auto* output = static_cast<volatile uint32_t*>(dst);
-	for (uint32_t i = 0; i < dw_num; i++) {
-		*output = src[i];
-		output += !write_one_address;
+	if (!write_one_address) {
+		WriteMemory(dst, src, uint64_t {dw_num} * sizeof(uint32_t));
+		return;
 	}
+	for (uint32_t i = 0; i < dw_num; i++) {
+		WriteMemory(dst, src + i, sizeof(uint32_t));
+	}
+}
+
+void CommandProcessor::WriteMemory(void* dst, const void* src, uint64_t size) {
+	m_renderer.GetBufferCache().WriteMemory(reinterpret_cast<uint64_t>(dst), src, size);
 }
 
 void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_bytes) {
@@ -355,7 +360,7 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 		     num_bytes);
 	}
 	const auto value = Sync::ReadReferenceClock();
-	std::memcpy(reinterpret_cast<void*>(dst_address), &value, num_bytes);
+	WriteMemory(reinterpret_cast<void*>(dst_address), &value, num_bytes);
 	static std::atomic<uint32_t> clock_log_count {0};
 	if (clock_log_count.fetch_add(1) < 64) {
 		LOGF("\t copy_data reference clock: dst=0x%016" PRIx64 " value=0x%016" PRIx64
@@ -608,6 +613,11 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 			if (progressed) {
 				cp.BufferFlush();
+				if (complete) {
+					m_renderer.RunGarbageCollector();
+				}
+			} else if (complete) {
+				m_renderer.RunGarbageCollector();
 			}
 			break;
 		}
@@ -629,10 +639,16 @@ bool GuestGpu::Process(Submission& submission) {
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
 				cp.BufferFlush();
+				if (complete) {
+					m_renderer.RunGarbageCollector();
+				}
+			} else if (complete) {
+				m_renderer.RunGarbageCollector();
 			}
 			break;
 		}
 		case SubmissionType::FlipPreparation:
+			m_renderer.RunGarbageCollector();
 			cp.PrepareCpuFlip(submission.flip_request_id);
 			break;
 		case SubmissionType::SuspendPoint:
@@ -1137,7 +1153,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 		auto  data = static_cast<uint32_t>(value);
 		EXIT_IF(dst == nullptr);
 		(void)command.Handle();
-		std::memcpy(dst, &data, sizeof(data));
+		WriteMemory(dst, &data, sizeof(data));
 
 		if (with_interrupt) {
 			TriggerEopEventAtEndOfPipe(interrupt_context_id);
@@ -1180,7 +1196,7 @@ void CommandProcessor::WriteAtEndOfPipe(uint32_t cache_policy, uint32_t event_wr
 					auto* dst = static_cast<uint64_t*>(dst_gpu_addr);
 					EXIT_IF(dst == nullptr);
 					(void)command.Handle();
-					std::memcpy(dst, &value, sizeof(value));
+					WriteMemory(dst, &value, sizeof(value));
 
 					if (with_interrupt) {
 						TriggerEopEventAtEndOfPipe(interrupt_context_id);
