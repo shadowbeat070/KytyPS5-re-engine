@@ -17,8 +17,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <vector>
 #include <vulkan/vk_platform.h>
 
@@ -988,7 +991,14 @@ void Presenter::Impl::Present() {
 			continue;
 		}
 		{
-			Common::LockGuard render_lock(renderer.GetMutex());
+			static const bool render_locked = [] {
+				const char* text = std::getenv("KYTY_PRESENT_RENDER_LOCK");
+				return text != nullptr && std::strcmp(text, "0") != 0;
+			}();
+			std::optional<Common::LockGuard> render_lock;
+			if (render_locked) {
+				render_lock.emplace(renderer.GetMutex());
+			}
 			auto&             command = present_scheduler.BeginCommand();
 			const bool        draw_system_overlay =
 			    overlay_visual.active && swapchain.PrepareSystemOverlay();
