@@ -2784,6 +2784,77 @@ void TestGpuOwnedScalarDataStaysNative() {
         "the rebuilt shader did not materialize, or skipped the image word the host needs");
 }
 
+// RESIDENT EVIL 2's BVH refit (cs 0x47153ebdeb5f17bd) writes through V#s from a GPU-written
+// record. Decoded in the shader, its first stores missed the BDA page table and were dropped.
+void TestGpuOwnedWrittenHandleStaysOnHost() {
+  constexpr uint32_t read_pc = 8;
+  constexpr uint32_t written_pc = 12;
+  Fixture fixture;
+  const auto record = fixture.Address(fixture.UserData(0), fixture.UserData(1), 4);
+  const auto descriptor = [&](uint32_t offset, uint32_t pc) {
+    std::array<Value, 4> words;
+    for (uint32_t word = 0; word < 4; ++word) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = offset + word * 4u;
+      words[word] = fixture.Emit(ValueOpcode::LoadAddressU32,
+                                 {record, Value(0u), Value(0u), Value(true)},
+                                 fixture.AddMemory(memory, pc));
+    }
+    return words;
+  };
+  const auto read_words = descriptor(64, read_pc);
+  const auto written_words = descriptor(96, written_pc);
+  MemoryInfo buffer;
+  buffer.kind = ResourceKind::Buffer;
+  const auto loaded = fixture.Emit(ValueOpcode::LoadBufferU32,
+                                   {fixture.Buffer(read_words, 20), Value(0u), Value(0u),
+                                    Value(0u), Value(true)},
+                                   fixture.AddMemory(buffer, 20));
+  fixture.Emit(ValueOpcode::StoreBufferU32,
+               {fixture.Buffer(written_words, 24), Value(0u), Value(0u), Value(0u), loaded,
+                Value(true)},
+               fixture.AddMemory(buffer, 24));
+  fixture.PlanAndTrack();
+  const auto &program = fixture.program;
+  const auto kind_of = [&](Value value) {
+    for (uint32_t slot = 0; slot < program.srt_reads.size(); ++slot) {
+      if (program.srt_reads[slot].value.Resolve() == value.Resolve()) {
+        return static_cast<int>(program.data_flat_slots[slot]);
+      }
+    }
+    return -1;
+  };
+  for (uint32_t word = 0; word < 4; ++word) {
+    Check(kind_of(read_words[word]) == 2, "a V# the shader only reads was not decodable");
+    Check(kind_of(written_words[word]) == 0, "a V# the shader writes through left the host");
+  }
+
+  std::array<uint32_t, 10> user_data{0x1000u, 0u};
+  OwnedTestMemory owned;
+  owned.memory.words[64 / sizeof(uint32_t)] = 0x4000u;
+  owned.memory.words[72 / sizeof(uint32_t)] = 256u;
+  owned.memory.words[96 / sizeof(uint32_t)] = 0x8000u;
+  owned.memory.words[104 / sizeof(uint32_t)] = 256u;
+  owned.owned_begin = 0x1000u;
+  owned.owned_end = 0x1100u;
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadOwnedTestMemory,
+                     .userdata = &owned,
+                     .gpu_owned = OwnedTestRange};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::vector<uint32_t> refused;
+  Check(!MaterializeResources(ExtractResourcePlan(program), runtime, snapshot, specialization,
+                              &refused),
+        "a record the GPU owns was read on the host");
+  std::ranges::sort(refused);
+  const auto last = std::ranges::unique(refused);
+  refused.erase(last.begin(), last.end());
+  Check(refused == std::vector<uint32_t>{read_pc},
+        "the walk did not keep only the read V# native, or let the written V# go native");
+}
+
 void TestSrtFlatteningAndRuntimeMemoization() {
   Fixture fixture;
   const auto base =
@@ -6081,6 +6152,7 @@ int main() {
     Run("DMA address materialization", TestDmaAddressMaterialization);
     Run("DMA pointer from SRT", TestDmaPointerFromSrt);
     Run("GPU-owned scalar data stays native", TestGpuOwnedScalarDataStaysNative);
+    Run("GPU-owned written handle stays on host", TestGpuOwnedWrittenHandleStaysOnHost);
     Run("scalar read slot order", TestScalarReadSlotOrder);
     Run("deep planning value chain", TestDeepPlanningValueChain);
     Run("deep uniform value chain", TestDeepUniformValueChain);

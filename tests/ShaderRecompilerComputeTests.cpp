@@ -39672,8 +39672,8 @@ TestCase ScalarLoadAlignsComponentsAndMasksAddress() {
 }
 
 // RESIDENT EVIL 3's cs 0x9ff42d53da1c03e7: a record the dispatch before wrote holds the thread
-// count at +144 and, at +168, the V# of the buffer the threads rewrite. With the record GPU-owned
-// the count stays a native load and the V# is decoded in the shader, so the host reads neither.
+// count at +144 and, at +168, the V# of a buffer the threads read. With the record GPU-owned the
+// count stays a native load and the V# is decoded in the shader, so the host reads neither.
 TestCase GpuOwnedRecordDecodedInShader() {
   using O = ShaderOpcode;
   constexpr uint64_t GuestBase = 0x00000001e0000000ull;
@@ -39710,8 +39710,9 @@ TestCase GpuOwnedRecordDecodedInShader() {
   code.push_back(EncodeMubuf0(0x0c, 0, true, false)); // buffer_load_dword v1, v0, s[16:19] idxen
   code.push_back(EncodeMubuf1(1, 4, 0));
   code.push_back(EncodeVop2(0x25, 1, InlineU32(1), 1)); // v_add_nc_u32 v1, 1, v1
-  code.push_back(EncodeMubuf0(0x1c, 0, true, false));   // buffer_store_dword v1, v0, s[16:19]
-  code.push_back(EncodeMubuf1(1, 4, 0));
+  code.push_back(EncodeVop2(0x1a, 2, InlineU32(2), 0)); // v_lshlrev_b32 v2, 2, v0
+  code.push_back(EncodeMubuf0(0x1c, DataDword * 4u));   // buffer_store_dword v1, v2, s[48:51] offen
+  code.push_back(EncodeMubuf1(1, 12, 2));
   code[skip] = EncodeSopp(0x08, static_cast<u32>(code.size() - skip - 1));
   AppendEnd(&code);
 
@@ -39723,7 +39724,8 @@ TestCase GpuOwnedRecordDecodedInShader() {
   test.forbidden_spirv = {"flattened_srt"};
   test.opcodes = {O::S_MOV_B32,       O::S_LOAD_DWORD,      O::S_LOAD_DWORDX4,
                   O::V_CMPX_GT_U32,   O::S_CBRANCH_EXECZ,   O::BUFFER_LOAD_DWORD,
-                  O::V_ADD_NC_U32,    O::BUFFER_STORE_DWORD, O::S_ENDPGM};
+                  O::V_ADD_NC_U32,    O::V_LSHLREV_B32,     O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
   test.compute_info.threads_num[0] = 8;
   test.compute_info.threads_num[1] = 1;
   test.compute_info.threads_num[2] = 1;
