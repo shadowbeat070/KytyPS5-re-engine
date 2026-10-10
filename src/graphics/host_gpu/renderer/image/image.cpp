@@ -897,6 +897,7 @@ bool Image::Supersede(uint64_t address, uint64_t size) {
 		return false;
 	}
 	m_superseded.emplace_back(begin, end);
+	m_superseded_epoch = NextImageWriteEpoch();
 	std::ranges::sort(m_superseded);
 	size_t merged = 0;
 	for (size_t i = 1; i < m_superseded.size(); i++) {
