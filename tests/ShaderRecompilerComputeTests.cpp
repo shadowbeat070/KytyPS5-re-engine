@@ -45471,6 +45471,68 @@ void CheckImageTransitionState(RenderContext &renderer) {
                      "repeat transfer write");
   CheckRepeatedWrite(vk::AccessFlagBits2::eShaderWrite, "repeat shader write");
   CheckRepeatedWrite(vk::AccessFlagBits2::eMemoryWrite, "repeat memory write");
+
+  const auto storage_access =
+      vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite;
+  image.backing.state = {};
+  image.backing.subresource_states.clear();
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                          graphics_stage, {});
+  image.MarkShaderWritesFlushed({});
+  Require(name, "flushed storage re-entry",
+          image.backing.state.flushed &&
+              image
+                  .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                               graphics_stage, {})
+                  .empty() &&
+              !image.backing.state.flushed,
+          "a write already published by a full barrier was fenced again");
+  Require(name, "re-entry write is fenced",
+          image
+                  .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                               graphics_stage, {})
+                  .size() == 1,
+          "the write after a flushed re-entry lost its dependency");
+  image.MarkShaderWritesFlushed({});
+  barriers = image.GetBarriers(vk::ImageLayout::eShaderReadOnlyOptimal,
+                               vk::AccessFlagBits2::eShaderRead, graphics_stage,
+                               {});
+  Require(name, "flushed layout change",
+          barriers.size() == 1 &&
+              barriers[0].oldLayout == vk::ImageLayout::eGeneral &&
+              !image.backing.state.flushed,
+          "a flushed state skipped a layout transition");
+  image.backing.state = {};
+  image.backing.subresource_states.clear();
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral,
+                          vk::AccessFlagBits2::eTransferWrite,
+                          vk::PipelineStageFlagBits2::eTransfer, {});
+  image.MarkShaderWritesFlushed({});
+  Require(name, "flush ignores transfer writes", !image.backing.state.flushed,
+          "a transfer write was treated as published by a shader barrier");
+  image.backing.state = {};
+  image.backing.subresource_states.clear();
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                          graphics_stage, {});
+  image.MarkShaderWritesFlushed(ImageSubresourceRange{1, 1, 0, 1});
+  Require(name, "partial flush of an unsplit image", !image.backing.state.flushed,
+          "a partial flush marked the whole image");
+  (void)image.GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                          graphics_stage, ImageSubresourceRange{1, 1, 0, 1});
+  image.MarkShaderWritesFlushed(ImageSubresourceRange{1, 1, 0, 1});
+  Require(name, "partial flush",
+          image.backing.subresource_states.size() == 6 &&
+              image.backing.subresource_states[3].flushed &&
+              !image.backing.subresource_states[0].flushed &&
+              image
+                  .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                               graphics_stage, ImageSubresourceRange{1, 1, 0, 1})
+                  .empty() &&
+              image
+                      .GetBarriers(vk::ImageLayout::eGeneral, storage_access,
+                                   graphics_stage, ImageSubresourceRange{0, 1, 0, 1})
+                      .size() == 1,
+          "subresource flush state diverged from its range");
   image.backing.state = {};
   image.backing.subresource_states.clear();
   const auto attachment_access = vk::AccessFlagBits2::eColorAttachmentRead |

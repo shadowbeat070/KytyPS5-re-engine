@@ -351,6 +351,24 @@ static void ReportOverLimitDispatch(RenderContext& context, uint64_t shader_hash
 	std::fflush(stdout);
 }
 
+static void MarkStorageImagesFlushed(TextureCache& cache, const PreparedBindings& bindings) {
+	for (const auto& binding: bindings.images) {
+		if (binding.desc.type != TextureCache::BindingType::Storage) {
+			continue;
+		}
+		auto*      image = &cache.GetImage(binding.image_id);
+		const bool whole =
+		    image->binding.force_general && !image->info.IsDepth() && !image->info.data.Empty();
+		const auto&                          view = binding.desc.view_info;
+		std::optional<ImageSubresourceRange> range;
+		if (!whole) {
+			range = ImageSubresourceRange {view.base_level, view.level_count, view.base_layer,
+			                               view.layer_count};
+		}
+		image->MarkShaderWritesFlushed(range);
+	}
+}
+
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
 	if (ShaderRecompiler::IR::FindBinding(input.stage.program->bindings,
@@ -645,6 +663,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
 	ResetBindings();
 }
 
@@ -738,6 +757,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	vk_buffer.dispatchIndirect(dispatch_record.buffer, dispatch_record.groups_offset);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+	MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
 	ResetBindings();
 }
 
