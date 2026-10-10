@@ -31544,6 +31544,76 @@ TestCase CvtF32ToIntSaturatesPerLane(u32 wave_size) {
   return test;
 }
 
+u32 ModelF32ToF16Rtz(u32 bits) {
+  const u32 sign = (bits >> 16u) & 0x8000u;
+  const u32 exp = (bits >> 23u) & 0xffu;
+  const u32 mant = bits & 0x007fffffu;
+  if (exp == 255u) {
+    return sign | 0x7c00u | (mant == 0u ? 0u : 0x200u | (mant >> 13u));
+  }
+  if (exp >= 143u) {
+    return sign | 0x7bffu;
+  }
+  if (exp < 103u) {
+    return sign;
+  }
+  if (exp <= 112u) {
+    return sign | ((mant | 0x00800000u) >> (126u - exp));
+  }
+  return sign | ((exp - 112u) << 10u) | (mant >> 13u);
+}
+
+// Every exponent with boundary mantissas, both signs; the conversion is integer-only.
+TestCase CvtPkrtzF16F32AllExponents(u32 slice, u32 wave_size) {
+  using O = ShaderOpcode;
+  static constexpr u32 mantissas[] = {0x000000u, 0x000001u, 0x001fffu, 0x002000u,
+                                      0x003fffu, 0x400000u, 0x7fe000u, 0x7fffffu};
+  constexpr u32 lanes = 1024;
+  constexpr u32 count = 2u * 256u * static_cast<u32>(std::size(mantissas));
+  const auto value = [](u32 index) {
+    const u32 mantissa = mantissas[index % std::size(mantissas)];
+    const u32 exponent = (index / static_cast<u32>(std::size(mantissas))) % 256u;
+    const u32 sign = index / (256u * static_cast<u32>(std::size(mantissas)));
+    return (sign << 31u) | (exponent << 23u) | mantissa;
+  };
+  constexpr u32 in_x = 0, in_y = lanes, out = 2 * lanes;
+
+  std::vector<u32> code;
+  AppendLoadLaneInput(&code, 1, in_x);
+  AppendLoadLaneInput(&code, 2, in_y);
+  code.push_back(EncodeVop2(0x2f, 10, Vgpr(1), 2));
+  AppendStoreVgprAtLaneDwordOffset(&code, 10, 0, out);
+  AppendEnd(&code);
+
+  TestCase test;
+  test.name = slice == 0   ? "CvtPkrtzF16F32AllExponentsA"
+              : slice == 1 ? "CvtPkrtzF16F32AllExponentsB"
+              : slice == 2 ? "CvtPkrtzF16F32AllExponentsC"
+                           : "CvtPkrtzF16F32AllExponentsD";
+  test.code = std::move(code);
+  test.initial.assign(out + lanes, 0);
+  for (u32 lane = 0; lane < lanes; lane++) {
+    const u32 index = slice * lanes + lane;
+    test.initial[in_x + lane] = value(index % count);
+    test.initial[in_y + lane] = value((index * 7u + 3u) % count);
+  }
+  test.expected = test.initial;
+  for (u32 lane = 0; lane < lanes; lane++) {
+    test.expected[out + lane] = ModelF32ToF16Rtz(test.initial[in_x + lane]) |
+                                (ModelF32ToF16Rtz(test.initial[in_y + lane]) << 16u);
+  }
+  test.opcodes = {O::V_MOV_B32,           O::V_ADD_NC_U32,       O::V_LSHLREV_B32,
+                  O::BUFFER_LOAD_DWORD,   O::V_CVT_PKRTZ_F16_F32, O::BUFFER_STORE_DWORD,
+                  O::S_ENDPGM};
+  test.compute_info.threads_num[0] = lanes;
+  test.compute_info.threads_num[1] = 1;
+  test.compute_info.threads_num[2] = 1;
+  test.compute_info.thread_ids_num = 1;
+  test.compute_info.wave_size = wave_size;
+  test.has_compute_info = true;
+  return test;
+}
+
 TestCase VectorSpecialF32FlushesDenormalInputs() {
   using O = ShaderOpcode;
 
@@ -44452,6 +44522,9 @@ std::vector<TestCase> MakeCases() {
   AddCase(VectorFloatConversionOps);
   AddCase(VectorFrexpF32Edges);
   AddCase(CvtF32ToIntSaturatesNaNAndOutOfRange);
+  for (u32 slice = 0; slice < 4; slice++) {
+    AddMade(CvtPkrtzF16F32AllExponents(slice, slice % 2 == 0 ? 32u : 64u));
+  }
   AddMade(CvtF32ToIntSaturatesPerLane(32));
   AddMade(CvtF32ToIntSaturatesPerLane(64));
   AddCase(VectorSpecialF32FlushesDenormalInputs);
