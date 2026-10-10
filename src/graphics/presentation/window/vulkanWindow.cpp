@@ -627,6 +627,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 		provoking_vertex.pNext = supported_features2.pNext;
 		supported_features2.pNext = &provoking_vertex;
 	}
+	const bool maintenance8_extension =
+	    HasExtension(available_device_extensions, VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+	vk::PhysicalDeviceMaintenance8FeaturesKHR maintenance8 {};
+	if (maintenance8_extension) {
+		maintenance8.pNext        = supported_features2.pNext;
+		supported_features2.pNext = &maintenance8;
+	}
 	const bool image_atomic_int64_extension =
 	    HasExtension(device_extensions, VK_EXT_SHADER_IMAGE_ATOMIC_INT64_EXTENSION_NAME);
 	vk::PhysicalDeviceShaderImageAtomicInt64FeaturesEXT image_atomic_int64 {};
@@ -709,6 +716,12 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	graphics.attachment_feedback_loop_enabled =
 	    feedback_extensions && feedback_layout.attachmentFeedbackLoopLayout &&
 	    feedback_dynamic.attachmentFeedbackLoopDynamicState;
+	{
+		const char* disable               = std::getenv("KYTY_NO_DEPTH_COLOR_COPY");
+		graphics.depth_color_copy_enabled = maintenance8_extension &&
+		                                    maintenance8.maintenance8 == VK_TRUE &&
+		                                    (disable == nullptr || std::strcmp(disable, "0") == 0);
+	}
 	LOGF("Vulkan depth feedback support: %s\n",
 	     graphics.attachment_feedback_loop_enabled ? "true" : "false");
 	if (graphics.mesh_shader_enabled) {
@@ -827,6 +840,13 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	}
 	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT enable_pipeline_library {};
 	std::vector<const char*>                             enabled_extensions = device_extensions;
+	vk::PhysicalDeviceMaintenance8FeaturesKHR            enable_maintenance8 {};
+	if (graphics.depth_color_copy_enabled) {
+		enabled_extensions.push_back(VK_KHR_MAINTENANCE_8_EXTENSION_NAME);
+		enable_maintenance8.maintenance8 = VK_TRUE;
+		enable_maintenance8.pNext        = const_cast<void*>(create_info.pNext);
+		create_info.pNext                = &enable_maintenance8;
+	}
 	if (graphics.pipeline_library_enabled) {
 		enabled_extensions.push_back(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 		enabled_extensions.push_back(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);

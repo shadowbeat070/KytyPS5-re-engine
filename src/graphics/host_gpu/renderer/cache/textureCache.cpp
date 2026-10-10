@@ -893,7 +893,13 @@ void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
 		           vk::to_string(source.backing.format).c_str(),
 		           vk::to_string(destination.backing.format).c_str());
 	}
-	if (direct_copy) {
+	const bool depth_color_copy =
+	    !direct_copy && source_depth != dest_depth && m_graphics.depth_color_copy_enabled &&
+	    source.backing.samples == 1 && destination.backing.samples == 1 &&
+	    source.info.GetColorTransform() == destination.info.GetColorTransform() &&
+	    source.backing.image_type == destination.backing.image_type &&
+	    Image::DepthColorCopyCompatible(source.backing.format, destination.backing.format);
+	if (direct_copy || depth_color_copy) {
 		destination.CopyImage(source);
 	} else if (!CopyD16(destination, source)) {
 		if (source.backing.samples != 1 || destination.backing.samples != 1) {
