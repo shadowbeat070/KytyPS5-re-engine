@@ -30,6 +30,7 @@ vk::CommandBuffer CommandBuffer::Handle() const {
 
 void CommandBuffer::Begin() {
 	EXIT_IF(m_rendering || IsInvalid());
+	m_indirect_barrier_holds = false;
 	auto buffer = Handle();
 
 	vk::CommandBufferBeginInfo begin_info {};
@@ -113,8 +114,9 @@ void CommandBuffer::EndRendering() const {
 		return;
 	}
 	Handle().endRendering();
-	m_rendering    = false;
-	m_render_state = {};
+	m_rendering              = false;
+	m_render_state           = {};
+	m_indirect_barrier_holds = false;
 }
 
 } // namespace Libs::Graphics

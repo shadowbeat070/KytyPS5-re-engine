@@ -16,8 +16,8 @@
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/dispatchGuard.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -25,6 +25,7 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
+#include "graphics/shader/recompiler/ir/passes/BindingLayout.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/shader.h"
 #include "kernel/eventQueue.h"
@@ -1123,6 +1124,16 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
+static bool StageMayWriteMemory(const ShaderStageRuntime& stage) {
+	const auto& program = *stage.program;
+	const auto& info    = program.info;
+	return info.writes_dma || program.has_address_writes ||
+	       std::ranges::any_of(info.buffers, [](const auto& buffer) { return buffer.written; }) ||
+	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; }) ||
+	       ShaderRecompiler::IR::FindBinding(
+	           program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::Gds) != nullptr;
+}
+
 static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
@@ -1340,7 +1351,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	if (indirect != nullptr) {
+	if (indirect != nullptr && !buffer.IndirectArgsBarrierHolds()) {
 		// The arguments may come from any earlier GPU write; the barrier cannot sit in a pass.
 		m_context.GetCommandScheduler().EndRendering();
 		vk::MemoryBarrier barrier {};
@@ -1349,6 +1360,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
 		                          nullptr, 0, nullptr);
+		buffer.MarkIndirectArgsBarrier();
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
@@ -1397,6 +1409,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+	}
+	if (std::ranges::any_of(vertex_stages,
+	                        [](const auto& stage) { return StageMayWriteMemory(stage.stage); }) ||
+	    (state.ps_active && StageMayWriteMemory(state.ps_input_info.stage))) {
+		buffer.InvalidateIndirectArgsBarrier();
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {

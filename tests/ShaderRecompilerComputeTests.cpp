@@ -20747,6 +20747,38 @@ public:
                 "a counted indirect draw fell back to the CPU");
         check_rect(indirect_name, true);
 
+        // Back-to-back indirect draws share one argument barrier; a GPU write between them does not.
+        {
+          constexpr uint64_t zero_address = source_address + 0x400;
+          const std::array<u32, 4> zero_record{3, 0, 0, 0};
+          std::memcpy(reinterpret_cast<void *>(zero_address), zero_record.data(),
+                      sizeof(zero_record));
+          clear_rect();
+          for (u32 repeat = 0; repeat < 2; repeat++) {
+            Require(indirect_name, "draw under a reused argument barrier",
+                    RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                                                           {.args_addr = args_address}) ==
+                        IndirectDrawResult::Drawn,
+                    "an eligible indirect draw fell back to reading its arguments on the CPU");
+            Require(indirect_name, "write-free draw keeps the argument barrier",
+                    scheduler.Current().IndirectArgsBarrierHolds(),
+                    "the next indirect draw in the same rendering instance re-issues its barrier");
+          }
+          check_rect(indirect_name, true);
+          buffers.CopyBuffer(args_address, zero_address, sizeof(zero_record), false, false);
+          Require(indirect_name, "GPU copy voids the argument barrier",
+                  !scheduler.Current().IndirectArgsBarrierHolds(),
+                  "a draw after a GPU write to its arguments would skip the barrier");
+          clear_rect();
+          Require(indirect_name, "draw after the copy",
+                  RenderExecutorTestAccess::DrawIndirect(executor, scheduler.Current(),
+                                                         {.args_addr = args_address}) ==
+                      IndirectDrawResult::Drawn,
+                  "an eligible indirect draw fell back to reading its arguments on the CPU");
+          check_rect(indirect_name, false);
+          buffers.CopyBuffer(args_address, source_address, sizeof(records), false, false);
+        }
+
         // PPSA30803 issues empty draws whose stale depth register names a colour surface.
         constexpr uint64_t empty_address = source_address + 0x200;
         constexpr uint64_t stale_depth_address = depth_address + 0x10000;
