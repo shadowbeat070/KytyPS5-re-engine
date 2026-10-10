@@ -30,6 +30,7 @@ std::condition_variable           g_device_cv;
 std::vector<int>                  g_live_devices;
 std::vector<int>                  g_device_backed_handles;
 std::vector<bool>                 g_output_blocking;
+bool                              g_last_cushion = false;
 std::vector<std::vector<uint8_t>> g_output_pcm;
 std::vector<std::array<float, 2>> g_output_gains;
 size_t                            g_capture_bytes = 0;
@@ -404,6 +405,7 @@ void TestAsynchronousDevicePushKeepsQueueBounded() {
 	      "full async queue accepted another buffer");
 	const auto calls = OutputCalls();
 	Check(calls.size() == 1 && !calls[0], "rejected async push reached the device backend");
+	Check(g_last_cushion, "async push did not ask the backend for a jitter cushion");
 
 	uint32_t queued    = 0;
 	uint32_t available = 0;
@@ -881,9 +883,10 @@ bool AudioOutHasDevice(int handle) {
 	       g_device_backed_handles.end();
 }
 
-uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking) {
+uint32_t AudioOutOutputs(const OutputParam* params, uint32_t num, bool blocking, bool cushion) {
 	std::lock_guard lock(g_device_mutex);
 	g_output_blocking.push_back(blocking);
+	g_last_cushion = cushion;
 	g_output_gains.clear();
 	if (g_capture_bytes != 0) {
 		for (uint32_t i = 0; i < num; i++) {
