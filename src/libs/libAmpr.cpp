@@ -1,4 +1,5 @@
 #include "common/abi.h"
+#include "common/archive.h"
 #include "common/dateTime.h"
 #include "common/file.h"
 #include "common/logging/log.h"
@@ -201,8 +202,11 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 
 	ResolvedPathInfo  info {};
 	const std::string path(guest_path);
-	bool              found = false;
-	{
+	const auto        real_path = LibKernel::FileSystem::GetRealFilename(path);
+	// Only read-only archive contents can be cached; save data is rewritten while mounted.
+	const bool cacheable = Common::IsArchivePath(real_path);
+	bool       found     = false;
+	if (cacheable) {
 		std::scoped_lock lock(g_mutex);
 		const auto       it = g_resolved_paths.find(path);
 		if (it != g_resolved_paths.end()) {
@@ -212,9 +216,8 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 	}
 
 	if (!found) {
-		const auto real_path = LibKernel::FileSystem::GetRealFilename(path);
-		info.file_id         = AprShared::ComputeFileId(guest_path);
-		info.host_path       = Common::PathToString(real_path);
+		info.file_id   = AprShared::ComputeFileId(guest_path);
+		info.host_path = Common::PathToString(real_path);
 
 		if (Common::File::IsDirectoryExisting(real_path)) {
 			info.is_dir    = true;
@@ -228,12 +231,17 @@ static int ResolveOnePath(const char* guest_path, uint32_t* id, uint64_t* size) 
 		bool log_missing = false;
 		{
 			std::scoped_lock lock(g_mutex);
-			auto [it, inserted] = g_resolved_paths.emplace(path, info);
-			if (!inserted) {
-				info = it->second;
-			} else if (info.result == OK) {
+			bool             inserted = true;
+			if (cacheable) {
+				auto [it, added] = g_resolved_paths.emplace(path, info);
+				inserted         = added;
+				if (!added) {
+					info = it->second;
+				}
+			}
+			if (inserted && info.result == OK) {
 				RegisterHostPathLocked(info.file_id, info.host_path, info.file_size, info.is_dir);
-			} else if (info.result == LibKernel::KERNEL_ERROR_ENOENT) {
+			} else if (inserted && info.result == LibKernel::KERNEL_ERROR_ENOENT) {
 				log_missing = true;
 			}
 		}
