@@ -211,6 +211,7 @@ struct AudioOut2PortStateEntry {
 	std::array<float, 16>  gains {};
 	uint32_t               ambisonics        = UINT32_MAX;
 	bool                   attributes_locked = false;
+	bool                   pcm_fresh         = false;
 	std::vector<uint8_t>   pcm_data;
 };
 
@@ -619,21 +620,28 @@ static void audioout2_mix_object(std::vector<float>* mix, const AudioOut2PortSta
 }
 
 static AudioOut2Grain audioout2_snapshot_context_locked(AudioOut2ContextHandle    ctx,
-                                                        const AudioOut2ObjectBus& bus) {
+                                                        const AudioOut2ObjectBus& bus,
+                                                        bool                      fresh_only) {
 	AudioOut2Grain     grain;
 	std::vector<float> object_mix;
 	for (const auto& state: g_audioout2_ports) {
 		if (!state.used || state.context != ctx || state.pcm_data.empty()) {
 			continue;
 		}
+		// A port given no new PCM since the last advance is silent for this grain.
+		const bool stale = fresh_only && !state.pcm_fresh;
 		if (audioout2_port_type_is_object(state.port_type)) {
 			if (bus.audio_handle > 0) {
 				object_mix.resize(static_cast<size_t>(bus.num_grains) * 2, 0.0f);
-				audioout2_mix_object(&object_mix, state);
+				if (!stale) {
+					audioout2_mix_object(&object_mix, state);
+				}
 			}
 		} else if (state.audio_handle > 0 && grain.size() < AudioInternal::OUT_PORTS_MAX) {
-			grain.push_back(
-			    AudioOut2GrainPort {state.handle, state.audio_handle, state.pcm_data, state.gains});
+			grain.push_back(AudioOut2GrainPort {
+			    state.handle, state.audio_handle,
+			    stale ? std::vector<uint8_t>(state.pcm_data.size(), 0) : state.pcm_data,
+			    state.gains});
 		}
 	}
 	for (auto& sample: object_mix) {
@@ -663,13 +671,14 @@ static void audioout2_drop_dead_ports_locked(AudioOut2Grain* grain, int object_a
 }
 
 static bool audioout2_take_advanced_grain(AudioOut2ContextHandle ctx, AudioOut2Grain* grain,
-                                          AudioOut2ObjectBus* bus) {
+                                          AudioOut2ObjectBus* bus, bool* uses_advance) {
 	Common::LockGuard lock(g_audioout2_context_mutex);
 	auto*             state = audioout2_find_context_locked(ctx);
 	if (state == nullptr) {
 		return false;
 	}
-	*bus = AudioOut2ObjectBus {state->object_audio_handle, state->num_grains};
+	*bus          = AudioOut2ObjectBus {state->object_audio_handle, state->num_grains};
+	*uses_advance = state->uses_advance;
 	if (state->advanced.empty()) {
 		return false;
 	}
@@ -683,13 +692,20 @@ static void audioout2_queue_context_audio(AudioOut2ContextHandle ctx, bool block
 
 	AudioOut2Grain     grain;
 	AudioOut2ObjectBus bus;
-	const bool         advanced = audioout2_take_advanced_grain(ctx, &grain, &bus);
+	bool               uses_advance = false;
+	const bool         advanced = audioout2_take_advanced_grain(ctx, &grain, &bus, &uses_advance);
 	{
 		Common::LockGuard lock(g_audioout2_port_mutex);
 		if (advanced) {
 			audioout2_drop_dead_ports_locked(&grain, bus.audio_handle);
 		} else {
-			grain = audioout2_snapshot_context_locked(ctx, bus);
+			grain = audioout2_snapshot_context_locked(ctx, bus, false);
+		}
+	}
+	if (!advanced && uses_advance) {
+		// A push with no new advance is an underrun; replaying the last grain buzzes.
+		for (auto& entry: grain) {
+			std::fill(entry.pcm.begin(), entry.pcm.end(), uint8_t {0});
 		}
 	}
 
@@ -868,10 +884,11 @@ int KYTY_SYSV_ABI AudioOut2ContextAdvance(AudioOut2ContextHandle ctx) {
 	AudioOut2Grain grain;
 	{
 		Common::LockGuard lock(g_audioout2_port_mutex);
-		grain = audioout2_snapshot_context_locked(ctx, bus);
+		grain = audioout2_snapshot_context_locked(ctx, bus, true);
 		for (auto& port: g_audioout2_ports) {
 			if (port.used && port.context == ctx) {
 				port.attributes_locked = false;
+				port.pcm_fresh         = false;
 			}
 		}
 	}
@@ -1150,6 +1167,7 @@ int KYTY_SYSV_ABI AudioOut2PortSetAttributes(AudioOut2PortHandle       port,
 			state->pcm_data.clear();
 		}
 		state->attributes_locked = audioout2_port_type_is_object(state->port_type);
+		state->pcm_fresh         = !state->pcm_data.empty();
 	}
 
 	return OK;
