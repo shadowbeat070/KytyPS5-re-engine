@@ -123,6 +123,7 @@ using BackingVisitor = void (*)(void* context, const uint8_t* data, uint64_t siz
 // TryReadGpuCleanBacking, handing each backing piece to `visit` in place instead of copying it.
 bool TryVisitGpuCleanBacking(uint64_t vaddr, uint64_t size, BackingVisitor visit, void* context);
 bool                   TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size);
+bool                   HasGpuOwnedBytes(uint64_t vaddr, uint64_t size);
 bool                   TryReadSparseBacking(uint64_t vaddr, void* data, uint64_t size);
 // Zero-fills the destination, copies back whatever the guest has committed over the span, and
 // returns how many bytes were real. For a caller that cannot refuse, such as an image upload.
