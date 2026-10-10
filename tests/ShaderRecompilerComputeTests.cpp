@@ -45663,6 +45663,17 @@ void CheckImageTransitionState(RenderContext &renderer) {
   HW::UserConfig user_config{};
   HW::Shader shaders{};
   scheduler.Begin(registers, user_config, shaders);
+  {
+    auto &command = scheduler.Current();
+    Require(name, "full barrier unmarked", !command.FullBarrierIsLast(),
+            "a fresh command buffer claimed a full barrier");
+    (void)command.Handle();
+    command.MarkFullBarrier();
+    const bool marked = command.FullBarrierIsLast();
+    (void)command.Handle();
+    Require(name, "full barrier mark", marked && !command.FullBarrierIsLast(),
+            "a handle request after the full barrier did not invalidate its mark");
+  }
   image.backing.state = {};
   image.backing.subresource_states.clear();
   image.Transit(vk::ImageLayout::eGeneral,

@@ -155,6 +155,10 @@ public:
 	}
 	void MarkIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = true; }
 	void InvalidateIndirectArgsBarrier() const noexcept { m_indirect_barrier_holds = false; }
+	[[nodiscard]] bool FullBarrierIsLast() const noexcept {
+		return m_full_barrier_mark == m_handle_requests;
+	}
+	void MarkFullBarrier() const noexcept { m_full_barrier_mark = m_handle_requests; }
 
 	[[nodiscard]] vk::CommandBuffer Handle() const;
 	[[nodiscard]] GraphicContext&   GetGraphics() const noexcept { return m_graphics; }
@@ -187,6 +191,8 @@ private:
 	mutable RenderState m_render_state;
 	mutable bool        m_rendering   = false;
 	mutable bool        m_indirect_barrier_holds = false;
+	mutable uint64_t    m_handle_requests        = 0;
+	mutable uint64_t    m_full_barrier_mark      = UINT64_MAX;
 	HW::Context*        m_registers   = nullptr;
 	HW::UserConfig*     m_user_config = nullptr;
 	HW::Shader*         m_shaders     = nullptr;

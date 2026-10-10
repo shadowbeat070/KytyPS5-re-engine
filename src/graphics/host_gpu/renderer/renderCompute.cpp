@@ -629,6 +629,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	BindSharedMemory(m_context, input_info, bindings);
 	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
+	const bool ordered_before = BarrierElisionEnabled() && buffer.FullBarrierIsLast();
 
 	auto                     vk_buffer = buffer.Handle();
 	ThreadDispatcher::Record thread_record {};
@@ -649,7 +650,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 		                           ShaderRecompiler::IR::ImageResourceClass::Storage;
 	                }) ||
 	    has_storage_writes;
-	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly();
+	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly() && !ordered_before;
 	if (hazard_barrier) {
 		// A host fence used to serialize every dispatch. Preserve its read-before-write ordering
 		// while allowing the queue to execute asynchronously.
@@ -666,6 +667,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!GuestSyncOnly()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+		if (hazard_barrier || ordered_before) {
+			buffer.MarkFullBarrier();
+		}
 	}
 	ResetBindings();
 }
@@ -723,6 +727,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	EXIT_IF(args_buffer == nullptr || (args_offset & 3u) != 0);
 	const PreciseWriteScope precise_writes(m_context.GetBufferCache());
 	RebindBuffers(bindings);
+	const bool               ordered_before = BarrierElisionEnabled() && buffer.FullBarrierIsLast();
 	ThreadDispatcher::Record dispatch_record {args_buffer->Handle(), args_offset, 0};
 	if (thread_dimensions) {
 		const auto& limits = m_context.GetGraphics().physical_device_properties.limits;
@@ -744,7 +749,7 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 		    return image.written &&
 		           image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Storage;
 	    });
-	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly();
+	const bool hazard_barrier = has_storage_writes && !GuestSyncOnly() && !ordered_before;
 	if (hazard_barrier) {
 		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	}
@@ -763,6 +768,9 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	if (!GuestSyncOnly()) {
 		ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 		MarkStorageImagesFlushed(m_context.GetTextureCache(), bindings);
+		if (hazard_barrier || ordered_before) {
+			buffer.MarkFullBarrier();
+		}
 	}
 	ResetBindings();
 }
