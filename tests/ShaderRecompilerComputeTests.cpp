@@ -21296,10 +21296,13 @@ public:
                                     std::vector<u32>(static_cast<size_t>(tiled_words), 0u));
       auto output = CreateHostBuffer(name, linear_words * 4u, AllFlags,
                                      std::vector<u32>(static_cast<size_t>(linear_words), 0u));
+      // In place on device memory, and through the staged copy a host buffer takes.
+      const bool device_local = (&test - cases.data()) % 2 == 0;
       tile_manager.Tile(source.buffer, 0, linear_words * 4u, tiled.buffer, 0, tiled_words * 4u,
-                        tiles);
+                        tiles, device_local);
       const auto result =
-          tile_manager.Detile(tiled.buffer, 0, tiled_words * 4u, linear_words * 4u, tiles);
+          tile_manager.Detile(tiled.buffer, 0, tiled_words * 4u, linear_words * 4u, tiles,
+                              ColorTransform::None, !device_local);
       const vk::BufferCopy copy{result.offset, 0, linear_words * 4u};
       scheduler.Current().Handle().copyBuffer(result.buffer, output.buffer, 1, &copy);
       vk::MemoryBarrier barrier{};

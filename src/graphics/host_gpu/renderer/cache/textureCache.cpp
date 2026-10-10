@@ -1602,9 +1602,9 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 		}
 		TileManager::Result linear {source.Handle(), source_offset, info.data.size};
 		if (!transfer.tiles.empty()) {
-			linear =
-			    m_tiler.Detile(source.Handle(), source_offset, info.data.size,
-			                   transfer.LinearSize(), transfer.tiles, transfer.color_transform);
+			linear = m_tiler.Detile(source.Handle(), source_offset, info.data.size,
+			                        transfer.LinearSize(), transfer.tiles, transfer.color_transform,
+			                        source.Usage() == MemoryUsage::DeviceLocal);
 		} else if (transfer.color_transform != ColorTransform::None) {
 			linear = m_tiler.TransformColor(linear, transfer.color_transform, true);
 		}
@@ -1642,7 +1642,8 @@ void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_off
 	if (info.IsTiled()) {
 		const auto tiles = BuildDepthTiles(info);
 		linear =
-		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles);
+		    m_tiler.Detile(source.Handle(), source_offset, info.data.size, info.data.size, tiles,
+		                   ColorTransform::None, source.Usage() == MemoryUsage::DeviceLocal);
 	}
 	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
 	if (transfer_bytes != info.bytes_per_block) {
@@ -2610,7 +2611,8 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 		}
 		const auto tiles = BuildDepthTiles(info);
 		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, info.data.size,
-		                  info.data.size, tiles);
+		                  info.data.size, tiles, ColorTransform::None,
+		                  destination.Usage() == MemoryUsage::DeviceLocal);
 		return;
 	}
 	EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
@@ -2638,7 +2640,8 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	}
 	const auto tiles = BuildDepthTiles(info);
 	m_tiler.Tile(guest_linear.buffer, guest_linear.offset, info.data.size, destination.Handle(),
-	             destination_offset, info.data.size, tiles);
+	             destination_offset, info.data.size, tiles,
+	             destination.Usage() == MemoryUsage::DeviceLocal);
 }
 
 void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
@@ -2663,7 +2666,8 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	}
 
 	m_tiler.TileImage(image, texture.regions, destination.Handle(), destination_offset,
-	                  destination_size, texture.LinearSize(), texture.tiles, transform);
+	                  destination_size, texture.LinearSize(), texture.tiles, transform,
+	                  destination.Usage() == MemoryUsage::DeviceLocal);
 }
 
 void TextureCache::DownloadColorRegions(Image& image, std::vector<vk::BufferImageCopy>& regions,

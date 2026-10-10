@@ -25,6 +25,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 
@@ -280,6 +281,14 @@ vk::Pipeline TileManager::GetPipeline(uint32_t slot) {
 	return m_pipelines[slot];
 }
 
+bool TileManager::TilerStagingForced() {
+	static const bool forced = [] {
+		const char* text = std::getenv("KYTY_TILER_STAGE");
+		return text != nullptr && std::strcmp(text, "0") != 0;
+	}();
+	return forced;
+}
+
 TileManager::Result TileManager::StageTiled(uint64_t offset, uint64_t capacity) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -301,14 +310,22 @@ TileManager::Result TileManager::StageTiled(uint64_t offset, uint64_t capacity) 
 	return {m_tiled_scratch->Handle(), base, capacity};
 }
 
-void TileManager::Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
-                         vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-                         std::span<Dispatch> dispatches, bool clear_target) {
+void TileManager::Record(bool device_local, vk::Buffer source, uint64_t source_offset,
+                         uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
+                         uint64_t target_capacity, std::span<Dispatch> dispatches,
+                         bool clear_target) {
 	const bool tile         = !clear_target;
 	const auto tiled_offset = tile ? target_offset : source_offset;
 	const auto tiled_bytes  = tile ? target_capacity : source_capacity;
 	const auto tiled_buffer = tile ? target : source;
-	const auto staged       = StageTiled(tiled_offset, tiled_bytes);
+	if (device_local && !TilerStagingForced()) {
+		// Whole-dword stores read their neighbours from the destination, so no seeded copy is
+		// needed.
+		RecordPasses(source, source_offset, source_capacity, target, target_offset, target_capacity,
+		             dispatches, clear_target);
+		return;
+	}
+	const auto staged = StageTiled(tiled_offset, tiled_bytes);
 	m_scheduler.EndRendering();
 	auto command = m_scheduler.Current().Handle();
 
@@ -435,7 +452,7 @@ void TileManager::RecordPasses(vk::Buffer source, uint64_t source_offset, uint64
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
                                         uint64_t tiled_capacity, uint64_t linear_capacity,
                                         std::span<const GpuTileInfo> infos,
-                                        ColorTransform               transform) {
+                                        ColorTransform transform, bool device_local) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -444,13 +461,14 @@ TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
 	StreamHold            hold(m_stream_buffer);
 	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches, transform);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
-	Record(tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size, dispatches, true);
+	Record(device_local, tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size,
+	       dispatches, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                       std::span<const GpuTileInfo> infos) {
+                       std::span<const GpuTileInfo> infos, bool device_local) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -459,14 +477,14 @@ void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linea
 	std::vector<Dispatch> dispatches;
 	StreamHold            hold(m_stream_buffer);
 	Prepare(true, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
-	Record(linear, linear_offset, linear_capacity, tiled, tiled_offset, tiled_capacity, dispatches,
-	       false);
+	Record(device_local, linear, linear_offset, linear_capacity, tiled, tiled_offset,
+	       tiled_capacity, dispatches, false);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
                             uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
-                            ColorTransform transform) {
+                            ColorTransform transform, bool device_local) {
 	EXIT_IF(regions.empty());
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -478,8 +496,8 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches, transform);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
-	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, dispatches,
-	       false);
+	Record(device_local, linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity,
+	       dispatches, false);
 }
 
 void TileManager::ReleaseScratch() {
