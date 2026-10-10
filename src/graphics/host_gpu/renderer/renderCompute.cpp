@@ -94,6 +94,18 @@ bool RenderExecutor::TryConsumeComputeMetaClear(const ShaderComputeInputInfo& in
 	    !program.info.samplers.empty() || program.info.writes_dma) {
 		return false;
 	}
+	uint32_t stores = 0;
+	for (const auto& resource: program.info.buffers) {
+		if (resource.written || resource.atomic) {
+			if (resource.read || resource.atomic) {
+				return false;
+			}
+			stores++;
+		}
+	}
+	if (stores != 1) {
+		return false;
+	}
 	auto&    cache           = buffer.GetContext().GetTextureCache();
 	uint32_t metadata_writes = 0;
 	uint32_t metadata_index  = 0;
