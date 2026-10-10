@@ -172,7 +172,7 @@ struct AudioOut2MasteringStatesV2 {
 
 static std::atomic_uint64_t g_audioout2_next_context {1};
 static std::atomic_uint64_t g_audioout2_next_port {1};
-static AudioOut2UserHandle g_audioout2_next_user = 1;
+static AudioOut2UserHandle  g_audioout2_next_user = 1;
 
 struct AudioOut2GrainPort {
 	AudioOut2PortHandle   port         = 0;
@@ -184,14 +184,14 @@ struct AudioOut2GrainPort {
 using AudioOut2Grain = std::vector<AudioOut2GrainPort>;
 
 struct AudioOut2ContextState {
-	bool                   used        = false;
-	AudioOut2ContextHandle handle      = 0;
-	uint32_t               queue_depth = 4;
-	uint32_t               queued      = 0;
-	uint32_t               num_grains  = 512;
-	uint64_t               last_update = 0;
+	bool                   used             = false;
+	AudioOut2ContextHandle handle           = 0;
+	uint32_t               queue_depth      = 4;
+	uint32_t               queued           = 0;
+	uint32_t               num_grains       = 512;
+	uint64_t               last_update      = 0;
 	uint64_t               last_update_frac = 0; // in 1/48000 us, so grains need not be whole us
-	bool                   idle        = true;
+	bool                   idle             = true;
 	std::deque<AudioOut2Grain> advanced;
 	bool                       uses_advance        = false;
 	int                        object_audio_handle = 0;
@@ -234,7 +234,7 @@ static std::array<AudioOut2ContextState, 16>      g_audioout2_contexts;
 static Common::Mutex                              g_audioout2_port_mutex;
 static std::array<AudioOut2PortStateEntry, 256>   g_audioout2_ports;
 static std::shared_mutex                          g_audioout2_output_mutex;
-static std::vector<AudioOut2UserHandle>          g_audioout2_users;
+static std::vector<AudioOut2UserHandle>           g_audioout2_users;
 static Common::Mutex                              g_audioout2_speaker_array_mutex;
 static std::array<AudioOut2SpeakerArrayState, 32> g_audioout2_speaker_arrays;
 static Common::Mutex                              g_audioout2_latency_mutex;
@@ -246,8 +246,8 @@ static constexpr int AUDIO_OUT2_ERROR_INVALID_PARAM               = -2144960511;
 static constexpr int AUDIO_OUT2_ERROR_BUSY                        = -2144960505; /* 0x80268007 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_API_PARAM = -2144959999; /* 0x80268201 */
 static constexpr int AUDIO_OUT2_ERROR_MASTERING_INVALID_STATES_ID = -2144959996; /* 0x80268204 */
-static constexpr int      AUDIO_OUT2_ERROR_OUT_OF_RESOURCE        = -2144960510; /* 0x80268002 */
-static constexpr int      AUDIO_OUT2_ERROR_INVALID_PORT           = -2144960503; /* 0x80268009 */
+static constexpr int AUDIO_OUT2_ERROR_OUT_OF_RESOURCE             = -2144960510; /* 0x80268002 */
+static constexpr int AUDIO_OUT2_ERROR_INVALID_PORT                = -2144960503; /* 0x80268009 */
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_PCM        = 0;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_GAIN       = 1;
 static constexpr uint32_t AUDIO_OUT2_PORT_ATTRIBUTE_ID_AMBISONICS = 8;
@@ -394,7 +394,8 @@ static uint64_t audioout2_micros_to_next_tick_locked(const AudioOut2ContextState
 	return next_tick > now ? std::min(next_tick - now, grain_micros + 1) : 1;
 }
 
-// A synchronous push returns once the queue can take another grain; RE Engine yield-polls otherwise.
+// A synchronous push returns once the queue can take another grain; RE Engine yield-polls
+// otherwise.
 static void audioout2_wait_for_free_slot(AudioOut2ContextHandle ctx) {
 	for (;;) {
 		uint64_t sleep_micros = 0;
@@ -425,7 +426,8 @@ static AudioOut2PortStateEntry* audioout2_find_port_locked(AudioOut2PortHandle p
 }
 
 static size_t audioout2_pcm_size(const AudioOut2PortStateEntry& state) {
-	const auto bytes_per_sample = (state.data_format & 0x7fu) == 1 ? sizeof(int16_t) : sizeof(float);
+	const auto bytes_per_sample =
+	    (state.data_format & 0x7fu) == 1 ? sizeof(int16_t) : sizeof(float);
 	return static_cast<size_t>(state.samples_num) *
 	       audioout2_data_format_channels(state.data_format) * bytes_per_sample;
 }
@@ -900,8 +902,7 @@ int KYTY_SYSV_ABI AudioOut2ContextPush(AudioOut2ContextHandle ctx, uint32_t bloc
 		// Only a synchronous submission carrying PCM to a real device can rely on the SDL queue for
 		// pacing. Async pushes must retain queue-depth backpressure, and a handle without PCM (or a
 		// vibration/failed-open handle) has no downstream operation that can block this call.
-		const bool use_device_clock =
-		    blocking != 0 && audioout2_context_has_queueable_device(ctx);
+		const bool use_device_clock = blocking != 0 && audioout2_context_has_queueable_device(ctx);
 
 		g_audioout2_context_mutex.Lock();
 		if (auto* state = audioout2_find_context_locked(ctx); state != nullptr) {
@@ -1202,7 +1203,7 @@ int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 	PRINT_NAME();
 	LOGF("\t handle = 0x%016" PRIx64 "\n", static_cast<uint64_t>(handle));
 	Common::LockGuard lock(g_audioout2_port_mutex);
-	const auto it = std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle);
+	const auto        it = std::find(g_audioout2_users.begin(), g_audioout2_users.end(), handle);
 	if (it == g_audioout2_users.end()) {
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
@@ -1215,8 +1216,8 @@ int KYTY_SYSV_ABI AudioOut2UserDestroy(AudioOut2UserHandle handle) {
 }
 
 int KYTY_SYSV_ABI AudioOut2UserGetSupportedAttributes(AudioOut2UserHandle handle,
-                                                       uint32_t* context_attributes,
-                                                       uint32_t* port_attributes) {
+                                                      uint32_t*           context_attributes,
+                                                      uint32_t*           port_attributes) {
 	if (context_attributes == nullptr || port_attributes == nullptr) {
 		return AUDIO_OUT2_ERROR_INVALID_PARAM;
 	}
