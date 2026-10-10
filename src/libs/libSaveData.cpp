@@ -477,31 +477,25 @@ static void queue_save_data_event(uint32_t type, int32_t user_id,
 	}
 }
 
+// '%' matches any run of characters, including none; '_' matches exactly one.
 static bool dir_name_match(const char* str, const char* pattern) {
-	while (*str != '\0' && *pattern != '\0') {
+	for (; *pattern != '\0'; pattern++) {
 		if (*pattern == '%') {
 			for (const char* s = str;; s++) {
 				if (dir_name_match(s, pattern + 1)) {
 					return true;
 				}
 				if (*s == '\0') {
-					break;
+					return false;
 				}
 			}
-			return false;
 		}
-		if (*pattern == '_') {
-			str++;
-			pattern++;
-			continue;
-		}
-		if (*pattern != *str) {
+		if (*str == '\0' || (*pattern != '_' && *pattern != *str)) {
 			return false;
 		}
 		str++;
-		pattern++;
 	}
-	return *str == '\0' && *pattern == '\0';
+	return *str == '\0';
 }
 
 static int mount_save_data(int slot, const std::filesystem::path& directory, uint32_t status,
