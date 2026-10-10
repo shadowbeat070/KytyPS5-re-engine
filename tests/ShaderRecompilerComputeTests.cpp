@@ -13038,6 +13038,23 @@ public:
                   std::all_of(expanded_metadata.begin(), expanded_metadata.end(),
                               [](uint8_t byte) { return byte == 0xff; }),
               "the GPU materialization retained native clear keys");
+      // RESIDENT EVIL 3 samples a target whose metadata another image also covers. An alias that
+      // holds nothing newer than guest memory does not take the decision off the GPU.
+      auto alias = MakeLinearDesc(dcc_address, metadata_size, vk::Format::eR8Unorm,
+                                  Prospero::BufferFormat::k8UNorm, Prospero::ImageType::kColor2D,
+                                  {4096, static_cast<uint32_t>(metadata_size / 4096), 1}, 1, 1, 1);
+      const auto alias_id = cache.FindImage(alias);
+      (void)cache.FindTexture(alias_id, alias);
+      (void)buffers.ObtainBuffer(dcc_address, metadata_size, true);
+      buffers.FillBuffer(dcc_address, metadata_size, 0x80808080u, false);
+      binding.image_id = cache.FindImage(binding.desc);
+      (void)cache.FindTexture(binding.image_id, binding.desc);
+      Require(name, "sampled clear beside a metadata alias",
+              binding.image_id != alias_id &&
+                  buffers.IsRegionGpuModified(dcc_address, metadata_size) &&
+                  ReadCachedTexel(name, context, binding.image_id) ==
+                      std::vector<u32>{0x3c003c00u, 0x00003c00u},
+              "an alias holding only guest bytes drained the GPU-written clear");
       resources.UnmapMemory(base, allocation_size);
       scheduler.Finish();
       context.ShutdownGpu();

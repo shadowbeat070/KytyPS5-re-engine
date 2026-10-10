@@ -1697,8 +1697,16 @@ bool TextureCache::MaterializeColorClearOnGpu(
 		if (registered != m_surface_metas.end() && registered->first < address + size) {
 			return false;
 		}
+		static const bool strict_aliases = [] {
+			const char* text = std::getenv("KYTY_NO_COLOR_CLEAR_ALIAS_GPU");
+			return text != nullptr && std::strcmp(text, "0") != 0;
+		}();
 		for (const auto other: FindImagesInRegion(address, size, false)) {
-			if (m_slot_images[other].Overlaps(address, size)) {
+			const auto& alias = m_slot_images[other];
+			if (!strict_aliases && (other == id || !alias.IsGpuModified())) {
+				continue;
+			}
+			if (alias.Overlaps(address, size)) {
 				return false;
 			}
 		}
