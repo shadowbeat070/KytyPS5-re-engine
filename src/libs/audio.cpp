@@ -14,6 +14,7 @@
 #include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstring>
 #include <magic_enum.hpp>
 #include <vector>
@@ -166,6 +167,16 @@ private:
 };
 
 static Audio* g_audio = nullptr;
+
+static double audio_soft_limit(double sample) {
+	constexpr double knee      = 0.9;
+	const double     magnitude = std::abs(sample);
+	if (magnitude <= knee) {
+		return sample;
+	}
+	return std::copysign(knee + (1.0 - knee) * std::tanh((magnitude - knee) / (1.0 - knee)),
+	                     sample);
+}
 
 namespace AudioInternal {
 
@@ -339,8 +350,9 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
+				const double sample = src[frame * channels + src_ch] * scales[src_ch];
 				dst[frame * output_channels + ch] =
-				    static_cast<float>(src[frame * channels + src_ch] * scales[src_ch]);
+				    static_cast<float>(gain > 1.0f ? audio_soft_limit(sample) : sample);
 			}
 			if (channels == 12) {
 				// Add the four top channels to their front/back channels, turning 12 into 8.
@@ -359,9 +371,12 @@ const void* Audio::PrepareOutputBuffer(const PortOut& port, const void* data,
 		for (uint32_t frame = 0; frame < frames; frame++) {
 			for (uint32_t ch = 0; ch < output_channels; ch++) {
 				const auto src_ch = reorder ? SDL_8CH_MAP[ch] : ch;
-				const double sample = src[frame * channels + src_ch] * scales[src_ch];
-				dst[frame * output_channels + ch] = static_cast<int16_t>(
-				    std::clamp(sample, -32768.0, 32767.0));
+				double     sample = src[frame * channels + src_ch] * scales[src_ch];
+				if (gain > 1.0f) {
+					sample = 32768.0 * audio_soft_limit(sample / 32768.0);
+				}
+				dst[frame * output_channels + ch] =
+				    static_cast<int16_t>(std::clamp(sample, -32768.0, 32767.0));
 			}
 		}
 	}
@@ -378,7 +393,7 @@ bool Audio::QueueSdlAudio(PortOut* port, const void* data, bool blocking, float 
 	}
 
 	std::vector<uint8_t> prepared_buffer;
-	const void*          prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer, gain, gains);
+	const void* prepared_data = PrepareOutputBuffer(*port, data, &prepared_buffer, gain, gains);
 	const auto           output_channels = OutputChannels(*port);
 	const auto           prepared_size =
 	    BytesPerSample(port->format) * output_channels * port->samples_num;
