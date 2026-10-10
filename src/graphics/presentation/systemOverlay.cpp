@@ -1,20 +1,19 @@
 #include "graphics/presentation/systemOverlay.h"
 
-#include <SDL3/SDL.h>
-
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "imgui.h"
-#include "imgui_internal.h"
 #include "imgui_impl_vulkan.h"
+#include "imgui_internal.h"
 #include "libs/controller.h"
 #include "libs/dialog.h"
 #include "libs/ime.h"
 #include "libs/imeDialog.h"
 #include "stb_image.h"
 
+#include <SDL3/SDL.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -178,14 +177,14 @@ bool                         g_input_reset_requested      = false;
 uint16_t                     g_last_external_keycode      = 0;
 uint32_t                     g_last_external_status       = 0;
 OverlaySession               g_input_session;
-bool                         g_input_active               = false;
-bool                         g_input_controller           = false;
-bool                         g_input_keyboard             = false;
-bool                         g_input_multiline            = false;
-bool                         g_input_lifecycle_active     = false;
-bool                         g_controller_captured        = false;
+bool                         g_input_active           = false;
+bool                         g_input_controller       = false;
+bool                         g_input_keyboard         = false;
+bool                         g_input_multiline        = false;
+bool                         g_input_lifecycle_active = false;
+bool                         g_controller_captured    = false;
 OverlaySession               g_session;
-SDL_Window*                  g_input_window               = nullptr;
+SDL_Window*                  g_input_window = nullptr;
 struct TrophyNotification {
 	std::string            name;
 	int32_t                grade;
@@ -480,9 +479,9 @@ void ShutdownSystemOverlayInput() {
 }
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
-	const auto core   = CoreIme::GetVisualState();
-	const auto dialog = DialogIme::GetVisualState();
-	const auto system = SystemDialog::GetVisualState();
+	const auto core          = CoreIme::GetVisualState();
+	const auto dialog        = DialogIme::GetVisualState();
+	const auto system        = SystemDialog::GetVisualState();
 	const bool trophy_active = g_trophy_notification_active.load(std::memory_order_acquire);
 	return {core.active || dialog.active || system.active || trophy_active,
 	        core.revision + dialog.revision + system.revision + (trophy_active ? 1u : 0u)};
@@ -533,7 +532,8 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 	if (controller_event && !g_input_controller) {
 		return false;
 	}
-	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT || event.type == SDL_EVENT_TEXT_EDITING ||
+	const bool keyboard_event = event.type == SDL_EVENT_TEXT_INPUT ||
+	                            event.type == SDL_EVENT_TEXT_EDITING ||
 	                            event.type == SDL_EVENT_KEY_DOWN || event.type == SDL_EVENT_KEY_UP;
 	if (keyboard_event && !g_input_keyboard) {
 		return false;
@@ -562,8 +562,8 @@ bool ProcessSystemOverlayInput(const SDL_Event& event) {
 		case SDL_EVENT_KEY_DOWN: {
 			g_last_external_keycode = static_cast<uint16_t>(event.key.scancode);
 			g_last_external_status  = ExternalKeyStatus(event.key.mod, false);
-			auto action = Ime::ExternalAction::Text;
-			bool queue  = true;
+			auto action             = Ime::ExternalAction::Text;
+			bool queue              = true;
 			if (event.key.key == SDLK_BACKSPACE) {
 				action = Ime::ExternalAction::Backspace;
 			} else if (event.key.key == SDLK_LEFT) {
@@ -1156,7 +1156,7 @@ struct SystemOverlay::Impl {
 	bool PrepareFrame(vk::Extent2D frame_extent, vk::Format format, uint32_t image_count) {
 		OverlaySnapshot snapshot;
 		const bool      has_overlay = GetOverlaySnapshot(&snapshot);
-		const auto now = Clock::now();
+		const auto      now         = Clock::now();
 		if (!has_overlay && !g_trophy_notification_active.load(std::memory_order_acquire)) {
 			return false;
 		}
@@ -1236,16 +1236,16 @@ struct SystemOverlay::Impl {
 		vulkan_initialized = false;
 	}
 
-	GraphicContext&                       graphics;
-	ImGuiContext*                         imgui_context      = nullptr;
-	bool                                  vulkan_initialized = false;
-	bool                                  shift              = false;
-	bool                                  symbol_mode        = false;
-	bool                                  focus_pending      = true;
-	float                                 ui_scale           = 1.0f;
-	float                                 button_height      = 42.0f;
-	ImVec2                                panel_offset {};
-	ImVec2                                right_stick {};
+	GraphicContext&                             graphics;
+	ImGuiContext*                               imgui_context      = nullptr;
+	bool                                        vulkan_initialized = false;
+	bool                                        shift              = false;
+	bool                                        symbol_mode        = false;
+	bool                                        focus_pending      = true;
+	float                                       ui_scale           = 1.0f;
+	float                                       button_height      = 42.0f;
+	ImVec2                                      panel_offset {};
+	ImVec2                                      right_stick {};
 	OverlaySession                              session;
 	std::unique_ptr<ImTextureData>              trophy_notification_image;
 	std::optional<TrophyNotification>           trophy_notification;
