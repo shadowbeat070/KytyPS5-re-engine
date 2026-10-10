@@ -13,11 +13,12 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
-#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/dispatchGuard.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -384,8 +385,8 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 	dynamic_state.SetDepthBoundsTestEnabled(depth.depth_bounds_test_enable);
 	if (depth.depth_bounds_test_enable) {
 		// Without VK_EXT_depth_range_unrestricted the bounds must lie in [0, 1].
-		vk_buffer.setDepthBounds(std::clamp(ctx.GetDepthBoundsMin(), 0.0f, 1.0f),
-		                         std::clamp(ctx.GetDepthBoundsMax(), 0.0f, 1.0f));
+		dynamic_state.SetDepthBounds(std::clamp(ctx.GetDepthBoundsMin(), 0.0f, 1.0f),
+		                             std::clamp(ctx.GetDepthBoundsMax(), 0.0f, 1.0f));
 	}
 #endif
 
@@ -588,11 +589,13 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 static uint32_t DrawColorOutputMask(const HW::Context& ctx) {
 	const auto& sh_regs     = ctx.GetShaderRegisters();
 	const auto  write_mask  = ctx.GetRenderTargetMask() & sh_regs.m_cbShaderMask;
-	const auto  slots       = ColorExportSlots(sh_regs.m_cbShaderMask);
 	uint32_t    output_mask = 0;
 	for (uint32_t index = 0; index < RENDER_COLOR_ATTACHMENTS_MAX; index++) {
-		const auto slot = slots[index];
-		if (sh_regs.target_output_mode[index] != 0 && slot < RENDER_COLOR_ATTACHMENTS_MAX &&
+		const auto slot = ShaderPixelExportTarget(sh_regs.m_cbShaderMask, index);
+		if (slot >= RENDER_COLOR_ATTACHMENTS_MAX) {
+			break;
+		}
+		if (sh_regs.target_output_mode[index] != 0 &&
 		    render_target_mask_slot(write_mask, slot) != 0) {
 			output_mask |= 1u << slot;
 		}
@@ -1110,6 +1113,16 @@ static void CommitVertexBuffers(vk::CommandBuffer            vk_buffer,
 	}
 }
 
+static bool StageMayWriteMemory(const ShaderStageRuntime& stage) {
+	const auto& program = *stage.program;
+	const auto& info    = program.info;
+	return info.writes_dma || program.has_address_writes ||
+	       std::ranges::any_of(info.buffers, [](const auto& buffer) { return buffer.written; }) ||
+	       std::ranges::any_of(info.images, [](const auto& image) { return image.written; }) ||
+	       program.bindings.descriptor_counts[static_cast<size_t>(
+	           ShaderRecompiler::IR::DescriptorBindingKind::Gds)] != 0;
+}
+
 static void CommitIndexBuffer(vk::CommandBuffer vk_buffer, const PreparedIndexBuffer& prepared) {
 	if (prepared.buffer == nullptr) {
 		return;
@@ -1378,16 +1391,24 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	}
 
 	auto& dynamic_state = m_context.GetCommandScheduler().GetDynamicState();
+	// Helper passes (stencil-export replay, colour-clear draws, blits) bind their own pipelines
+	// and state, and bump the graphics binding epoch when they do.
+	if (m_dynamic_state_command != static_cast<VkCommandBuffer>(vk_buffer) ||
+	    m_dynamic_state_epoch != GraphicsBindingEpoch()) {
+		dynamic_state.Invalidate();
+	}
 	UpdateGraphicsDynamicState(buffer, dynamic_state, vertex_stages.back(), state.depth_info,
 	                           rendering);
 	dynamic_state.SetAttachmentFeedbackLoopAspects(feedback_aspects);
 	dynamic_state.Commit(m_context.GetGraphics(), vk_buffer);
+	m_dynamic_state_command = static_cast<VkCommandBuffer>(vk_buffer);
+	m_dynamic_state_epoch   = GraphicsBindingEpoch();
 
 	LogDrawPhase(draw.Name(), "BeginRendering");
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x400u);
 	}
-	if (indirect != nullptr) {
+	if (indirect != nullptr && !buffer.IndirectArgsBarrierHolds()) {
 		// The arguments may come from any earlier GPU write; the barrier cannot sit in a pass.
 		m_context.GetCommandScheduler().EndRendering();
 		vk::MemoryBarrier barrier {};
@@ -1396,6 +1417,7 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
 		                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0,
 		                          nullptr, 0, nullptr);
+		buffer.MarkIndirectArgsBarrier();
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
 	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
@@ -1444,6 +1466,11 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	if (shader_write_stages) {
 		m_context.GetCommandScheduler().EndRendering();
 		ShaderWriteBarrier(vk_buffer, shader_write_stages);
+	}
+	if (std::ranges::any_of(vertex_stages,
+	                        [](const auto& stage) { return StageMayWriteMemory(stage.stage); }) ||
+	    (state.ps_active && StageMayWriteMemory(state.ps_input_info.stage))) {
+		buffer.InvalidateIndirectArgsBarrier();
 	}
 	LogDrawPhase(draw.Name(), "DrawComplete");
 	if (!draw.IsIndexed()) {
@@ -1672,6 +1699,8 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 	    indirect ? std::pair<int32_t, uint32_t> {0, args.first_instance}
 	             : ResolveDrawOffsets(ucfg.GetIndexOffset(), state.vertex_info[0]);
 	DrawEmitInfo emit {};
+	// Native fetches (and fast-launch mesh prologs) consume the patched SGPRs; rewritten fetches
+	// need Vulkan offsets.
 	const bool native_indirect = indirect && !state.vertex_info[0].fetch_embedded;
 	emit.first_vertex = native_indirect ? 0 :
 	    static_cast<uint32_t>(vertex_offset + static_cast<int32_t>(args.first_vertex));
