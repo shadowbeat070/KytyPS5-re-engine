@@ -28,9 +28,29 @@ public:
 	bool Read(uint64_t address, std::span<uint32_t> values, CleanLine&& clean_line,
 	          Fallback&& fallback) {
 		const auto bytes = static_cast<uint64_t>(values.size_bytes());
-		const auto base  = address & ~(LineBytes - 1u);
-		if (bytes == 0u || address - base > LineBytes - bytes || bytes > LineBytes) {
+		auto*      line  = Find(address, bytes, clean_line);
+		if (line == nullptr || !line->clean) {
 			return Uncached(address, values, fallback);
+		}
+		std::memcpy(values.data(), line->data.data() + (address - line->base),
+		            static_cast<size_t>(bytes));
+		return true;
+	}
+
+	template <typename CleanLine>
+	bool CleanCovered(uint64_t address, uint64_t bytes, CleanLine&& clean_line) {
+		const auto* line = Find(address, bytes, clean_line);
+		return line != nullptr && line->clean;
+	}
+
+private:
+	struct Line;
+
+	template <typename CleanLine>
+	Line* Find(uint64_t address, uint64_t bytes, CleanLine& clean_line) {
+		const auto base = address & ~(LineBytes - 1u);
+		if (bytes == 0u || address - base > LineBytes - bytes || bytes > LineBytes) {
+			return nullptr;
 		}
 		// Hashed: tables sit at power-of-two alignments that a modulo would map to one slot.
 		auto& line = m_lines[static_cast<size_t>(((base / LineBytes) * 0x9e3779b97f4a7c15ull) >>
@@ -40,14 +60,9 @@ public:
 			line.base  = base;
 			line.clean = clean_line(base, line.data.data(), LineBytes);
 		}
-		if (!line.clean) {
-			return Uncached(address, values, fallback);
-		}
-		std::memcpy(values.data(), line.data.data() + (address - base), static_cast<size_t>(bytes));
-		return true;
+		return &line;
 	}
 
-private:
 	template <typename Fallback>
 	bool Uncached(uint64_t address, std::span<uint32_t> values, Fallback& fallback) {
 		bool       drained = false;
