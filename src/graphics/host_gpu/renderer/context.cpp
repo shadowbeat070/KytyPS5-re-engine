@@ -44,6 +44,7 @@ void CommandBuffer::Begin() {
 void CommandBuffer::End() const {
 	EndRendering();
 	auto buffer = Handle();
+	m_context.GetIndirectKeyFeedback().Flush(buffer);
 
 	auto result = buffer.end();
 
@@ -117,6 +118,7 @@ void CommandBuffer::EndRendering() const {
 	m_rendering              = false;
 	m_render_state           = {};
 	m_indirect_barrier_holds = false;
+	m_context.GetIndirectKeyFeedback().Flush(Handle());
 }
 
 } // namespace Libs::Graphics
