@@ -31,6 +31,7 @@
 #include "graphics/host_gpu/renderer/pipeline/bindlessImageHeap.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/dispatchGuard.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -13716,6 +13717,159 @@ public:
             Libs::LibKernel::Memory::KernelReleaseDirectMemory(
                 direct_offset, allocation_size) == 0,
             "indirect argument allocation release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
+  void CheckDispatchOverlap() {
+    constexpr const char *name = "DispatchOverlap";
+    constexpr uintptr_t base = 0x0000000204a00000ull;
+    constexpr uint64_t allocation_size = 0x100000;
+    constexpr uint64_t stride = 0x10000;
+    constexpr u32 groups = 64;
+    constexpr u32 words = groups * 64;
+    const std::array<uint64_t, 4> buffers{base, base + stride, base + 2 * stride, base + 3 * stride};
+    enum : u32 { A, B, C, D };
+
+    std::vector<u32> inc;
+    AppendVop3(&inc, 0x346u, 1, 8, InlineU32(6), Vgpr(0));
+    inc.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+    inc.push_back(EncodeMubuf1(2, 1, 1));
+    inc.push_back(EncodeSopp(0x0c, 0));
+    inc.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 2));
+    inc.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+    inc.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&inc);
+    std::vector<u32> fill;
+    AppendVop3(&fill, 0x346u, 1, 4, InlineU32(6), Vgpr(0));
+    fill.push_back(EncodeVop2(0x25u, 2, InlineU32(1), 1));
+    fill.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+    fill.push_back(EncodeMubuf1(2, 0, 1));
+    AppendEnd(&fill);
+    for (const auto *code : {&fill, &inc}) {
+      ShaderMapUserData(reinterpret_cast<uint64_t>(code->data()),
+          {.type = Prospero::ShaderBinaryType::kCs,
+           .code_size_bytes = static_cast<uint32_t>(code->size() * sizeof(u32))});
+    }
+
+    EnsureRuntimeContext();
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(),
+                allocation_size, allocation_size, 0, &direct_offset) == 0,
+            "overlap fixture allocation failed");
+    void *mapped = reinterpret_cast<void *>(base);
+    Require(name, "direct mapping",
+            Libs::LibKernel::Memory::KernelMapDirectMemory(
+                &mapped, allocation_size, 0x3, 0x10, direct_offset, allocation_size) == 0 &&
+                mapped == reinterpret_cast<void *>(base),
+            "overlap fixture mapping failed");
+    std::memset(mapped, 0, allocation_size);
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &scheduler = context.GetCommandScheduler();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(base, allocation_size);
+      const auto set_buffer = [&](u32 sgpr, uint64_t address) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= static_cast<u32>(sizeof(u32)) << 16u;
+        descriptor.fields[2] = words;
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i], HW::UserSgprType::Unknown);
+        }
+      };
+      const auto run_fill = [&](u32 out) {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(fill.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 4, .tgid_x_en = true});
+        set_buffer(0, buffers[out]);
+        processor.DispatchDirect(groups, 1, 1, 0x41u);
+      };
+      const auto run_inc = [&](u32 in, u32 out) {
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(inc.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 8, .tgid_x_en = true});
+        set_buffer(0, buffers[out]);
+        set_buffer(4, buffers[in]);
+        processor.DispatchDirect(groups, 1, 1, 0x41u);
+      };
+      const auto check = [&](const char *what, u32 index, u32 offset) {
+        cache.ReadMemory(buffers[index], words * sizeof(u32));
+        std::vector<u32> actual(words);
+        Require(name, "readback",
+                LibKernel::Memory::TryReadBacking(buffers[index], actual.data(),
+                                                  words * sizeof(u32)),
+                "overlap output could not be read back");
+        for (u32 i = 0; i < words; i++) {
+          Require(name, what, actual[i] == i + offset,
+                  "word " + std::to_string(i) + " expected " + Hex(i + offset) + ", got " +
+                      Hex(actual[i]));
+        }
+      };
+      const auto sequence = [&] {
+        run_fill(A);      // starts a group
+        run_fill(B);      // disjoint: joins
+        run_inc(A, C);    // reads A, which the group wrote: flushes
+        run_inc(B, D);    // B was flushed with the first group, C/A are only read by D: joins
+        run_inc(C, B);    // reads C and overwrites B that D just read: flushes
+      };
+      auto &counters = GetDispatchOverlapCounters();
+      // The first pass creates the programs and cache buffers, which records uploads in between.
+      sequence();
+      check("warm-up results", B, 3);
+      const auto joined = counters.joined.load();
+      const auto conflicts = counters.conflicts.load();
+      sequence();
+      Require(name, "pending barrier after a dispatch",
+              scheduler.Current().HasDeferredBarrier() == DispatchOverlapEnabled(),
+              "the last dispatch did not leave its barrier pending");
+      check("fill A", A, 1);
+      Require(name, "readback flushes the pending barrier",
+              !scheduler.Current().HasDeferredBarrier(),
+              "a download was recorded while a dispatch barrier was still pending");
+      check("RAW A -> C", C, 2);
+      check("RAW B -> D before the WAR overwrite", D, 2);
+      check("WAR C -> B", B, 3);
+      const auto expected_joins = DispatchOverlapEnabled() ? 2u : 0u;
+      Require(name, "disjoint dispatches join", counters.joined.load() - joined == expected_joins,
+              "joined " + std::to_string(counters.joined.load() - joined) + ", expected " +
+                  std::to_string(expected_joins));
+      Require(name, "dependent dispatches flush",
+              counters.conflicts.load() - conflicts == expected_joins,
+              "conflicts " + std::to_string(counters.conflicts.load() - conflicts) +
+                  ", expected " + std::to_string(expected_joins));
+
+      // A guest CS partial flush ends the group even for disjoint resources.
+      const auto before_sync = counters.joined.load();
+      run_fill(A);
+      processor.EmitGlobalBarrier();
+      Require(name, "guest sync flushes the group", !scheduler.Current().HasDeferredBarrier(),
+              "a guest barrier left the dispatch barrier pending");
+      run_fill(B);
+      Require(name, "no join across a guest sync", counters.joined.load() == before_sync,
+              "a dispatch joined a group that a guest sync had ended");
+      check("fill B after sync", B, 1);
+      context.UnmapMemory(base, allocation_size);
+      scheduler.Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "unmap direct backing",
+            Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0,
+            "overlap fixture unmap failed");
+    Require(name, "release direct backing",
+            Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, allocation_size) ==
+                0,
+            "overlap fixture release failed");
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
@@ -53559,6 +53713,11 @@ int main(int argc, char **argv) {
     vulkan.CheckLongRecordingSubmit();
     return 0;
   }
+  if (argc == 2 && std::strcmp(argv[1], "--dispatch-overlap-only") == 0) {
+    VulkanHarness vulkan;
+    vulkan.CheckDispatchOverlap();
+    return 0;
+  }
   if (argc == 2 && std::strcmp(argv[1], "--stencil-plane-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckStencilPlaneEqualFootprint(true);
@@ -54661,6 +54820,7 @@ int main(int argc, char **argv) {
   vulkan.CheckGpuTilerVolumeRoundTrip();
   vulkan.CheckGpuTilerCpuParity();
   vulkan.CheckNativeIndirectDispatch();
+  vulkan.CheckDispatchOverlap();
   CheckComputeLdsLimit(vulkan);
   vulkan.CheckRefusedShaderSkipsDispatch();
   vulkan.CheckUnifiedTextureCacheFlow();
