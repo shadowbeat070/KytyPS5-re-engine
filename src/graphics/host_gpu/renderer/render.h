@@ -319,6 +319,19 @@ private:
 	PreparedBindings                      m_compute_bindings;
 	DispatchAccess                        m_dispatch_access;
 	std::vector<ImageId>                  m_bound_images;
+	struct LastGraphicsBindings {
+		VkCommandBuffer       command          = nullptr;
+		uint64_t              tick             = 0;
+		uint64_t              epoch            = 0;
+		VkPipelineLayout      layout           = nullptr;
+		uint64_t              layout_signature = 0;
+		VkPipeline            pipeline         = nullptr;
+		bool                  pixel_set_bound  = false;
+		std::vector<uint64_t> pixel_content;
+	};
+	LastGraphicsBindings  m_last_graphics;
+	std::vector<uint64_t> m_pixel_content_scratch;
+	[[nodiscard]] bool    LastGraphicsBindingsValid(vk::CommandBuffer command);
 	// Scratch for CommitBindings: the ranges this op writes, checked against captured reads.
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
 	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;

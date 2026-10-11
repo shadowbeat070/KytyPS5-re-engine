@@ -15,6 +15,7 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/hostMemory.h"
+#include "graphics/host_gpu/renderer/bindingEpoch.h"
 #include "graphics/host_gpu/renderer/colorRenderTarget.h"
 #include "graphics/host_gpu/renderer/debug.h"
 #include "graphics/host_gpu/renderer/depthRenderTarget.h"
@@ -34,12 +35,14 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
 #include <vector>
+#include <xxhash.h>
 
 #ifdef min
 #undef min
@@ -918,6 +921,39 @@ static vk::DescriptorBufferInfo NativeUpload(RenderContext&            context,
 	return {buffer.Handle(), offset, data.size_bytes()};
 }
 
+static vk::DescriptorBufferInfo NativeUploadShared(RenderContext&            context,
+                                                   std::span<const uint32_t> data) {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_UPLOAD_DEDUP");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	if (!enabled) {
+		return NativeUpload(context, data);
+	}
+	struct Entry {
+		uint64_t                 tick   = 0;
+		VkBuffer                 buffer = nullptr;
+		std::vector<uint32_t>    words;
+		vk::DescriptorBufferInfo info;
+	};
+	static thread_local std::array<Entry, 64> entries;
+	const auto                                tick   = context.GetCommandScheduler().CurrentTick();
+	const auto                                stream = static_cast<VkBuffer>(
+	    context.GetBufferCache().GetUtilityBuffer(MemoryUsage::Stream).Handle());
+	const auto hash  = XXH3_64bits(data.data(), data.size_bytes());
+	auto&      entry = entries[hash % entries.size()];
+	if (entry.tick == tick && entry.buffer == stream && entry.words.size() == data.size() &&
+	    std::equal(data.begin(), data.end(), entry.words.begin())) {
+		return entry.info;
+	}
+	const auto info = NativeUpload(context, data);
+	entry.tick      = tick;
+	entry.buffer    = static_cast<VkBuffer>(info.buffer);
+	entry.words.assign(data.begin(), data.end());
+	entry.info = info;
+	return info;
+}
+
 RenderExecutor::RenderExecutor(RenderContext& context): m_context(context) {}
 
 RenderExecutor::~RenderExecutor() = default;
@@ -1110,8 +1146,10 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        layout, ShaderRecompiler::IR::DescriptorBindingKind::FlattenedSrt) != nullptr) {
+		const bool shared = snapshot.key_feedback.empty();
 		if (prepared.bindless_patches.empty()) {
-			prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+			prepared.flattened_srt = shared ? NativeUploadShared(m_context, snapshot.flattened_srt)
+			                                : NativeUpload(m_context, snapshot.flattened_srt);
 		} else {
 			static thread_local std::vector<uint32_t> patched;
 			patched.assign(snapshot.flattened_srt.begin(), snapshot.flattened_srt.end());
@@ -1120,7 +1158,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 				patched[offset]      = base;
 				patched[offset + 1u] = count;
 			}
-			prepared.flattened_srt = NativeUpload(m_context, patched);
+			prepared.flattened_srt =
+			    shared ? NativeUploadShared(m_context, patched) : NativeUpload(m_context, patched);
 		}
 		for (const auto& feedback: snapshot.key_feedback) {
 			m_context.GetIndirectKeyFeedback().Queue(
@@ -1131,7 +1170,7 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 	}
 	if (ShaderRecompiler::IR::FindBinding(
 	        program.bindings, ShaderRecompiler::IR::DescriptorBindingKind::ShaderData) != nullptr) {
-		prepared.shader_data_buffer = NativeUpload(m_context, prepared.shader_data);
+		prepared.shader_data_buffer = NativeUploadShared(m_context, prepared.shader_data);
 	}
 }
 
@@ -1308,6 +1347,54 @@ void RenderExecutor::PrepareGraphicsBindings(std::span<PreparedBindings* const> 
 	// after image identities are final; attachment layout transitions follow buffer alias copies.
 	for (auto* stage: stages) {
 		RebindBuffers(*stage);
+	}
+}
+
+bool RenderExecutor::LastGraphicsBindingsValid(vk::CommandBuffer command) {
+	auto& last = m_last_graphics;
+	return last.command == static_cast<VkCommandBuffer>(command) &&
+	       last.tick == m_context.GetCommandScheduler().CurrentTick() &&
+	       last.epoch == GraphicsBindingEpoch();
+}
+
+static bool SameGraphicsLayout(VkPipelineLayout last, uint64_t last_signature,
+                               const PipelineCache::Pipeline& pipeline) {
+	static const bool signatures = [] {
+		const char* text = std::getenv("KYTY_NO_LAYOUT_SIGNATURE");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	if (last == static_cast<VkPipelineLayout>(pipeline.pipeline_layout)) {
+		return true;
+	}
+	return signatures && last_signature != 0 && last_signature == pipeline.layout_signature;
+}
+
+// KYTY_NO_PIXEL_SET_REUSE=1: allocate, write and bind the pixel set for every draw again.
+static bool PixelSetReuseEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_PIXEL_SET_REUSE");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+static void AppendWriteContent(std::vector<uint64_t>& out, const vk::WriteDescriptorSet& write) {
+	out.push_back((uint64_t {write.dstBinding} << 32u) |
+	              static_cast<uint32_t>(write.descriptorType));
+	out.push_back(write.descriptorCount);
+	for (uint32_t i = 0; i < write.descriptorCount; i++) {
+		if (write.pBufferInfo != nullptr) {
+			const auto& info = write.pBufferInfo[i];
+			out.push_back(reinterpret_cast<uint64_t>(static_cast<VkBuffer>(info.buffer)));
+			out.push_back(info.offset);
+			out.push_back(info.range);
+		}
+		if (write.pImageInfo != nullptr) {
+			const auto& info = write.pImageInfo[i];
+			out.push_back(reinterpret_cast<uint64_t>(static_cast<VkSampler>(info.sampler)));
+			out.push_back(reinterpret_cast<uint64_t>(static_cast<VkImageView>(info.imageView)));
+			out.push_back(static_cast<uint64_t>(info.imageLayout));
+		}
 	}
 }
 
@@ -1554,6 +1641,25 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 		}
 	}
 
+	const bool graphics_point     = pipeline_bind_point == vk::PipelineBindPoint::eGraphics;
+	bool       pixel_set_reusable = false;
+	if (graphics_point) {
+		if (!LastGraphicsBindingsValid(vk_buffer) ||
+		    !SameGraphicsLayout(m_last_graphics.layout, m_last_graphics.layout_signature,
+		                        pipeline)) {
+			m_last_graphics.pixel_set_bound = false;
+			m_last_graphics.pixel_content.clear();
+			if (!LastGraphicsBindingsValid(vk_buffer)) {
+				m_last_graphics.pipeline = nullptr;
+			}
+		}
+		m_last_graphics.command          = static_cast<VkCommandBuffer>(vk_buffer);
+		m_last_graphics.tick             = m_context.GetCommandScheduler().CurrentTick();
+		m_last_graphics.epoch            = GraphicsBindingEpoch();
+		m_last_graphics.layout           = static_cast<VkPipelineLayout>(pipeline.pipeline_layout);
+		m_last_graphics.layout_signature = pipeline.layout_signature;
+		pixel_set_reusable               = PixelSetReuseEnabled();
+	}
 	if (has_push_data) {
 		vk_buffer.pushConstants(pipeline.pipeline_layout, push_stages, 0, sizeof(push_data),
 		                        push_data.dwords.data());
@@ -1617,14 +1723,25 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			}
 		}
 		if (pixel_count != 0) {
-			const auto set = heap.Commit(pipeline.pixel_descriptor_set_layout);
+			auto& content = m_pixel_content_scratch;
+			content.clear();
 			for (uint32_t i = 0; i < pixel_count; i++) {
-				pixel_begin[i].dstSet = set;
+				AppendWriteContent(content, pixel_begin[i]);
 			}
-			m_context.GetGraphics().device.updateDescriptorSets(pixel_count, &*pixel_begin, 0,
-			                                                    nullptr);
-			vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1, &set,
-			                             0, nullptr);
+			const bool reuse = pixel_set_reusable && m_last_graphics.pixel_set_bound &&
+			                   content == m_last_graphics.pixel_content;
+			if (!reuse) {
+				const auto set = heap.Commit(pipeline.pixel_descriptor_set_layout);
+				for (uint32_t i = 0; i < pixel_count; i++) {
+					pixel_begin[i].dstSet = set;
+				}
+				m_context.GetGraphics().device.updateDescriptorSets(pixel_count, &*pixel_begin, 0,
+				                                                    nullptr);
+				vk_buffer.bindDescriptorSets(pipeline_bind_point, pipeline.pipeline_layout, 1, 1,
+				                             &set, 0, nullptr);
+				m_last_graphics.pixel_set_bound = true;
+				m_last_graphics.pixel_content.swap(content);
+			}
 		}
 	}
 	if (bindless_set != nullptr) {

@@ -39,6 +39,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -1383,7 +1384,15 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 		buffer.MarkIndirectArgsBarrier();
 	}
 	m_context.GetCommandScheduler().BeginRendering(rendering);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+	static const bool pipeline_reuse = [] {
+		const char* text = std::getenv("KYTY_NO_GRAPHICS_PIPELINE_REUSE");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	if (!pipeline_reuse || !LastGraphicsBindingsValid(vk_buffer) ||
+	    m_last_graphics.pipeline != static_cast<VkPipeline>(pipeline.pipeline)) {
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eGraphics, pipeline.pipeline);
+		m_last_graphics.pipeline = static_cast<VkPipeline>(pipeline.pipeline);
+	}
 	if (!draw.IsIndexed()) {
 		SetDrawDebugPhase(buffer, submit_id, draw, 0x500u);
 	}
