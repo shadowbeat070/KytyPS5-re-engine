@@ -195,6 +195,10 @@ struct BufferCacheTestAccess {
     return cache.BeginGuestDownload(buffer, address, size, download);
   }
 
+  static void NoteGuestFault(BufferCache &cache, uint64_t address, uint64_t size) {
+    cache.NoteGuestFault(address, size);
+  }
+
   static void FinishGuestDownload(BufferCache &cache, GuestDownload &download,
                                   uint64_t address, uint64_t size) {
     cache.m_scheduler.WaitDetached({download.slot, download.fence});
@@ -4982,6 +4986,8 @@ public:
     constexpr uint64_t recording_offset = 0x2000;
     constexpr uint64_t joined_offset = 0x40100;
     constexpr uint64_t guest_offset = 0x80000;
+    constexpr uint64_t hot_offset = 0xc0000;
+    constexpr uint32_t hot_value = 0x2468ace0u;
     constexpr uint32_t stale = 0x0badf00du;
     constexpr uint32_t submitted_value = 0x11223344u;
     constexpr uint32_t recording_value = 0x55667788u;
@@ -5010,7 +5016,8 @@ public:
                 allocation_alignment) == 0 &&
                 mapped == reinterpret_cast<void *>(base),
             "detached-download fixed direct-memory mapping failed");
-    for (const auto offset : {submitted_offset, recording_offset, joined_offset}) {
+    for (const auto offset :
+         {submitted_offset, recording_offset, joined_offset, guest_offset, hot_offset}) {
       std::memcpy(static_cast<uint8_t *>(mapped) + offset, &stale, sizeof(stale));
     }
     {
@@ -5123,6 +5130,54 @@ public:
       Require(name, "late download keeps the guest write",
               backing(guest_offset) == guest_write,
               "a second fault's older copy was published over a guest write");
+
+      const auto settle = [&] {
+        const auto tick = scheduler.CurrentTick();
+        scheduler.Flush();
+        scheduler.GetMasterSemaphore().Wait(tick);
+        scheduler.PopPendingOperations();
+      };
+      write_on_gpu(hot_offset, hot_value);
+      scheduler.Flush();
+      cache.ReadMemory(base + hot_offset, sizeof(hot_value));
+      BufferCacheTestAccess::NoteGuestFault(cache, base + hot_offset, sizeof(hot_value));
+      write_on_gpu(hot_offset, hot_value + 1u);
+      settle();
+      Require(name, "hot page settles without a fault",
+              backing(hot_offset) == hot_value + 1u &&
+                  !cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)) &&
+                  !cache.IsRegionGpuModified(base + hot_offset, sizeof(hot_value)),
+              "a GPU write to a page the guest faulted on was not published at completion");
+
+      // Written again before the copy completed: the older copy must not land.
+      write_on_gpu(hot_offset, hot_value + 2u);
+      scheduler.Flush();
+      const auto overtaken_tick = scheduler.CurrentTick() - 1u;
+      write_on_gpu(hot_offset, hot_value + 3u);
+      scheduler.GetMasterSemaphore().Wait(overtaken_tick);
+      scheduler.PopPendingOperations();
+      Require(name, "overtaken hot copy stays unpublished",
+              backing(hot_offset) == hot_value + 1u &&
+                  cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
+              "a hot-page copy older than the newest GPU write was published");
+      settle();
+      Require(name, "overtaken hot page settles",
+              backing(hot_offset) == hot_value + 3u &&
+                  !cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
+              "the rewritten hot page did not publish its newest bytes");
+
+      write_on_gpu(hot_offset, hot_value + 4u);
+      scheduler.Flush();
+      const auto joined_tick = scheduler.CurrentTick() - 1u;
+      (void)cache.FindBuffer(base + hot_offset - 0x8100, 0x20000);
+      scheduler.GetMasterSemaphore().Wait(joined_tick);
+      scheduler.PopPendingOperations();
+      settle();
+      Require(name, "join-overtaken hot page settles",
+              backing(hot_offset) == hot_value + 4u &&
+                  !cache.HasGpuDirtyBytes(base + hot_offset, sizeof(hot_value)),
+              "a hot page overtaken by a join was not copied again");
+
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
     }

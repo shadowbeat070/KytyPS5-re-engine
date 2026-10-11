@@ -50,6 +50,8 @@ public:
 	void WaitGuestWrites(uint64_t address, uint64_t size);
 	// Records into its own command buffer that waits only for `wait_tick`, already submitted.
 	void RunDetached(uint64_t wait_tick, Common::UniqueFunction<void, vk::CommandBuffer>&& record);
+	// Runs at the end of every recording, before it is submitted; it may record more commands.
+	void SetBeforeSubmit(Common::UniqueFunction<void>&& hook) { m_before_submit = std::move(hook); }
 	struct DetachedTicket {
 		int       slot  = -1;
 		vk::Fence fence = nullptr;
@@ -128,6 +130,8 @@ private:
 	vk::CommandPool              m_detached_pool          = nullptr;
 	vk::CommandBuffer            m_detached_buffer        = nullptr;
 	vk::Fence                    m_detached_fence         = nullptr;
+	Common::UniqueFunction<void>          m_before_submit;
+	bool                                  m_in_before_submit = false;
 	struct DetachedSlot {
 		vk::CommandBuffer command = nullptr;
 		vk::Fence         fence   = nullptr;
