@@ -4,6 +4,8 @@
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <utility>
 
@@ -30,8 +32,22 @@ public:
 		if (size == 0) {
 			return;
 		}
+		if (RoundToPages()) {
+			const auto begin = vaddr & ~(TRACKER_PAGE_SIZE - 1);
+			const auto end   = (vaddr + size + TRACKER_PAGE_SIZE - 1) & ~(TRACKER_PAGE_SIZE - 1);
+			vaddr            = begin;
+			size             = end - begin;
+		}
 		std::lock_guard lock(m_mutex);
 		m_pending.Add(vaddr, size);
+	}
+
+	[[nodiscard]] static bool RoundToPages() {
+		static const bool enabled = [] {
+			const char* text = std::getenv("KYTY_NO_BDA_SYNC_PAGES");
+			return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+		}();
+		return enabled;
 	}
 
 	// Only for memory that can no longer be reached at all - an unmapped range. Dropping a range
