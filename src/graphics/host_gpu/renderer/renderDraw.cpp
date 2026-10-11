@@ -1045,15 +1045,35 @@ struct PreparedIndirectDraw {
 	if (span > MaxPeekBytes) {
 		return false;
 	}
+	// Both record layouts lead with the element count and the instance count.
+	const auto record_empty = [](std::span<const uint32_t> record) {
+		return record[0] == 0 || record[1] == 0;
+	};
+	// Almost every draw draws: decide on the first record before copying the rest.
+	static const bool first_record_only = ![] {
+		const char* text = std::getenv("KYTY_NO_INDIRECT_FIRST_RECORD");
+		return text != nullptr && text[0] != '\0' && std::strcmp(text, "0") != 0;
+	}();
+	std::array<uint32_t, 2> head {};
+	if (first_record_only) {
+		if (!clean_read(args.args_addr, head)) {
+			return false;
+		}
+		if (!record_empty(head)) {
+			return false;
+		}
+		if (count == 1) {
+			return true;
+		}
+	}
 	static thread_local std::vector<uint32_t> words;
 	words.resize(static_cast<size_t>(span / sizeof(uint32_t)));
 	if (!clean_read(args.args_addr, words)) {
 		return false;
 	}
-	// Both record layouts lead with the element count and the instance count.
 	for (uint32_t record = 0; record < count; record++) {
 		const auto first = static_cast<size_t>(record) * args.stride / sizeof(uint32_t);
-		if (words[first] != 0 && words[first + 1] != 0) {
+		if (!record_empty(std::span<const uint32_t>(words).subspan(first, 2))) {
 			return false;
 		}
 	}
