@@ -17,6 +17,7 @@
 #include <memory>
 #include <set>
 #include <span>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -201,6 +202,26 @@ private:
 	};
 	[[nodiscard]] bool BeginGuestDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
 	                                      GuestDownload& download);
+	void               NoteGuestFault(uint64_t vaddr, uint64_t size);
+	void               NoteHotWrite(uint64_t vaddr, uint64_t size);
+	void               RecordHotWriteBacks();
+	// One copied range of a hot write-back: guest address, offset in the staging buffer, bytes.
+	struct HotCopy {
+		uint64_t address = 0;
+		uint64_t staging = 0;
+		uint64_t size    = 0;
+	};
+	void PublishHotWriteBack(const std::vector<HotCopy>& copies, const uint8_t* mapped,
+	                         size_t writes_start);
+	// One submit's hot write-back, published once its recording has completed.
+	struct HotBatch {
+		uint64_t                tick = 0;
+		std::vector<HotCopy>    copies;
+		std::unique_ptr<Buffer> staging;
+		uint64_t                size         = 0;
+		size_t                  writes_start = 0;
+	};
+	void                 PublishCompletedHotWriteBacks(uint64_t max_tick = UINT64_MAX);
 	[[nodiscard]] size_t OpenWriteLog();
 	[[nodiscard]] bool   WrittenSince(size_t start, uint64_t begin, uint64_t end) const;
 	void                 CloseWriteLog(size_t start);
@@ -256,6 +277,11 @@ private:
 	// Absolute index of the log's first entry, and the starts of every open user.
 	size_t                m_write_log_base = 0;
 	std::multiset<size_t> m_write_log_users;
+	// Tracker page -> garbage-collection tick of the last guest fault on it.
+	std::unordered_map<uint64_t, uint64_t> m_guest_hot_pages;
+	// Hot pages the recording in progress wrote.
+	RangeSet             m_hot_written;
+	std::deque<HotBatch> m_hot_batches;
 	// A BDA store can reach any page, including ones no mark names yet.
 	uint64_t      m_bda_store_tick = 0;
 	MemoryTracker m_memory_tracker;
