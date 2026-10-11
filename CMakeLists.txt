@@ -697,6 +697,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME long_recording_submit
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --long-recording-only)
+	add_test(NAME long_recording_submit_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --long-recording-only)
+	set_tests_properties(long_recording_submit_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_PERIODIC_SUBMIT=1")
 
 	add_test(NAME texture_cache_layered_image
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --layered-image-only)
