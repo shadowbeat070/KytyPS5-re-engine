@@ -1180,7 +1180,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 			m_memory_tracker.MarkRegionAsCpuModified(address, bytes);
 		}
 	}
-	if (source) {
+	if (source && m_upload_batch) {
+		m_batched_uploads.push_back({source, buffer.Handle(), std::move(copies)});
+	} else if (source) {
 		auto& command = m_scheduler.Current();
 		command.EndRendering();
 		const auto              native = command.Handle();
@@ -1837,6 +1839,57 @@ void BufferCache::ForgetClassifiedMetadata(uint64_t vaddr, uint64_t size) {
 	while (it != m_classified_metadata.end() && it->first < end) {
 		it = it->first + it->second.size > vaddr ? m_classified_metadata.erase(it) : std::next(it);
 	}
+}
+
+static bool BdaUploadBatchEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_BDA_UPLOAD_BATCH");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+void BufferCache::BeginUploadBatch() {
+	EXIT_IF(m_upload_batch || !m_batched_uploads.empty());
+	if (!BdaUploadBatchEnabled()) {
+		return;
+	}
+	// The staged bytes stay unsealed until the batch has recorded the copies that read them.
+	m_staging_buffer.BeginHold();
+	m_upload_batch = true;
+}
+
+void BufferCache::EndUploadBatch() {
+	if (!m_upload_batch) {
+		return;
+	}
+	m_upload_batch = false;
+	if (!m_batched_uploads.empty()) {
+		auto& command = m_scheduler.Current();
+		command.EndRendering();
+		const auto        native = command.Handle();
+		vk::MemoryBarrier before {};
+		before.srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite |
+		                       vk::AccessFlagBits::eTransferRead |
+		                       vk::AccessFlagBits::eTransferWrite;
+		before.dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+		                       vk::PipelineStageFlagBits::eTransfer, {}, 1, &before, 0, nullptr, 0,
+		                       nullptr);
+		// The memory tracker hands out each dirty byte once, so the batch's copies are disjoint.
+		for (const auto& upload: m_batched_uploads) {
+			native.copyBuffer(upload.source, upload.destination,
+			                  static_cast<uint32_t>(upload.copies.size()), upload.copies.data());
+		}
+		vk::MemoryBarrier after {};
+		after.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+		native.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                       vk::PipelineStageFlagBits::eAllCommands, {}, 1, &after, 0, nullptr,
+		                       0, nullptr);
+		m_batched_uploads.clear();
+	}
+	m_staging_buffer.EndHold();
 }
 
 void BufferCache::SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size) {

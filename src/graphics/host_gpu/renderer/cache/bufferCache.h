@@ -109,6 +109,8 @@ public:
 	void PrefetchBda(uint64_t vaddr, uint64_t size, bool store, uint64_t store_window = 64 * 1024);
 	void ForgetBdaResidency(uint64_t vaddr, uint64_t size);
 	void SynchronizeBuffersInRange(uint64_t vaddr, uint64_t size);
+	void BeginUploadBatch();
+	void EndUploadBatch();
 	// Marks the tracked pages a BDA store can reach GPU-written, restricted to mapped memory.
 	void MarkBdaStoresInMapped(const RangeSet& mapped, bool all_tracked);
 	// The BDA synchronise set, kept by the memory tracker. PrepareBda drains it instead of
@@ -303,6 +305,14 @@ private:
 	std::map<std::pair<uint64_t, uint64_t>, uint32_t> m_precise_dense;
 	bool                                              m_precise_scope   = false;
 	bool                                              m_precise_marking = false;
+
+	struct BatchedUpload {
+		vk::Buffer                  source;
+		vk::Buffer                  destination;
+		std::vector<vk::BufferCopy> copies;
+	};
+	bool                       m_upload_batch = false;
+	std::vector<BatchedUpload> m_batched_uploads;
 };
 
 } // namespace Libs::Graphics

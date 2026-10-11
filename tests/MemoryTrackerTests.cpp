@@ -1461,6 +1461,24 @@ void TestBdaSyncSetOrdering() {
         "Drop did not keep the tracker pages an unmap only partly covered");
 }
 
+void TestBdaSyncSetPageRanges() {
+  constexpr uint64_t P = Libs::Graphics::TRACKER_PAGE_SIZE;
+  Libs::Graphics::BdaSyncSet set;
+  for (uint64_t page = 0; page < 3; page++) {
+    for (uint64_t byte = 7; byte < P; byte += 61) {
+      set.Queue(0x40000 + page * P + byte, 1);
+    }
+  }
+  set.Queue(0x80000 + P / 2, 1);
+  const RangeSet drained = set.Take();
+  size_t ranges = 0;
+  drained.ForEach([&](uint64_t, uint64_t) { ranges++; });
+  Check(!Libs::Graphics::BdaSyncSet::RoundToPages() ||
+            (ranges == 2 && drained.Contains(0x40000, P * 3) &&
+             drained.Contains(0x80000, P) && !drained.Intersects(0x40000 + P * 3, P)),
+        "scattered queues were not merged into the whole tracker pages they touch");
+}
+
 void TestFatalPaths() {
   for (const char *name : {"gpu-dirty-explicit-cpu", "reentrant-upload",
                            "recursive-tracking-lock", "non-owner-tracking-unlock"}) {
@@ -1567,6 +1585,7 @@ int main(int argc, char **argv) {
   TestGpuUnmarkUsesRegionMask();
   TestFullRegionGpuUnmarkBatching();
   TestBdaSyncSetOrdering();
+  TestBdaSyncSetPageRanges();
   TestBdaSyncSetMatchesFullWalk();
   TestFatalPaths();
 #if KYTY_PLATFORM == KYTY_PLATFORM_LINUX

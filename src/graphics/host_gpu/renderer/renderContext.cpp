@@ -177,9 +177,11 @@ void RenderContext::PrepareBda(bool stores) {
 	// the mapped set, so everything outside it is provably a no-op. Take the set before walking:
 	// a queue that lands during the walk belongs to the next call, never to this one.
 	const RangeSet pending = m_buffer_cache.TakeBdaSync();
+	m_buffer_cache.BeginUploadBatch();
 	ForEachBdaSyncRange(pending, m_mapped_ranges, [this](uint64_t start, uint64_t end) {
 		m_buffer_cache.SynchronizeBuffersInRange(start, end - start);
 	});
+	m_buffer_cache.EndUploadBatch();
 	if (stores || m_buffer_cache.HasUnmarkedBdaStores()) {
 		m_buffer_cache.MarkBdaStoresInMapped(m_mapped_ranges, stores);
 		m_buffer_cache.ClearUnmarkedBdaStores();
