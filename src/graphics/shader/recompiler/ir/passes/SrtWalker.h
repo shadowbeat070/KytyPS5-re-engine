@@ -48,6 +48,8 @@ struct SrtRuntime {
 	SrtMemoryReader read_condition_memory = nullptr;
 	std::span<const uint32_t> workgroup_counts;
 	SrtOwnershipQuery         gpu_owned = nullptr;
+	// Told when a materialization throws its walk away and walks again without pruning.
+	void (*walk_restarted)(void* userdata) = nullptr;
 };
 
 enum class RuntimeValueType { Any, Integer };
@@ -181,6 +183,16 @@ struct RawReadEvent {
 };
 [[nodiscard]] const RawReadEvent* CurrentRawReadEvent();
 [[nodiscard]] size_t              RawReadOffsetArgument(ValueOpcode op);
+struct RawReadShape {
+	enum class Kind : uint8_t { Address, ConstBuffer, VectorBuffer };
+	Kind    kind      = Kind::Address;
+	int64_t immediate = 0;
+};
+[[nodiscard]] RawReadReject       RawReadShapeOf(const ResourcePlan& program, const Inst& inst,
+                                                 uint32_t component_bytes, RawReadShape& shape);
+[[nodiscard]] RawReadReject       RawReadAddressFrom(const RawReadShape&            shape,
+                                                     const std::array<uint64_t, 5>& operands,
+                                                     uint64_t&                      address);
 [[nodiscard]] RawReadReject       RawReadAddress(const ResourcePlan& program, const Inst& inst,
                                                  uint32_t                       component_bytes,
                                                  const std::array<uint64_t, 5>& operands,

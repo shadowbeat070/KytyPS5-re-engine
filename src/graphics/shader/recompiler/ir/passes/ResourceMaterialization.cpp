@@ -3080,6 +3080,47 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 	       WriteIndirectImageSlots(program, snapshot, specialization);
 }
 
+bool RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                            ResourceSpecialization& specialization) {
+	if (snapshot.images.size() != program.info.images.size() ||
+	    specialization.images.size() != program.info.images.size() ||
+	    snapshot.samplers.size() != program.info.samplers.size()) {
+		return false;
+	}
+	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
+		const auto& image  = program.info.images[i];
+		const auto* source = Source(program, image.source);
+		if (source == nullptr || source->indirect_descriptor.has_value()) {
+			continue;
+		}
+		specialization.images[i] = {
+		    .numeric_class              = image.numeric_class,
+		    .dimension                  = image.dimension,
+		    .mip_count                  = image.mip_count,
+		    .conversion_format          = image.conversion_format,
+		    .shader_swizzle             = image.shader_swizzle,
+		    .indirect_root              = image.indirect_root,
+		    .indirect_mapping_offset    = image.indirect_mapping_offset,
+		    .indirect_search_iterations = image.indirect_search_iterations,
+		    .cube                       = image.cube,
+		};
+		if (!ValidImageDescriptor(snapshot.images[i], image.r128)) {
+			snapshot.images[i].dwords.fill(0);
+		}
+	}
+	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
+		if (program.info.samplers[i].gather_lod) {
+			const auto control = snapshot.samplers[i].dwords[2];
+			const auto filter  = (control >> 26u) & 3u;
+			if (filter > 1u || (filter == 1u && (control & 0xfffffu) != 0u)) {
+				return false;
+			}
+		}
+	}
+	return BuildResourceSpecialization(program, snapshot, specialization) &&
+	       WriteIndirectImageSlots(program, snapshot, specialization);
+}
+
 // The caller holds one snapshot and one specialization per cached shader, and both outlive a
 // refused draw: the permutation lookup compares the specialization, so a half-written one names
 // a shape nothing was built for. Materialize aside and commit only when the whole draw resolves.
@@ -3115,6 +3156,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	// A branch condition read from a buffer the shader writes cannot prune blocks: walk them all.
 	if (!CapturedReadsAvoidWrittenBuffers(program, next)) {
 		reset();
+		if (runtime.walk_restarted != nullptr) {
+			runtime.walk_restarted(runtime.userdata);
+		}
 		if (!MaterializeInto(program, runtime, next, next_specialization, refused_tables, false)) {
 			return false;
 		}

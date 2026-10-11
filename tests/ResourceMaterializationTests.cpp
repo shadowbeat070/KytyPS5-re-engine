@@ -1295,7 +1295,10 @@ void TestMaterializeMemo() {
     point(a);
   }
 
-  {
+  for (const bool patch : {false, true}) {
+    auto &config = MaterializeMemoConfig::Get();
+    const auto saved = config.descriptor_patch;
+    config.descriptor_patch = patch;
     Stage buffer{UserDataBufferPlan()};
     std::array<uint32_t, 1> words{7};
     const SrtRuntime direct{.user_data = words,
@@ -1305,12 +1308,28 @@ void TestMaterializeMemo() {
                                buffer.specialization),
           "user-data descriptor materialization failed");
     buffer.memo.Commit(buffer.plan, buffer.snapshot);
-    Check(buffer.memo.Replay(buffer.plan, direct, buffer.snapshot),
+    Check(buffer.memo.Replay(buffer.plan, direct, buffer.snapshot, &buffer.specialization),
           "an unchanged user-data descriptor missed");
     words[0] = 9;
-    Check(!buffer.memo.Replay(buffer.plan, direct, buffer.snapshot) &&
-              buffer.memo.LastMiss() == MaterializeMemo::Miss::InputChanged,
-          "user data that is a descriptor dword changed without a walk");
+    if (!patch) {
+      Check(!buffer.memo.Replay(buffer.plan, direct, buffer.snapshot, &buffer.specialization) &&
+                buffer.memo.LastMiss() == MaterializeMemo::Miss::InputChanged,
+            "user data that is a descriptor dword changed without a walk");
+    } else {
+      Check(!buffer.memo.Replay(buffer.plan, direct, buffer.snapshot) &&
+                buffer.memo.LastMiss() == MaterializeMemo::Miss::StructureChanged,
+            "a moved descriptor word replayed without a specialization to refresh");
+      ResourceSnapshot fresh;
+      ResourceSpecialization fresh_specialization;
+      Check(buffer.memo.Replay(buffer.plan, direct, buffer.snapshot, &buffer.specialization) &&
+                MaterializeResources(buffer.plan, direct, fresh, fresh_specialization) &&
+                buffer.snapshot.buffers == fresh.buffers &&
+                buffer.snapshot.buffers[0].dwords[0] == 9u &&
+                buffer.specialization == fresh_specialization &&
+                buffer.specialization.unbound_buffers == fresh_specialization.unbound_buffers,
+            "a moved user-data descriptor dword was not patched like a walk");
+    }
+    config.descriptor_patch = saved;
   }
 
   {
@@ -1619,6 +1638,124 @@ void TestMaterializeMemoGpuOwnedDataSlot() {
         "the walk read a GPU-owned data slot instead of refusing it");
 }
 
+Libs::Graphics::ShaderRecompiler::IR::ResourcePlan MemoDescriptorPlan() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  Program program;
+  program.stage = Libs::Graphics::ShaderType::Compute;
+  program.srt_plan_complete = true;
+  program.resource_tracking_complete = true;
+  auto &block = AddValueBlock(program);
+  auto &lo = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(0))});
+  auto &hi = block.AppendNewInst(ValueOpcode::GetUserData, {Value(static_cast<ScalarReg>(1))});
+  auto &handle = block.AppendNewInst(ValueOpcode::GetAddressResource, {Value(&lo), Value(&hi)});
+  auto &srt = block.AppendNewInst(ValueOpcode::GetSrtResource);
+  DescriptorSource source;
+  for (uint32_t dword = 0; dword < 4; dword++) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarAddress;
+    memory.planning_only = true;
+    memory.offset = dword * 4u;
+    program.memory_info.push_back(memory);
+    auto &raw = block.AppendNewInst(ValueOpcode::LoadAddressU32,
+                                    {Value(&handle), Value(0u), Value(0u), Value(true)});
+    raw.SetFlags(MemoryFlags{.index = dword, .pc = 0x40u + dword * 4u});
+    program.srt_reads.push_back({Value(&raw), dword});
+    auto &flat = block.AppendNewInst(ValueOpcode::ReadConst, {Value(&srt), Value(dword)});
+    source.dwords[dword] = Value(&flat);
+  }
+  source.dword_count = 4;
+  program.descriptor_sources.push_back(source);
+  program.info.buffers.push_back({.source = 0});
+  return ExtractResourcePlan(program);
+}
+
+void TestMaterializeMemoDescriptorPatch() {
+  using namespace Libs::Graphics::ShaderRecompiler::IR;
+  // Base 0x1000_0000, stride 16 (dword1 bits 16..29), 64 records, dst_sel + formats in dword3.
+  std::array<uint32_t, 4> table_a{0x10000000u, 16u << 16u, 64u, 0x00027fac};
+  std::array<uint32_t, 4> table_b{0x20000000u, 32u << 16u, 128u, 0x00027fac};
+  std::array<uint32_t, 4> table_c{0x30000000u, 16u << 16u, 64u, 0x00027fac};
+  const auto address = [](const auto &table) { return reinterpret_cast<uint64_t>(table.data()); };
+  std::array<uint32_t, 2> user_data{};
+  const auto point = [&](uint64_t where) {
+    user_data = {static_cast<uint32_t>(where), static_cast<uint32_t>(where >> 32u)};
+  };
+  const SrtRuntime runtime{.user_data = user_data,
+                           .read_memory = MemoRead,
+                           .read_specialization_memory = MemoRead};
+  const auto plan = MemoDescriptorPlan();
+  MaterializeMemo memo;
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  point(address(table_a));
+  Check(MaterializeResources(plan, memo.Record(runtime), snapshot, specialization),
+        "the descriptor plan did not materialize");
+  memo.Commit(plan, snapshot);
+  Check(memo.Valid(), "the descriptor plan was not memoized");
+  const auto same_as_walk = [&] {
+    ResourceSnapshot fresh;
+    ResourceSpecialization fresh_specialization;
+    return MaterializeResources(plan, runtime, fresh, fresh_specialization) &&
+           fresh.buffers == snapshot.buffers && fresh.flattened_srt == snapshot.flattened_srt &&
+           fresh.user_data == snapshot.user_data && fresh_specialization == specialization &&
+           fresh_specialization.unbound_buffers == specialization.unbound_buffers;
+  };
+  for (const auto *table : {&table_b, &table_c, &table_a, &table_b}) {
+    point(address(*table));
+    Check(memo.Replay(plan, runtime, snapshot, &specialization) && same_as_walk() &&
+              snapshot.buffers[0].dwords[0] == (*table)[0],
+          "a moved V# bound as a buffer did not replay like a walk");
+  }
+  table_b[2] = 0;
+  Check(memo.Replay(plan, runtime, snapshot, &specialization) && same_as_walk() &&
+            specialization.unbound_buffers[0],
+        "a V# that became unbound did not refresh the specialization");
+  table_b[2] = 128u;
+}
+
+void TestMaterializeMemoBackoff() {
+  using Backoff = Libs::Graphics::ShaderRecompiler::IR::MaterializeMemoBackoff;
+  Backoff backoff;
+  const auto skipped = [&](uint32_t calls) {
+    uint32_t count = 0;
+    for (uint32_t i = 0; i < calls; i++) {
+      count += backoff.Skip() ? 1u : 0u;
+    }
+    return count;
+  };
+  for (uint32_t i = 0; i < Backoff::Threshold; i++) {
+    Check(!backoff.Skip(), "the memo backed off before the miss threshold");
+    backoff.OnMiss();
+  }
+  Check(!backoff.Skip(), "the memo backed off before trying to replay a fresh recording");
+  backoff.OnMiss();
+  Check(skipped(Backoff::InitialWindow) == Backoff::InitialWindow && !backoff.Skip(),
+        "the first back-off window has the wrong length");
+  backoff.OnMiss();
+  Check(!backoff.Skip(), "the memo skipped the call that replays a fresh recording");
+  backoff.OnMiss();
+  Check(skipped(2 * Backoff::InitialWindow) == 2 * Backoff::InitialWindow && !backoff.Skip(),
+        "the back-off window did not double");
+  backoff.OnHit();
+  for (uint32_t i = 0; i + 1 < Backoff::Threshold; i++) {
+    backoff.OnMiss();
+  }
+  Check(!backoff.Skip(), "a hit did not reset the miss run");
+  backoff.OnMiss();
+  backoff.OnMiss();
+  Check(skipped(Backoff::InitialWindow) == Backoff::InitialWindow && !backoff.Skip(),
+        "a hit did not reset the back-off window");
+  for (uint32_t round = 0; round < 16; round++) {
+    backoff.OnMiss();
+    backoff.OnMiss();
+    skipped(Backoff::MaxWindow);
+  }
+  backoff.OnMiss();
+  backoff.OnMiss();
+  Check(skipped(Backoff::MaxWindow + 1) == Backoff::MaxWindow,
+        "the back-off window grew past its cap");
+}
+
 int main() {
   TestMappedSrtUsesDirectReaderByDefault();
   TestIntegerRuntimeValueFollowsSrtReads();
@@ -1641,6 +1778,8 @@ int main() {
   TestMaterializeMemo();
   TestMaterializeMemoGpuOwnedDataSlot();
   TestMaterializeMemoExtensions();
+  TestMaterializeMemoBackoff();
+  TestMaterializeMemoDescriptorPatch();
   std::puts("ResourceMaterializationTests: all cases passed");
   return 0;
 }

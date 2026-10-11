@@ -689,6 +689,9 @@ struct PipelineCache::ProgramCache {
 		ShaderRecompiler::IR::ResourceSpecialization specialization;
 		std::vector<Permutation>                     permutations;
 		ShaderRecompiler::IR::MaterializeMemoWays    memo;
+		ShaderRecompiler::IR::MaterializeMemoBackoff memo_backoff;
+		// Whether the walk after a miss records for the memo; false while the stage backs off.
+		bool memo_recording = false;
 	};
 
 	static bool MaterializeMemoEnabled() {
@@ -698,8 +701,25 @@ struct PipelineCache::ProgramCache {
 
 	static bool MaterializeMemoHit(SourceEntry&                            entry,
 	                               const ShaderRecompiler::IR::SrtRuntime& runtime) {
-		return MaterializeMemoEnabled() && entry.memo.Replay(entry.resource_plan, runtime,
-		                                                     entry.resources, entry.specialization);
+		entry.memo_recording = MaterializeMemoEnabled();
+		if (!entry.memo_recording) {
+			return false;
+		}
+		const bool backoff = ShaderRecompiler::IR::MaterializeMemoBackoff::Enabled();
+		if (backoff && entry.memo_backoff.Skip()) {
+			entry.memo_recording = false;
+			entry.memo.ForgetCurrent();
+			return false;
+		}
+		if (entry.memo.Replay(entry.resource_plan, runtime, entry.resources,
+		                      entry.specialization)) {
+			entry.memo_backoff.OnHit();
+			return true;
+		}
+		if (backoff) {
+			entry.memo_backoff.OnMiss();
+		}
+		return false;
 	}
 
 	static const char* StageShortName(ShaderType stage) {
@@ -935,7 +955,7 @@ struct PipelineCache::ProgramCache {
 		}
 		if (entry != programs.end() && !MaterializeMemoHit(entry->second, runtime)) {
 			auto&      memo     = entry->second.memo;
-			const auto recorded = MaterializeMemoEnabled() ? memo.Record(runtime) : runtime;
+			const auto recorded = entry->second.memo_recording ? memo.Record(runtime) : runtime;
 			// Call unconditionally: EXIT_IF drops its argument under KYTY_FINAL.
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, recorded, entry->second.resources,
@@ -946,7 +966,7 @@ struct PipelineCache::ProgramCache {
 				}
 				return {};
 			}
-			if (MaterializeMemoEnabled()) {
+			if (entry->second.memo_recording) {
 				memo.Commit(entry->second.resource_plan, entry->second.resources,
 				            entry->second.specialization);
 			}

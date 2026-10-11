@@ -1187,28 +1187,36 @@ bool SrtWalker::EvaluateExtractU32x4(const Inst& inst, uint32_t component, uint6
 	return false;
 }
 
-RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
-                             uint32_t component_bytes, const std::array<uint64_t, 5>& operands,
-                             uint64_t& address) {
+RawReadReject RawReadShapeOf(const ResourcePlan& program, const Inst& inst,
+                             uint32_t component_bytes, RawReadShape& shape) {
 	const auto flags = inst.Flags<MemoryFlags>();
 	if (flags.index >= program.memory_info.size()) {
 		return RawReadReject::MemoryIndexOutOfRange;
 	}
-	const auto& mem      = program.memory_info[flags.index];
-	const auto  low      = operands[0];
-	const auto  high     = operands[1];
-	const auto  offset   = operands[2];
-	const auto  base     = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
-	const auto immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset)) + component_bytes;
-	if (inst.GetOpcode() == ValueOpcode::ReadConstBuffer ||
-	    inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
-	    DescriptorLoadDwords(inst.GetOpcode()) != 0u) {
+	const auto& mem = program.memory_info[flags.index];
+	shape.immediate = static_cast<int64_t>(static_cast<int32_t>(mem.offset)) + component_bytes;
+	shape.kind = inst.GetOpcode() == ValueOpcode::ReadConstBuffer ? RawReadShape::Kind::ConstBuffer
+	             : inst.GetOpcode() == ValueOpcode::LoadBufferU32 ||
+	                     DescriptorLoadDwords(inst.GetOpcode()) != 0u
+	                 ? RawReadShape::Kind::VectorBuffer
+	                 : RawReadShape::Kind::Address;
+	return RawReadReject::None;
+}
+
+RawReadReject RawReadAddressFrom(const RawReadShape& shape, const std::array<uint64_t, 5>& operands,
+                                 uint64_t& address) {
+	const auto low       = operands[0];
+	const auto high      = operands[1];
+	const auto offset    = operands[2];
+	const auto base      = ((high << 32u) | static_cast<uint32_t>(low)) & AddressMask;
+	const auto immediate = shape.immediate;
+	if (shape.kind != RawReadShape::Kind::Address) {
 		const auto records = operands[3];
 		const auto word3   = operands[4];
 		if (immediate < 0) {
 			return RawReadReject::NegativeImmediate;
 		}
-		const bool vector_load = inst.GetOpcode() != ValueOpcode::ReadConstBuffer;
+		const bool vector_load = shape.kind == RawReadShape::Kind::VectorBuffer;
 		const auto stride      = (static_cast<uint32_t>(high) >> 16u) & 0x3fffu;
 		// A vector load adds the thread ID to its index when V# asks, so no one value holds.
 		if (vector_load && ((static_cast<uint32_t>(word3) >> 23u) & 1u) != 0u) {
@@ -1245,6 +1253,17 @@ RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
 		}
 	}
 	return RawReadReject::None;
+}
+
+RawReadReject RawReadAddress(const ResourcePlan& program, const Inst& inst,
+                             uint32_t component_bytes, const std::array<uint64_t, 5>& operands,
+                             uint64_t& address) {
+	RawReadShape shape;
+	if (const auto reject = RawReadShapeOf(program, inst, component_bytes, shape);
+	    reject != RawReadReject::None) {
+		return reject;
+	}
+	return RawReadAddressFrom(shape, operands, address);
 }
 
 size_t RawReadOffsetArgument(ValueOpcode op) {
