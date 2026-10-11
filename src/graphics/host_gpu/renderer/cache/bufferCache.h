@@ -15,6 +15,7 @@
 #include <deque>
 #include <map>
 #include <memory>
+#include <set>
 #include <span>
 #include <utility>
 #include <vector>
@@ -188,6 +189,22 @@ private:
 	void                   PruneGpuWriteMarks();
 	// Downloads without submitting the recording in progress; false leaves all state unchanged.
 	[[nodiscard]] bool TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t size);
+	struct GuestDownload {
+		int                         slot  = -1;
+		vk::Fence                   fence = nullptr;
+		std::unique_ptr<Buffer>     staging;
+		std::vector<vk::BufferCopy> copies;
+		RangeSet                    pages;
+		uint64_t                    buffer_address = 0;
+		uint64_t                    wait           = 0;
+		size_t                      writes_start   = 0;
+	};
+	[[nodiscard]] bool BeginGuestDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+	                                      GuestDownload& download);
+	[[nodiscard]] size_t OpenWriteLog();
+	[[nodiscard]] bool   WrittenSince(size_t start, uint64_t begin, uint64_t end) const;
+	void                 CloseWriteLog(size_t start);
+	void FinishGuestDownload(GuestDownload& download, uint64_t vaddr, uint64_t size, bool is_write);
 	[[nodiscard]] uint64_t PrepareDetachedDownload(uint64_t vaddr, uint64_t size);
 
 	struct ClassifiedMetadata {
@@ -235,6 +252,10 @@ private:
 	uint64_t                               m_classified_span = 0;
 	// Disjoint; a mark whose tick has completed no longer constrains anything and is pruned.
 	std::map<uint64_t, GpuWriteMark> m_gpu_write_marks;
+	std::deque<std::pair<uint64_t, uint64_t>> m_guest_download_writes;
+	// Absolute index of the log's first entry, and the starts of every open user.
+	size_t                m_write_log_base = 0;
+	std::multiset<size_t> m_write_log_users;
 	// A BDA store can reach any page, including ones no mark names yet.
 	uint64_t      m_bda_store_tick = 0;
 	MemoryTracker m_memory_tracker;

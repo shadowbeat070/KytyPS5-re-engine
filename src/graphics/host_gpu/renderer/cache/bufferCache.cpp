@@ -33,6 +33,15 @@ constexpr uint64_t MiB           = 1024 * 1024;
 constexpr uint64_t GdsBufferSize = 64 * 1024;
 constexpr uint64_t MaxFaultMappingSize = 16 * MiB;
 
+// KYTY_NO_ASYNC_GUEST_DOWNLOAD=1: a guest fault's download blocks the GPU thread until it lands.
+bool AsyncGuestDownloads() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_ASYNC_GUEST_DOWNLOAD");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
 bool SparsePageTable(const GraphicContext& graphics) {
 	static const bool dense = [] {
 		const char* text = std::getenv("KYTY_DENSE_BDA_PAGETABLE");
@@ -410,6 +419,9 @@ void BufferCache::MarkGpuWrite(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return;
 	}
+	if (!m_write_log_users.empty()) {
+		m_guest_download_writes.emplace_back(vaddr, vaddr + size);
+	}
 	const auto end = vaddr + size;
 	if (!m_precise_marking) {
 		for (auto& write: m_precise_writes) {
@@ -544,6 +556,132 @@ bool BufferCache::TryDownloadDetached(Buffer& buffer, uint64_t vaddr, uint64_t s
 	return true;
 }
 
+bool BufferCache::BeginGuestDownload(Buffer& buffer, uint64_t vaddr, uint64_t size,
+                                     GuestDownload& download) {
+	const auto                  buffer_address = buffer.CpuAddress();
+	std::vector<vk::BufferCopy> copies;
+	RangeSet                    pages;
+	m_memory_tracker.ForEachDownloadRange<false>(
+	    vaddr, size, [&](uint64_t address, uint64_t bytes) noexcept {
+		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
+		                                           "guest buffer download");
+		    pages.Add(address, bytes);
+		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    copies.emplace_back(start - buffer_address, 0, end - start);
+		    });
+	    });
+	if (copies.empty()) {
+		return false;
+	}
+	uint64_t total_size  = 0;
+	uint64_t newest_tick = 0;
+	for (auto& copy: copies) {
+		copy.dstOffset = total_size;
+		total_size += Common::AlignUp(copy.size, 64);
+		newest_tick =
+		    std::max(newest_tick, NewestGpuWriteTick(buffer_address + copy.srcOffset, copy.size));
+	}
+	const auto current = m_scheduler.CurrentTick();
+	const auto wait    = std::max(newest_tick, m_scheduler.GetMasterSemaphore().KnownGpuTick());
+	if (newest_tick >= current || m_bda_store_tick >= current ||
+	    m_scheduler.PendingGuestWriteTick(vaddr, size) > wait) {
+		return false;
+	}
+	auto staging      = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
+	                                             vk::BufferUsageFlagBits::eTransferDst, total_size);
+	const auto source = buffer.Handle();
+	const auto target = staging->Handle();
+	const auto ticket = m_scheduler.SubmitDetached(wait, [&](vk::CommandBuffer command) {
+		command.copyBuffer(source, target, static_cast<uint32_t>(copies.size()), copies.data());
+		vk::BufferMemoryBarrier after {};
+		after.srcAccessMask       = vk::AccessFlagBits::eTransferWrite;
+		after.dstAccessMask       = vk::AccessFlagBits::eHostRead;
+		after.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		after.buffer              = target;
+		after.offset              = 0;
+		after.size                = total_size;
+		command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+		                        vk::PipelineStageFlagBits::eHost, {}, 0, nullptr, 1, &after, 0,
+		                        nullptr);
+	});
+	if (ticket.slot < 0) {
+		return false;
+	}
+	download.slot           = ticket.slot;
+	download.fence          = ticket.fence;
+	download.staging        = std::move(staging);
+	download.copies         = std::move(copies);
+	download.pages          = std::move(pages);
+	download.buffer_address = buffer_address;
+	download.wait           = wait;
+	download.writes_start   = OpenWriteLog();
+	return true;
+}
+
+void BufferCache::FinishGuestDownload(GuestDownload& download, uint64_t vaddr, uint64_t size,
+                                      bool is_write) {
+	// Write-backs queued up to the writer's tick come first, exactly as in the drain.
+	m_scheduler.WaitPriorityOperations(download.wait);
+	bool rewritten = false;
+	for (const auto& copy: download.copies) {
+		const auto start = download.buffer_address + copy.srcOffset;
+		if (WrittenSince(download.writes_start, start, start + copy.size)) {
+			rewritten = true;
+			break;
+		}
+	}
+	if (!rewritten) {
+		const auto mapped = download.staging->Mapped();
+		download.staging->Invalidate(0, download.staging->Size());
+		for (const auto& copy: download.copies) {
+			const auto start = download.buffer_address + copy.srcOffset;
+			m_gpu_modified_ranges.ForEachInRange(
+			    start, copy.size, [&](uint64_t begin, uint64_t end) {
+				    Libs::LibKernel::Memory::WriteBacking(
+				        begin, mapped.data() + copy.dstOffset + (begin - start), end - begin);
+			    });
+		}
+		download.pages.ForEach([this](uint64_t begin, uint64_t end) {
+			m_gpu_modified_ranges.Subtract(begin, end - begin);
+		});
+		m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		if (is_write) {
+			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
+		}
+	}
+	m_scheduler.ReleaseDetached({download.slot, download.fence});
+	download.staging.reset();
+	download.slot = -1;
+	CloseWriteLog(download.writes_start);
+}
+
+size_t BufferCache::OpenWriteLog() {
+	const auto start = m_write_log_base + m_guest_download_writes.size();
+	m_write_log_users.insert(start);
+	return start;
+}
+
+bool BufferCache::WrittenSince(size_t start, uint64_t begin, uint64_t end) const {
+	for (auto i = start - m_write_log_base; i < m_guest_download_writes.size(); i++) {
+		const auto [first, last] = m_guest_download_writes[i];
+		if (first < end && begin < last) {
+			return true;
+		}
+	}
+	return false;
+}
+
+void BufferCache::CloseWriteLog(size_t start) {
+	m_write_log_users.erase(m_write_log_users.find(start));
+	const auto keep = m_write_log_users.empty() ? m_write_log_base + m_guest_download_writes.size()
+	                                            : *m_write_log_users.begin();
+	while (m_write_log_base < keep) {
+		m_guest_download_writes.pop_front();
+		m_write_log_base++;
+	}
+}
+
 BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
                          PageManager& page_manager, TextureCache& texture_cache)
     : m_graphics(graphics), m_scheduler(scheduler), m_fault_manager(graphics, scheduler, *this),
@@ -630,7 +768,9 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	// A guest thread's access runs here on the GPU thread, outside any zone of its own.
 	const bool guest_access = !GuestGpu::IsGpuThread();
-	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, guest_access] {
+	GuestDownload download;
+	m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, guest_access,
+	                                                &download] {
 		static constexpr tracy::SourceLocationData guest_read {
 		    "BufferCache::ReadMemory for a guest CPU read", TracyFunction, TracyFile,
 		    static_cast<uint32_t>(__LINE__), 0};
@@ -648,6 +788,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
+		if (guest_access && AsyncGuestDownloads() &&
+		    BeginGuestDownload(buffer, vaddr, size, download)) {
+			return;
+		}
 		if (TryDownloadDetached(buffer, vaddr, size)) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
 		} else if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
@@ -657,6 +801,12 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 		}
 	});
+	if (download.slot >= 0) {
+		m_scheduler.WaitDetached({download.slot, download.fence});
+		m_scheduler.Context().GetGpu().SendCommandSync([this, vaddr, size, is_write, &download] {
+			FinishGuestDownload(download, vaddr, size, is_write);
+		});
+	}
 	if (guest_access && m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		m_scheduler.GetMasterSemaphore().Wait(m_scheduler.CurrentTick() - 1);
 		m_scheduler.Context().GetGpu().SendCommandSync(
