@@ -2855,6 +2855,117 @@ void TestGpuOwnedWrittenHandleStaysOnHost() {
         "the walk did not keep only the read V# native, or let the written V# go native");
 }
 
+void TestGpuOwnedRelativeWrittenHandleDecodes() {
+  constexpr uint32_t offset_pc = 8;
+  constexpr uint32_t records_pc = 12;
+  struct Shape {
+    std::unique_ptr<Fixture> fixture;
+    std::array<Value, 3> words;
+    uint32_t buffer_memory = 0;
+  };
+  // `foreign` reads the offset through another pointer, which no longer names where stores land.
+  const auto build = [](std::vector<uint32_t> unfoldable, bool foreign) {
+    Shape shape;
+    shape.fixture = std::make_unique<Fixture>();
+    auto &fixture = *shape.fixture;
+    fixture.program.unfoldable_pcs = std::move(unfoldable);
+    const auto base_lo = fixture.UserData(2);
+    const auto base_hi = fixture.UserData(3);
+    const auto record = fixture.Address(base_lo, base_hi, 4);
+    const auto other = fixture.Address(fixture.UserData(4), fixture.UserData(5), 4);
+    const auto scalar = [&](Value handle, uint32_t offset, uint32_t pc) {
+      MemoryInfo memory;
+      memory.kind = ResourceKind::ScalarAddress;
+      memory.offset = offset;
+      return fixture.Emit(ValueOpcode::LoadAddressU32,
+                          {handle, Value(0u), Value(0u), Value(true)},
+                          fixture.AddMemory(memory, pc));
+    };
+    shape.words[0] = scalar(foreign ? other : record, 40, offset_pc);
+    shape.words[1] = scalar(foreign ? other : record, 44, offset_pc);
+    shape.words[2] = scalar(record, 116, records_pc);
+    const auto low = fixture.Emit(ValueOpcode::IAdd32, {base_lo, shape.words[0]});
+    const auto high = fixture.Emit(
+        ValueOpcode::BitwiseOr32,
+        {fixture.Emit(ValueOpcode::IAdd32, {base_hi, shape.words[1]}), Value(0x00800000u)});
+    MemoryInfo buffer;
+    buffer.kind = ResourceKind::Buffer;
+    shape.buffer_memory = static_cast<uint32_t>(fixture.program.memory_info.size());
+    fixture.Emit(ValueOpcode::StoreBufferU32,
+                 {fixture.Buffer({low, high, shape.words[2], Value(0x00016204u)}, 20),
+                  Value(0u), Value(0u), Value(0u), Value(7u), Value(true)},
+                 fixture.AddMemory(buffer, 20));
+    fixture.PlanAndTrack();
+    return shape;
+  };
+  const auto kind_of = [](const Program &program, Value value) {
+    for (uint32_t slot = 0; slot < program.srt_reads.size(); ++slot) {
+      if (program.srt_reads[slot].value.Resolve() == value.Resolve()) {
+        return static_cast<int>(program.data_flat_slots[slot]);
+      }
+    }
+    return -1;
+  };
+
+  auto foreign = build({}, true);
+  for (const auto &word : foreign.words) {
+    Check(kind_of(foreign.fixture->program, word) == 0,
+          "a written V# offset read through another pointer left the host");
+  }
+
+  auto shape = build({}, false);
+  const auto &program = shape.fixture->program;
+  for (const auto &word : shape.words) {
+    Check(kind_of(program, word) == 2,
+          "a written V# relative to its record pointer was not decodable");
+  }
+
+  std::array<uint32_t, 10> user_data{0u, 0u, 0x1000u, 0u};
+  OwnedTestMemory owned;
+  owned.memory.words[40 / sizeof(uint32_t)] = 0x100u;
+  owned.memory.words[116 / sizeof(uint32_t)] = 4u;
+  SrtRuntime runtime{.user_data = user_data,
+                     .read_memory = ReadOwnedTestMemory,
+                     .userdata = &owned,
+                     .read_specialization_memory = ReadOwnedTestMemory,
+                     .gpu_owned = OwnedTestRange};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  const auto plan = ExtractResourcePlan(program);
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "the clean record was not materialized");
+  owned.owned_begin = 0x1000u;
+  owned.owned_end = 0x1100u;
+  std::vector<uint32_t> refused;
+  Check(!MaterializeResources(plan, runtime, snapshot, specialization, &refused),
+        "a record the GPU owns was read on the host");
+  std::ranges::sort(refused);
+  const auto last = std::ranges::unique(refused);
+  refused.erase(last.begin(), last.end());
+  Check(refused == std::vector<uint32_t>{offset_pc, records_pc},
+        "the walk did not name the offset and the count for a native load");
+
+  auto rebuilt = build(refused, false);
+  const auto &rebuilt_program = rebuilt.fixture->program;
+  Check(rebuilt_program.memory_info[rebuilt.buffer_memory].dynamic_buffer &&
+            rebuilt_program.info.writes_dma,
+        "the relative written V# was not decoded in the shader");
+  DmaPointer expected{.user_data = true, .store = true, .lo = 2, .hi = 3};
+  expected.relative_offset = 40;
+  expected.records_offset = 116;
+  expected.high_mask = 0x00800000u;
+  Check(std::ranges::find(rebuilt_program.info.dma_pointers, expected) !=
+            rebuilt_program.info.dma_pointers.end(),
+        "the host was not told where the relative stores land");
+  ResourceSnapshot rebuilt_snapshot;
+  ResourceSpecialization rebuilt_specialization;
+  const auto reads = owned.memory.reads;
+  Check(MaterializeResources(ExtractResourcePlan(rebuilt_program), runtime, rebuilt_snapshot,
+                             rebuilt_specialization) &&
+            owned.memory.reads == reads,
+        "the rebuilt shader still read the GPU-owned record on the host");
+}
+
 void TestSrtFlatteningAndRuntimeMemoization() {
   Fixture fixture;
   const auto base =
@@ -6153,6 +6264,7 @@ int main() {
     Run("DMA pointer from SRT", TestDmaPointerFromSrt);
     Run("GPU-owned scalar data stays native", TestGpuOwnedScalarDataStaysNative);
     Run("GPU-owned written handle stays on host", TestGpuOwnedWrittenHandleStaysOnHost);
+    Run("GPU-owned relative written handle decodes", TestGpuOwnedRelativeWrittenHandleDecodes);
     Run("scalar read slot order", TestScalarReadSlotOrder);
     Run("deep planning value chain", TestDeepPlanningValueChain);
     Run("deep uniform value chain", TestDeepUniformValueChain);

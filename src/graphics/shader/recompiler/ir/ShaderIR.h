@@ -609,6 +609,10 @@ struct DmaPointer {
 	bool     store     = false;
 	uint32_t lo        = 0;
 	uint32_t hi        = 0;
+	uint32_t relative_offset = UINT32_MAX;
+	uint32_t records_offset  = UINT32_MAX;
+	uint32_t records         = 0;
+	uint32_t high_mask       = 0;
 
 	bool operator==(const DmaPointer& other) const = default;
 };

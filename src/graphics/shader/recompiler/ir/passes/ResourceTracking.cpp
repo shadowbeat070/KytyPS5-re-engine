@@ -8,6 +8,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <map>
 #include <numeric>
@@ -257,6 +259,14 @@ const char* StageName(ShaderType stage) {
 		case ShaderType::Compute: return "compute";
 		default: return "unknown";
 	}
+}
+
+bool RelativeWriteDecode() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_RELATIVE_WRITE_DECODE");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
 }
 
 uint32_t ByteExtent(const MemoryInfo& memory) {
@@ -975,6 +985,167 @@ private:
 		std::unordered_set<const Inst*> decodable;
 	};
 
+	bool RelativeStoreHandle(const Inst& handle, DmaPointer* pointer = nullptr) const {
+		const auto op    = handle.GetOpcode();
+		const auto words = op == ValueOpcode::GetBufferResource    ? 4u
+		                   : op == ValueOpcode::GetAddressResource ? 2u
+		                                                           : 0u;
+		if (words == 0u || handle.NumArgs() < words) {
+			return false;
+		}
+		const auto user_reg = [](const Inst* inst, uint32_t& reg) {
+			if (inst == nullptr || inst->GetOpcode() != ValueOpcode::GetUserData ||
+			    inst->Arg(0).GetType() != Type::ScalarReg) {
+				return false;
+			}
+			reg = RegIndex(inst->Arg(0).ScalarRegister());
+			return true;
+		};
+		uint32_t   base_lo       = UINT32_MAX;
+		uint32_t   base_hi       = UINT32_MAX;
+		const auto record_offset = [&](const Inst& load, int64_t& offset) {
+			uint32_t    index  = 0;
+			const auto* memory = ScalarReadMemory(load, index);
+			const auto* record = load.Arg(0).Resolve().TryInstruction();
+			const auto  extra  = load.Arg(1).Resolve();
+			uint32_t    lo     = UINT32_MAX;
+			uint32_t    hi     = UINT32_MAX;
+			if (memory == nullptr || record == nullptr ||
+			    record->GetOpcode() != ValueOpcode::GetAddressResource || record->NumArgs() != 2u ||
+			    !user_reg(record->Arg(0).Resolve().TryInstruction(), lo) ||
+			    !user_reg(record->Arg(1).Resolve().TryInstruction(), hi) || !extra.IsImmediate() ||
+			    extra.GetType() != Type::U32) {
+				return false;
+			}
+			if (base_lo == UINT32_MAX) {
+				base_lo = lo;
+				base_hi = hi;
+			} else if (lo != base_lo || hi != base_hi) {
+				return false;
+			}
+			offset = (static_cast<int64_t>(static_cast<int32_t>(memory->offset)) & ~int64_t {3}) +
+			         static_cast<int64_t>(extra.U32() & ~3u);
+			return true;
+		};
+		struct Leaves {
+			std::vector<uint32_t> regs;
+			std::vector<int64_t>  loads;
+		};
+		const auto collect = [&](Value root, Leaves& out) {
+			std::vector<const Inst*>        pending;
+			std::unordered_set<const Inst*> seen;
+			const auto                      visit = [&](Value value) {
+				value = value.Resolve();
+				if (value.IsImmediate()) {
+					return true;
+				}
+				const auto* inst = value.TryInstruction();
+				if (inst == nullptr) {
+					return false;
+				}
+				pending.push_back(inst);
+				return true;
+			};
+			if (!visit(root)) {
+				return false;
+			}
+			while (!pending.empty()) {
+				const auto* inst = pending.back();
+				pending.pop_back();
+				if (!seen.insert(inst).second) {
+					continue;
+				}
+				if (seen.size() > 128u) {
+					return false;
+				}
+				const auto inst_op = inst->GetOpcode();
+				if (inst_op == ValueOpcode::GetUserData) {
+					uint32_t reg = 0;
+					if (!user_reg(inst, reg)) {
+						return false;
+					}
+					out.regs.push_back(reg);
+					continue;
+				}
+				if (inst_op == ValueOpcode::LoadAddressU32) {
+					int64_t offset = 0;
+					if (!record_offset(*inst, offset)) {
+						return false;
+					}
+					out.loads.push_back(offset);
+					continue;
+				}
+				// Only arithmetic on those leaves: anything else could move the base anywhere.
+				if (inst_op == ValueOpcode::Phi || inst_op == ValueOpcode::ReadConst ||
+				    inst_op == ValueOpcode::ReadConstBuffer ||
+				    BufferAccessOf(inst_op) != BufferAccess::None ||
+				    AddressOpcodeInfoOf(inst_op).access != AddressAccess::None) {
+					return false;
+				}
+				for (uint32_t arg = 0; arg < inst->NumArgs(); ++arg) {
+					if (!visit(inst->Arg(arg))) {
+						return false;
+					}
+				}
+			}
+			return true;
+		};
+		Leaves low;
+		Leaves high;
+		if (!collect(handle.Arg(0), low) || !collect(handle.Arg(1), high) || low.loads.empty() ||
+		    base_lo == UINT32_MAX) {
+			return false;
+		}
+		const auto has = [](const auto& list, auto item) {
+			return std::ranges::find(list, item) != list.end();
+		};
+		const auto offset = low.loads.front();
+		const bool shape =
+		    offset >= 0 && offset <= INT32_MAX &&
+		    std::ranges::all_of(low.loads, [&](int64_t item) { return item == offset; }) &&
+		    std::ranges::all_of(low.regs, [&](uint32_t reg) { return reg == base_lo; }) &&
+		    has(low.regs, base_lo) &&
+		    std::ranges::all_of(
+		        high.loads, [&](int64_t item) { return item == offset || item == offset + 4; }) &&
+		    has(high.loads, offset + 4) &&
+		    std::ranges::all_of(high.regs,
+		                        [&](uint32_t reg) { return reg == base_lo || reg == base_hi; }) &&
+		    has(high.regs, base_hi);
+		if (!shape) {
+			return false;
+		}
+		if (pointer != nullptr) {
+			*pointer                 = {};
+			pointer->user_data       = true;
+			pointer->store           = true;
+			pointer->lo              = base_lo;
+			pointer->hi              = base_hi;
+			pointer->relative_offset = static_cast<uint32_t>(offset);
+			if (const auto* top = handle.Arg(1).Resolve().TryInstruction();
+			    top != nullptr && top->GetOpcode() == ValueOpcode::BitwiseOr32) {
+				for (uint32_t arg = 0; arg < top->NumArgs(); ++arg) {
+					const auto mask = top->Arg(arg).Resolve();
+					if (mask.IsImmediate() && mask.GetType() == Type::U32) {
+						pointer->high_mask = mask.U32();
+					}
+				}
+			}
+			if (words == 4u) {
+				const auto records    = handle.Arg(2).Resolve();
+				int64_t    records_at = 0;
+				if (records.IsImmediate() && records.GetType() == Type::U32) {
+					pointer->records = records.U32();
+				} else if (const auto* load = records.TryInstruction();
+				           load != nullptr && load->GetOpcode() == ValueOpcode::LoadAddressU32 &&
+				           record_offset(*load, records_at) && records_at >= 0 &&
+				           records_at <= INT32_MAX) {
+					pointer->records_offset = static_cast<uint32_t>(records_at);
+				}
+			}
+		}
+		return true;
+	}
+
 	HostEvaluated HostEvaluatedValues() const {
 		HostEvaluated result;
 		const auto    close = [](std::unordered_set<const Inst*>& needed, auto&& roots) {
@@ -1033,8 +1204,9 @@ private:
 						                               op == ValueOpcode::GetBufferResource;
 						const bool image_or_sampler  = op == ValueOpcode::GetImageResource ||
 						                               op == ValueOpcode::GetSamplerResource;
-						const bool strict =
-						    image_or_sampler || (buffer_or_address && written.contains(&inst));
+						const bool strict = image_or_sampler ||
+						                    (buffer_or_address && written.contains(&inst) &&
+						                     !(RelativeWriteDecode() && RelativeStoreHandle(inst)));
 						if (decodable ? buffer_or_address && !strict : strict) {
 							for (uint32_t arg = 0; arg < inst.NumArgs(); ++arg)
 								need(inst.Arg(arg));
@@ -3308,6 +3480,12 @@ private:
 		}
 		m_program.memory_info[index].dynamic_buffer = true;
 		m_info.uses_dma                             = true;
+		if (DmaPointer pointer;
+		    buffer != BufferAccess::Read && RelativeWriteDecode() &&
+		    RelativeStoreHandle(*root, &pointer) &&
+		    std::ranges::find(m_info.dma_pointers, pointer) == m_info.dma_pointers.end()) {
+			m_info.dma_pointers.push_back(pointer);
+		}
 		if (buffer != BufferAccess::Read) {
 			// The store-pointer helper is only emitted, and its writable set only published,
 			// when the program declares that it writes through DMA.
