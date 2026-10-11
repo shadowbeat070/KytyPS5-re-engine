@@ -738,6 +738,8 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --rt1d-only)
 	add_test(NAME buffer_cache_bda_store
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-bda-only)
+	add_test(NAME buffer_cache_ring_image_head
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --buffer-cache-ring-image-head-only)
 
 	if(WIN32)
 		# These tests still depend on the Windows multisample-depth path.
