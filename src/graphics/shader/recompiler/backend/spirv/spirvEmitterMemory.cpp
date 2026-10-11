@@ -2069,6 +2069,15 @@ uint32_t EmitReadConst(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitNative<spv::OpLoad, IR::Type::U32>(state, pointer);
 }
 
+// KYTY_NO_SCALAR_BOUNDS_CAP=1 keeps the explicit test and select on every scalar buffer read.
+bool ClampScalarBufferBounds() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_SCALAR_BOUNDS_CAP");
+		return text == nullptr || text[0] == '\0' || text[0] == '0';
+	}();
+	return enabled;
+}
+
 void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto mem = ctx.Memory(inst);
 	if (mem.planning_only) return;
@@ -2093,6 +2102,13 @@ void EmitReadConstBuffer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto element   = Binary(state, spv::OpIAdd, TypeU32(state), index,
 		                              Binary(state, spv::OpShiftRightLogical, TypeU32(state),
 		                                     access.byte_offset, ConstantU32(state, 2)));
+		if (DeviceBoundsChecked(state, access) && ClampScalarBufferBounds()) {
+			const auto capped = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpExtInst, TypeU32(state), capped, GlslStd450(state),
+			                          GLSLstd450UMin, element, ConstantU32(state, 0x3fffffffu));
+			return LoadResourceWord(state, access, state.builder.AllocateId(),
+			                        EmitMemoryElementPointer(state, access, capped));
+		}
 		// Kept under robustness2: a scalar offset that wraps 32 bits lands back in range.
 		const auto condition = EmitMemoryElementInBounds(state, access, element);
 		return EmitValueOrZeroIfCondition(state, condition, [&]() {
