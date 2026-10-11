@@ -45,6 +45,14 @@ bool EagerGuestWriteBacks() {
 constexpr uint64_t GuestHotPageTicks = 120;
 constexpr size_t   MaxGuestHotPages  = 16384;
 
+bool GuestRetryAsync() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_GUEST_RETRY_ASYNC");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
 bool FaultPublishes() {
 	static const bool enabled = [] {
 		const char* text = std::getenv("KYTY_NO_FAULT_PUBLISHES");
@@ -688,6 +696,7 @@ BufferCache::BufferCache(GraphicContext& graphics, CommandScheduler& scheduler,
       m_device_buffer(graphics, scheduler, MemoryUsage::DeviceLocal, 128 * MiB),
       m_texture_cache(texture_cache), m_page_diff(graphics, scheduler) {
 	m_scheduler.SetBeforeSubmit([this] { RecordHotWriteBacks(); });
+	m_guest_retry_async = GuestRetryAsync();
 	std::memset(m_gds_buffer.Mapped().data(), 0, static_cast<size_t>(m_gds_buffer.Size()));
 	m_gds_buffer.Flush(0, m_gds_buffer.Size());
 	SetVulkanObjectNameF(m_graphics.device, m_bda_pagetable_buffer.Handle(),
@@ -919,6 +928,12 @@ void BufferCache::InvalidateMemory(uint64_t vaddr, uint64_t size) {
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
+	ReadMemoryAttempt(vaddr, size, is_write, 0);
+}
+
+void BufferCache::ReadMemoryAttempt(uint64_t vaddr, uint64_t size, bool is_write,
+                                    uint32_t attempt) {
+	constexpr uint32_t MaxGuestRetries = 2;
 	if (!GuestGpu::IsGpuThread() && CommandScheduler::InDeferredOperation()) {
 		EXIT("unsupported buffer readback from an asynchronous GPU completion, "
 		     "addr=0x%016" PRIx64 " size=0x%016" PRIx64 "\n",
@@ -980,6 +995,10 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 	}
 	if (guest_access && m_memory_tracker.IsRegionGpuModified(vaddr, size)) {
 		m_scheduler.GetMasterSemaphore().Wait(m_scheduler.CurrentTick() - 1);
+		if (m_guest_retry_async && attempt < MaxGuestRetries) {
+			ReadMemoryAttempt(vaddr, size, is_write, attempt + 1);
+			return;
+		}
 		m_scheduler.Context().GetGpu().SendCommandSync(
 		    [this, vaddr, size, is_write] { ReadMemory(vaddr, size, is_write); });
 	}

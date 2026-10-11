@@ -178,6 +178,9 @@ struct BufferCacheTestAccess {
     return cache.m_download_buffer;
   }
 
+  static void SetGuestRetryAsync(BufferCache &cache, bool enabled) {
+    cache.m_guest_retry_async = enabled;
+  }
 
   using GuestDownload = BufferCache::GuestDownload;
 
@@ -5815,10 +5818,13 @@ public:
       cache.FillBuffer(base + ring_fault_second_offset,
                        sizeof(ring_fault_second_value), ring_fault_second_value,
                        false);
+      // This case is about the download ring, which the synchronous retry uses.
+      BufferCacheTestAccess::SetGuestRetryAsync(cache, false);
       Require(name, "fault-ring wrapped batch",
               resources.HandleFault(PageFaultAccess::Read,
                                     base + ring_fault_first_offset),
               "fault readback could not wrap a live download-ring tick");
+      BufferCacheTestAccess::SetGuestRetryAsync(cache, true);
       // Both disjoint writes on the faulting page share one wrapped batch.
       uint64_t expected_packing_offset = 2 * 64;
       uint64_t expected_packing_alignment = 1;

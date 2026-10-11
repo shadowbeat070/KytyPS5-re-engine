@@ -59,6 +59,7 @@ public:
 
 	void                  InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                  ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
+	void ReadMemoryAttempt(uint64_t vaddr, uint64_t size, bool is_write, uint32_t attempt);
 	[[nodiscard]] Buffer& GetBuffer(BufferId id) {
 		EnsureDeviceStateCleared();
 		return m_slot_buffers[id];
@@ -277,6 +278,7 @@ private:
 	// Absolute index of the log's first entry, and the starts of every open user.
 	size_t                m_write_log_base = 0;
 	std::multiset<size_t> m_write_log_users;
+	bool                  m_guest_retry_async = true;
 	// Tracker page -> garbage-collection tick of the last guest fault on it.
 	std::unordered_map<uint64_t, uint64_t> m_guest_hot_pages;
 	// Hot pages the recording in progress wrote.
