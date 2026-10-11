@@ -145,9 +145,11 @@ public:
 	}
 
 	[[nodiscard]] bool IsBufferModified() const noexcept { return m_buffer_modified; }
-	void               MarkBufferModified() noexcept {
+	void               MarkBufferModified() noexcept { MarkBufferModified(NextImageWriteEpoch()); }
+	// `epoch` is when the write landed, not when it was noticed.
+	void MarkBufferModified(uint64_t epoch) noexcept {
 		m_buffer_modified    = true;
-		m_buffer_write_epoch = NextImageWriteEpoch();
+		m_buffer_write_epoch = epoch;
 		m_superseded.clear();
 	}
 	// Guest bytes a later GPU buffer write replaced; never written back from this image.
