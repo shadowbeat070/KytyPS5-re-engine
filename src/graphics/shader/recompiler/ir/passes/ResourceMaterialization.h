@@ -65,6 +65,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
                           ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                           std::vector<uint32_t>* refused_tables = nullptr);
 
+bool               RefreshDescriptorState(const ResourcePlan& program, ResourceSnapshot& snapshot,
+                                          ResourceSpecialization& specialization);
 [[nodiscard]] bool ImageServedBindless(const ResourcePlan& program, uint32_t image_index);
 [[nodiscard]] bool ReadOverlapsWrittenBuffer(const ResourcePlan&     program,
                                              const ResourceSnapshot& snapshot, uint64_t address,

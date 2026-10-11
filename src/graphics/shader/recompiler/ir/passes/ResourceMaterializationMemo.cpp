@@ -109,6 +109,8 @@ struct MaterializeMemo::Analysis {
 		const Inst* user = nullptr; // nullptr: a descriptor, condition or fill value
 		uint32_t    arg  = 0;
 		bool        slot = false;
+		// The descriptor source this external use is a dword of, or UINT32_MAX.
+		uint32_t source = UINT32_MAX;
 	};
 
 	const ResourcePlan&                                    plan;
@@ -117,8 +119,10 @@ struct MaterializeMemo::Analysis {
 	std::unordered_map<uint64_t, std::vector<uint32_t>>    slots;
 	std::unordered_map<uint64_t, std::vector<const Inst*>> nodes;
 	std::vector<uint8_t>                                   changeable;
-	const bool integer_ops  = MaterializeMemoConfig::Get().integer_ops;
-	const bool self_compare = MaterializeMemoConfig::Get().self_compare;
+	// Sources whose words a replay may patch: plain resource descriptors only.
+	std::vector<uint8_t> patchable;
+	const bool           integer_ops  = MaterializeMemoConfig::Get().integer_ops;
+	const bool           self_compare = MaterializeMemoConfig::Get().self_compare;
 
 	explicit Analysis(const ResourcePlan& p): plan(p) {
 		const auto external = [&](Value value, bool slot) {
@@ -148,9 +152,13 @@ struct MaterializeMemo::Analysis {
 				nodes[key].push_back(&inst);
 			}
 		}
-		for (const auto& source: plan.descriptor_sources) {
+		for (uint32_t s = 0; s < plan.descriptor_sources.size(); s++) {
+			const auto& source = plan.descriptor_sources[s];
 			for (uint32_t i = 0; i < source.dword_count; i++) {
-				external(source.dwords[i], false);
+				if (const auto* inst = source.dwords[i].Resolve().TryInstruction();
+				    inst != nullptr) {
+					uses[inst].push_back({nullptr, i, false, s});
+				}
 			}
 		}
 		for (const auto& block: plan.control_flow) {
@@ -166,6 +174,7 @@ struct MaterializeMemo::Analysis {
 				slots[key].push_back(read.flat_offset);
 			}
 		}
+		ClassifyPatchable();
 		changeable.assign(plan.user_data_count, 1u);
 		for (const auto& inst: plan.value_storage) {
 			if (inst.GetOpcode() != ValueOpcode::GetUserData) {
@@ -204,7 +213,8 @@ struct MaterializeMemo::Analysis {
 	bool Check(const std::vector<Use>& list, bool slots_ok) {
 		return std::ranges::all_of(list, [&](const Use& use) {
 			if (use.user == nullptr) {
-				return slots_ok && use.slot;
+				return (slots_ok && use.slot) ||
+				       (use.source < patchable.size() && patchable[use.source] != 0u);
 			}
 			const auto op = use.user->GetOpcode();
 			if (op == ValueOpcode::ReadConst) {
@@ -240,6 +250,155 @@ struct MaterializeMemo::Analysis {
 		       });
 	}
 
+	// A value the replay's postfix programs can rebuild from user data and re-read words alone.
+	bool Derivable(Value value, uint32_t depth = 0) const {
+		value = value.Resolve();
+		if (value.IsImmediate()) {
+			uint64_t ignored = 0;
+			return ImmediateValue(value, ignored);
+		}
+		uint64_t key = 0;
+		if (ValueReadKey(value, key)) {
+			return true;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || depth > 32) {
+			return false;
+		}
+		switch (inst->GetOpcode()) {
+			case ValueOpcode::GetUserData: {
+				const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+				return reg >= plan.user_data_base &&
+				       reg - plan.user_data_base < plan.user_data_count;
+			}
+			case ValueOpcode::IAdd32:
+				return Derivable(inst->Arg(0), depth + 1) && Derivable(inst->Arg(1), depth + 1);
+			case ValueOpcode::ReadConst: {
+				const auto slot = SrtSlot(plan, *inst);
+				return slot != UINT32_MAX && Derivable(plan.srt_reads[slot].value, depth + 1);
+			}
+			case ValueOpcode::CompositeExtractU32x2: {
+				const auto* source = inst->Arg(0).ResolveInstruction();
+				const auto  index  = inst->Arg(1).Resolve();
+				if (source == nullptr || !index.IsImmediate() || index.GetType() != Type::U32 ||
+				    index.U32() >= 2u) {
+					return false;
+				}
+				if (source->GetOpcode() == ValueOpcode::IAddCarry32) {
+					return Derivable(source->Arg(0), depth + 1) &&
+					       Derivable(source->Arg(1), depth + 1);
+				}
+				return source->GetOpcode() == ValueOpcode::CompositeConstructU32x2 &&
+				       Derivable(source->Arg(index.U32()), depth + 1);
+			}
+			default:
+				return integer_ops && IsInteger32(inst->GetOpcode()) && inst->NumArgs() == 2 &&
+				       Derivable(inst->Arg(0), depth + 1) && Derivable(inst->Arg(1), depth + 1);
+		}
+	}
+
+	bool ServesAsHandle(Value value) const {
+		std::vector<const Inst*> pending;
+		std::vector<const Inst*> seen;
+		if (const auto* inst = value.Resolve().TryInstruction(); inst != nullptr) {
+			pending.push_back(inst);
+		}
+		while (!pending.empty()) {
+			const auto* node = pending.back();
+			pending.pop_back();
+			if (std::ranges::find(seen, node) != seen.end()) {
+				continue;
+			}
+			seen.push_back(node);
+			// A flat slot read carries its slot's word; so does every other read of that slot.
+			if (const auto slot = SrtSlot(plan, *node); slot != UINT32_MAX) {
+				if (const auto* read = plan.srt_reads[slot].value.Resolve().TryInstruction();
+				    read != nullptr) {
+					pending.push_back(read);
+				}
+			}
+			const auto found = uses.find(node);
+			if (found == uses.end()) {
+				continue;
+			}
+			for (const auto& use: found->second) {
+				if (use.user == nullptr) {
+					continue;
+				}
+				const auto op = use.user->GetOpcode();
+				if (op == ValueOpcode::GetAddressResource || op == ValueOpcode::GetBufferResource) {
+					return true;
+				}
+				if (op == ValueOpcode::ReadConst && use.arg == UINT32_MAX) {
+					pending.push_back(use.user);
+				}
+			}
+		}
+		return false;
+	}
+
+	// A source qualifies when only plain buffers, images and samplers evaluate it, never a table.
+	void ClassifyPatchable() {
+		const auto count = plan.descriptor_sources.size();
+		patchable.assign(count, 0u);
+		if (!MaterializeMemoConfig::Get().descriptor_patch) {
+			return;
+		}
+		std::vector<uint8_t> referenced(count, 0u);
+		std::vector<uint8_t> refused(count, 0u);
+		const auto           refuse = [&](uint32_t source) {
+			if (source < count) {
+				refused[source] = 1u;
+			}
+		};
+		const auto reference = [&](uint32_t source) {
+			if (source < count) {
+				referenced[source] = 1u;
+			}
+		};
+		for (uint32_t s = 0; s < count; s++) {
+			const auto& source = plan.descriptor_sources[s];
+			if (source.indirect_buffer.has_value()) {
+				refuse(s);
+				refuse(source.indirect_buffer->heap_source);
+			}
+			if (source.indirect_descriptor.has_value()) {
+				const auto& indirect = *source.indirect_descriptor;
+				refuse(s);
+				refuse(indirect.material_source);
+				refuse(indirect.table_source);
+				for (const auto other: indirect.sources) {
+					refuse(other);
+				}
+			}
+		}
+		for (const auto& buffer: plan.info.buffers) {
+			reference(buffer.source);
+		}
+		for (uint32_t i = 0; i < plan.info.images.size(); i++) {
+			if (ImageServedBindless(plan, i)) {
+				refuse(plan.info.images[i].source);
+			} else {
+				reference(plan.info.images[i].source);
+			}
+		}
+		for (const auto& sampler: plan.info.samplers) {
+			reference(sampler.source);
+		}
+		for (uint32_t s = 0; s < count; s++) {
+			const auto& source = plan.descriptor_sources[s];
+			if (referenced[s] == 0u || refused[s] != 0u || source.dword_count == 0u ||
+			    source.dword_count > 8u) {
+				continue;
+			}
+			bool derivable = true;
+			for (uint32_t d = 0; d < source.dword_count && derivable; d++) {
+				derivable = Derivable(source.dwords[d]) && !ServesAsHandle(source.dwords[d]);
+			}
+			patchable[s] = derivable ? 1u : 0u;
+		}
+	}
+
 	// The words of this read reach nothing but addresses and flat SRT slots.
 	bool Replaceable(uint64_t key) {
 		const auto found = nodes.find(key);
@@ -262,9 +421,16 @@ MaterializeMemoConfig& MaterializeMemoConfig::Get() {
 		result.capture_relocation = !EnvFlag("KYTY_MEMO_NO_CAPTURE_RELOCATION");
 		result.integer_ops        = !EnvFlag("KYTY_MEMO_NO_INTEGER_OPS");
 		result.self_compare       = !EnvFlag("KYTY_MEMO_NO_SELF_COMPARE");
+		result.descriptor_patch   = !EnvFlag("KYTY_MEMO_NO_DESCRIPTOR_PATCH");
+		result.hot_replay         = !EnvFlag("KYTY_MEMO_NO_HOT_REPLAY");
 		return result;
 	}();
 	return config;
+}
+
+bool MaterializeMemoBackoff::Enabled() {
+	static const bool enabled = !EnvFlag("KYTY_NO_MEMO_MISS_BACKOFF");
+	return enabled;
 }
 
 MaterializeMemo::MaterializeMemo()                                      = default;
@@ -302,6 +468,7 @@ bool MaterializeMemo::Supports(const ResourcePlan& plan) {
 SrtRuntime MaterializeMemo::Record(const SrtRuntime& runtime) {
 	m_source = runtime;
 	m_reads.clear();
+	m_restarted = false;
 	// Without both readers the walk reads or refuses through paths the memo cannot see.
 	m_replayable = runtime.read_memory != nullptr && runtime.read_specialization_memory != nullptr;
 	auto wrapped = runtime;
@@ -318,7 +485,8 @@ SrtRuntime MaterializeMemo::Record(const SrtRuntime& runtime) {
 	    runtime.read_specialization_block != nullptr ? ReadBlock : nullptr;
 	wrapped.hash_specialization_block =
 	    runtime.hash_specialization_block != nullptr ? HashBlock : nullptr;
-	wrapped.gpu_owned = runtime.gpu_owned != nullptr ? GpuOwned : nullptr;
+	wrapped.gpu_owned      = runtime.gpu_owned != nullptr ? GpuOwned : nullptr;
+	wrapped.walk_restarted = WalkRestarted;
 	return wrapped;
 }
 
@@ -391,6 +559,19 @@ bool MaterializeMemo::HashBlock(void* userdata, uint64_t address, uint64_t size,
 bool MaterializeMemo::GpuOwned(void* userdata, uint64_t address, uint64_t size) {
 	auto& memo = *static_cast<MaterializeMemo*>(userdata);
 	return memo.m_source.gpu_owned(memo.m_source.userdata, address, size);
+}
+
+void MaterializeMemo::WalkRestarted(void* userdata) {
+	auto& memo       = *static_cast<MaterializeMemo*>(userdata);
+	memo.m_restarted = true;
+	if (memo.m_source.walk_restarted != nullptr) {
+		memo.m_source.walk_restarted(memo.m_source.userdata);
+	}
+}
+
+bool MaterializeMemo::RefusedMoveAllowed() {
+	static const bool allowed = !EnvFlag("KYTY_MEMO_NO_REFUSED_MOVE");
+	return allowed;
 }
 
 void MaterializeMemo::Invalidate() {
@@ -528,6 +709,9 @@ void MaterializeMemo::Compile(const ResourcePlan& plan, Value value) {
 
 uint64_t MaterializeMemo::Evaluate(uint32_t begin, uint32_t end,
                                    std::span<const uint32_t> user_data) const {
+	// One scratch stack for every memo: it stays in cache, a per-memo one does not.
+	static thread_local std::vector<uint64_t> stack;
+	auto&                                     m_stack = stack;
 	m_stack.clear();
 	for (uint32_t index = begin; index < end; index++) {
 		const auto& op = m_ops[index];
@@ -580,6 +764,45 @@ bool MaterializeMemo::SameShape(const ResourcePlan& plan) const {
 	return true;
 }
 
+void MaterializeMemo::Pin(const ResourcePlan& plan, Value value, std::vector<uint8_t>& structural,
+                          std::vector<const Inst*>& seen) {
+	std::vector<const Inst*> pending;
+	if (const auto* inst = value.Resolve().TryInstruction(); inst != nullptr) {
+		pending.push_back(inst);
+	}
+	while (!pending.empty()) {
+		const auto* inst = pending.back();
+		pending.pop_back();
+		if (std::ranges::find(seen, inst) != seen.end()) {
+			continue;
+		}
+		seen.push_back(inst);
+		if (const auto key = KeyOf(Value(const_cast<Inst*>(inst))); key != UINT32_MAX) {
+			structural[key] = 1u;
+			continue;
+		}
+		if (inst->GetOpcode() == ValueOpcode::GetUserData) {
+			const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
+			if (reg >= plan.user_data_base &&
+			    reg - plan.user_data_base < m_fixed_registers.size()) {
+				m_fixed_registers[reg - plan.user_data_base] = 1u;
+			}
+			continue;
+		}
+		if (const auto slot = SrtSlot(plan, *inst); slot != UINT32_MAX) {
+			if (const auto* next = plan.srt_reads[slot].value.Resolve().TryInstruction();
+			    next != nullptr) {
+				pending.push_back(next);
+			}
+		}
+		for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
+			if (const auto* next = inst->Arg(arg).Resolve().TryInstruction(); next != nullptr) {
+				pending.push_back(next);
+			}
+		}
+	}
+}
+
 bool MaterializeMemo::Build(const ResourcePlan& plan, const ResourceSnapshot& snapshot) {
 	if (m_plan != &plan || m_analysis == nullptr) {
 		m_analysis = std::make_shared<Analysis>(plan);
@@ -615,7 +838,6 @@ bool MaterializeMemo::Build(const ResourcePlan& plan, const ResourceSnapshot& sn
 	}
 	m_steps.assign(m_recorded.size(), {});
 	m_ops.clear();
-	std::vector<const Inst*> pending;
 	std::vector<const Inst*> seen;
 	for (uint32_t index = 0; index < m_recorded.size(); index++) {
 		const auto& read = m_recorded[index];
@@ -643,42 +865,60 @@ bool MaterializeMemo::Build(const ResourcePlan& plan, const ResourceSnapshot& sn
 				continue;
 			}
 			// A kept operand must not move: pin every input it was computed from.
-			pending.clear();
-			if (const auto* inst = operands[operand].Resolve().TryInstruction(); inst != nullptr) {
-				pending.push_back(inst);
-			}
-			while (!pending.empty()) {
-				const auto* inst = pending.back();
-				pending.pop_back();
-				if (std::ranges::find(seen, inst) != seen.end()) {
-					continue;
-				}
-				seen.push_back(inst);
-				if (const auto key = KeyOf(Value(const_cast<Inst*>(inst))); key != UINT32_MAX) {
-					structural[key] = 1u;
-					continue;
-				}
-				if (inst->GetOpcode() == ValueOpcode::GetUserData) {
-					const auto reg = RegIndex(inst->Arg(0).ScalarRegister());
-					if (reg >= plan.user_data_base &&
-					    reg - plan.user_data_base < m_fixed_registers.size()) {
-						m_fixed_registers[reg - plan.user_data_base] = 1u;
-					}
-					continue;
-				}
-				if (const auto slot = SrtSlot(plan, *inst); slot != UINT32_MAX) {
-					if (const auto* next = plan.srt_reads[slot].value.Resolve().TryInstruction();
-					    next != nullptr) {
-						pending.push_back(next);
-					}
-				}
-				for (size_t arg = 0; arg < inst->NumArgs(); arg++) {
-					if (const auto* next = inst->Arg(arg).Resolve().TryInstruction();
-					    next != nullptr) {
-						pending.push_back(next);
+			Pin(plan, operands[operand], structural, seen);
+		}
+	}
+	// Patch a plain descriptor only if every dword re-derives, else its inputs must not move.
+	m_patches.clear();
+	std::vector<uint8_t> active(plan.descriptor_sources.size(), 1u);
+	if (!plan.control_flow.empty()) {
+		if (plan.visited_blocks.size() != plan.control_flow.size()) {
+			std::ranges::fill(active, 0u);
+		} else {
+			for (const auto& block: plan.control_flow) {
+				for (const auto source: block.sources) {
+					if (source < active.size()) {
+						active[source] = 0u;
 					}
 				}
 			}
+			for (size_t block = 0; block < plan.control_flow.size(); block++) {
+				if (plan.visited_blocks[block] == 0u) {
+					continue;
+				}
+				for (const auto source: plan.control_flow[block].sources) {
+					if (source < active.size()) {
+						active[source] = 1u;
+					}
+				}
+			}
+		}
+	}
+	for (uint32_t source = 0; source < analysis.patchable.size(); source++) {
+		if (analysis.patchable[source] == 0u) {
+			continue;
+		}
+		const auto& descriptor = plan.descriptor_sources[source];
+		bool        derivable  = active[source] != 0u && !m_restarted;
+		for (uint32_t dword = 0; dword < descriptor.dword_count && derivable; dword++) {
+			derivable =
+			    CanDerive(plan, descriptor.dwords[dword], static_cast<uint32_t>(m_recorded.size()));
+		}
+		if (!derivable) {
+			if (active[source] != 0u) {
+				for (uint32_t dword = 0; dword < descriptor.dword_count; dword++) {
+					Pin(plan, descriptor.dwords[dword], structural, seen);
+				}
+			}
+			continue;
+		}
+		auto& patch       = m_patches.emplace_back();
+		patch.source      = source;
+		patch.dword_count = descriptor.dword_count;
+		for (uint32_t dword = 0; dword < descriptor.dword_count; dword++) {
+			patch.op_begin[dword] = static_cast<uint32_t>(m_ops.size());
+			Compile(plan, descriptor.dwords[dword]);
+			patch.op_end[dword] = static_cast<uint32_t>(m_ops.size());
 		}
 	}
 	// Slots the walk pruned stay zero, so only the slots it filled follow a re-read word.
@@ -748,10 +988,11 @@ void MaterializeMemo::Commit(const ResourcePlan& plan, const ResourceSnapshot& s
 	m_shader_base       = m_source.shader_base;
 	m_capture_addresses = !snapshot.specialization_reads.empty();
 	// The same reads in the same order keep every derived property; only the values move.
-	const bool same_shape = SameShape(plan);
+	const bool same_shape = SameShape(plan) && m_restarted == m_built_restarted;
 	m_recorded.swap(m_reads);
 	if (!same_shape) {
-		m_shape_ok = Build(plan, snapshot);
+		m_built_restarted = m_restarted;
+		m_shape_ok        = Build(plan, snapshot);
 		if (!m_shape_ok) {
 			m_miss = Miss::Unreplayable;
 			return;
@@ -778,12 +1019,247 @@ void MaterializeMemo::Commit(const ResourcePlan& plan, const ResourceSnapshot& s
 		}
 		m_capture_mapped = mapped && capture == captured.size();
 	}
+	if (MaterializeMemoConfig::Get().hot_replay) {
+		BuildHot(plan);
+	}
 	m_valid = true;
 	m_miss  = Miss::None;
 }
 
+void MaterializeMemo::BuildHot(const ResourcePlan& plan) {
+	m_hot.resize(m_recorded.size());
+	m_hot_operands.clear();
+	for (uint32_t index = 0; index < m_recorded.size(); index++) {
+		const auto& read = m_recorded[index];
+		const auto& step = m_steps[index];
+		auto&       hot  = m_hot[index];
+		hot              = {};
+		hot.address      = read.address;
+		for (uint32_t operand = 0; operand < read.operands.size(); operand++) {
+			hot.operands[operand] = static_cast<uint32_t>(read.operands[operand]);
+		}
+		hot.word          = read.word;
+		hot.key           = step.key;
+		hot.capture       = step.capture;
+		hot.slot_begin    = step.slot_begin;
+		hot.slot_end      = step.slot_end;
+		hot.reader        = static_cast<uint8_t>(read.reader);
+		hot.operand_begin = static_cast<uint32_t>(m_hot_operands.size());
+		for (uint32_t operand = 0; operand < read.operands.size(); operand++) {
+			if ((step.derived_mask & (1u << operand)) != 0u) {
+				m_hot_operands.push_back({step.op_begin[operand], step.op_end[operand], operand});
+			}
+		}
+		hot.operand_count = static_cast<uint8_t>(m_hot_operands.size() - hot.operand_begin);
+		RawReadShape shape;
+		const bool   shape_ok =
+		    RawReadShapeOf(plan, *read.inst, read.component_bytes, shape) == RawReadReject::None &&
+		    shape.immediate >= INT32_MIN && shape.immediate <= INT32_MAX;
+		hot.kind      = static_cast<uint8_t>(shape.kind);
+		hot.immediate = static_cast<int32_t>(shape_ok ? shape.immediate : 0);
+		hot.flags     = static_cast<uint8_t>(
+		    (step.structural ? HotStep::Structural : 0u) |
+		    (step.ownership_checked ? HotStep::OwnershipChecked : 0u) |
+		    (step.refused ? HotStep::Refused : 0u) |
+		    (!step.refused && m_key_first[step.key] == index ? HotStep::FirstKey : 0u) |
+		    (shape_ok ? HotStep::ShapeOk : 0u));
+	}
+}
+
+// The recorded-read loop of Replay over the packed records; same checks, same order.
+bool MaterializeMemo::ReplayReadsHot(const SrtRuntime& runtime, bool moved, bool& captured_moved) {
+	for (uint32_t index = 0; index < m_hot.size(); index++) {
+		const auto& hot     = m_hot[index];
+		uint64_t    address = hot.address;
+		if (moved && hot.operand_count != 0u) {
+			std::array<uint64_t, 5> operands {hot.operands[0], hot.operands[1], hot.operands[2],
+			                                  hot.operands[3], hot.operands[4]};
+			bool                    changed = false;
+			for (uint32_t i = 0; i < hot.operand_count; i++) {
+				const auto& derived = m_hot_operands[hot.operand_begin + i];
+				const auto  value   = Evaluate(derived.begin, derived.end, runtime.user_data);
+				changed = changed ||
+				          static_cast<uint32_t>(value) != hot.operands[derived.operand] ||
+				          (value >> 32u) != 0u;
+				operands[derived.operand] = value;
+			}
+			if (changed) {
+				if ((hot.flags & HotStep::ShapeOk) == 0u) {
+					m_miss = Miss::AddressChanged;
+					return false;
+				}
+				const RawReadShape shape {static_cast<RawReadShape::Kind>(hot.kind), hot.immediate};
+				if (RawReadAddressFrom(shape, operands, address) != RawReadReject::None) {
+					m_miss = Miss::AddressChanged;
+					return false;
+				}
+			}
+			if (address != hot.address && m_capture_addresses) {
+				if (!m_capture_mapped ||
+				    (hot.capture == UINT32_MAX &&
+				     !((hot.flags & HotStep::Refused) != 0u && RefusedMoveAllowed()))) {
+					m_miss = Miss::AddressChanged;
+					return false;
+				}
+				captured_moved = true;
+			}
+		}
+		m_new_addresses[index] = address;
+		// The walk would refuse this read, and the rebuild keeps it native instead of draining.
+		if ((hot.flags & HotStep::OwnershipChecked) != 0u && runtime.gpu_owned != nullptr &&
+		    runtime.gpu_owned(runtime.userdata, address, sizeof(uint32_t))) {
+			m_miss = Miss::ReadRefused;
+			return false;
+		}
+		uint32_t   word   = 0;
+		const auto kind   = static_cast<Reader>(hot.reader);
+		const auto reader = kind == Reader::Memory           ? runtime.read_memory
+		                    : kind == Reader::Specialization ? runtime.read_specialization_memory
+		                                                     : runtime.read_condition_memory;
+		if ((hot.flags & HotStep::Refused) != 0u) {
+			// The walk only saw this read refuse; a read that now answers would steer it elsewhere.
+			if (reader == nullptr || reader(runtime.userdata, address, {&word, 1})) {
+				m_miss = Miss::StructureChanged;
+				return false;
+			}
+			continue;
+		}
+		if (reader == nullptr || !reader(runtime.userdata, address, {&word, 1})) {
+			m_miss = Miss::ReadRefused;
+			return false;
+		}
+		if ((hot.flags & HotStep::Structural) != 0u && word != hot.word) {
+			m_miss = Miss::StructureChanged;
+			return false;
+		}
+		if ((hot.flags & HotStep::FirstKey) == 0u && m_key_words[hot.key] != word) {
+			m_miss = Miss::StructureChanged;
+			return false;
+		}
+		moved                = moved || word != hot.word;
+		m_key_words[hot.key] = word;
+		m_new_words[index]   = word;
+	}
+	return true;
+}
+
+bool MaterializeMemo::CapturedReadsOverlapWrites(const ResourcePlan&     plan,
+                                                 const ResourceSnapshot& descriptors) const {
+	if (std::ranges::none_of(plan.info.buffers,
+	                         [](const auto& buffer) { return buffer.written; })) {
+		return false;
+	}
+	for (uint32_t step = 0; step < m_steps.size(); step++) {
+		if (m_steps[step].capture != UINT32_MAX &&
+		    ReadOverlapsWrittenBuffer(plan, descriptors, m_new_addresses[step], sizeof(uint32_t))) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool MaterializeMemo::PatchDescriptors(const ResourcePlan& plan, const SrtRuntime& runtime,
+                                       ResourceSnapshot&       snapshot,
+                                       ResourceSpecialization* specialization,
+                                       bool                    captured_moved) {
+	static thread_local std::vector<DescriptorValue> values;
+	values.resize(m_patches.size());
+	for (size_t index = 0; index < m_patches.size(); index++) {
+		const auto& patch = m_patches[index];
+		auto&       value = values[index];
+		value             = {};
+		value.dword_count = patch.dword_count;
+		for (uint32_t dword = 0; dword < patch.dword_count; dword++) {
+			value.dwords[dword] = static_cast<uint32_t>(
+			    Evaluate(patch.op_begin[dword], patch.op_end[dword], runtime.user_data));
+		}
+	}
+	const auto& info            = plan.info;
+	bool        changed         = false;
+	bool        written_changed = false;
+	if (snapshot.buffers.size() < info.buffers.size() ||
+	    snapshot.images.size() != info.images.size() ||
+	    snapshot.samplers.size() != info.samplers.size()) {
+		m_miss = Miss::StructureChanged;
+		return false;
+	}
+	for (size_t index = 0; index < m_patches.size(); index++) {
+		const auto  source = m_patches[index].source;
+		const auto& value  = values[index];
+		for (uint32_t i = 0; i < info.buffers.size(); i++) {
+			if (info.buffers[i].source == source && !(snapshot.buffers[i] == value)) {
+				changed         = true;
+				written_changed = written_changed || info.buffers[i].written;
+			}
+		}
+		for (uint32_t i = 0; i < info.images.size(); i++) {
+			changed =
+			    changed || (info.images[i].source == source && !(snapshot.images[i] == value));
+		}
+		for (uint32_t i = 0; i < info.samplers.size(); i++) {
+			changed =
+			    changed || (info.samplers[i].source == source && !(snapshot.samplers[i] == value));
+		}
+	}
+	if (!changed) {
+		if (captured_moved && CapturedReadsOverlapWrites(plan, snapshot)) {
+			m_miss = Miss::AddressChanged;
+			return false;
+		}
+		return true;
+	}
+	if (specialization == nullptr) {
+		m_miss = Miss::StructureChanged;
+		return false;
+	}
+	static thread_local ResourceSnapshot       next;
+	static thread_local ResourceSpecialization next_specialization;
+	next.buffers        = snapshot.buffers;
+	next.images         = snapshot.images;
+	next.samplers       = snapshot.samplers;
+	next_specialization = *specialization;
+	for (size_t index = 0; index < m_patches.size(); index++) {
+		const auto  source = m_patches[index].source;
+		const auto& value  = values[index];
+		for (uint32_t i = 0; i < info.buffers.size(); i++) {
+			if (info.buffers[i].source == source) {
+				next.buffers[i] = value;
+			}
+		}
+		for (uint32_t i = 0; i < info.images.size(); i++) {
+			if (info.images[i].source == source) {
+				next.images[i] = value;
+			}
+		}
+		for (uint32_t i = 0; i < info.samplers.size(); i++) {
+			if (info.samplers[i].source == source) {
+				next.samplers[i] = value;
+			}
+		}
+	}
+	if (!RefreshDescriptorState(plan, next, next_specialization) ||
+	    next.images.size() != info.images.size()) {
+		m_miss = Miss::StructureChanged;
+		return false;
+	}
+	if (m_capture_addresses && written_changed && !m_capture_mapped) {
+		m_miss = Miss::StructureChanged;
+		return false;
+	}
+	if (m_capture_addresses && (written_changed || captured_moved) &&
+	    CapturedReadsOverlapWrites(plan, next)) {
+		m_miss = Miss::StructureChanged;
+		return false;
+	}
+	snapshot.buffers.swap(next.buffers);
+	snapshot.images.swap(next.images);
+	snapshot.samplers.swap(next.samplers);
+	*specialization = next_specialization;
+	return true;
+}
+
 bool MaterializeMemo::Replay(const ResourcePlan& plan, const SrtRuntime& runtime,
-                             ResourceSnapshot& snapshot) {
+                             ResourceSnapshot& snapshot, ResourceSpecialization* specialization) {
 	if (!m_valid || &plan != m_plan) {
 		// Keep the reason the last commit was refused.
 		m_miss = m_miss == Miss::None ? Miss::Empty : m_miss;
@@ -803,11 +1279,16 @@ bool MaterializeMemo::Replay(const ResourcePlan& plan, const SrtRuntime& runtime
 		}
 	}
 	// Until a register or a re-read word moves, every derived operand is the recorded one.
-	bool moved = false;
+	bool moved          = false;
+	bool captured_moved = false;
 	for (size_t reg = 0; reg < m_user_data.size() && !moved; reg++) {
 		moved = runtime.user_data[reg] != m_user_data[reg];
 	}
-	for (uint32_t index = 0; index < m_recorded.size(); index++) {
+	const bool hot = m_hot.size() == m_recorded.size() && MaterializeMemoConfig::Get().hot_replay;
+	if (hot && !ReplayReadsHot(runtime, moved, captured_moved)) {
+		return false;
+	}
+	for (uint32_t index = 0; !hot && index < m_recorded.size(); index++) {
 		const auto& read    = m_recorded[index];
 		const auto& step    = m_steps[index];
 		uint64_t    address = read.address;
@@ -825,12 +1306,13 @@ bool MaterializeMemo::Replay(const ResourcePlan& plan, const SrtRuntime& runtime
 				m_miss = Miss::AddressChanged;
 				return false;
 			}
-			// A moved captured range must still avoid every buffer the shader writes.
-			if (address != read.address && m_capture_addresses &&
-			    (!m_capture_mapped || step.capture == UINT32_MAX ||
-			     ReadOverlapsWrittenBuffer(plan, snapshot, address, sizeof(uint32_t)))) {
-				m_miss = Miss::AddressChanged;
-				return false;
+			if (address != read.address && m_capture_addresses) {
+				if (!m_capture_mapped ||
+				    (step.capture == UINT32_MAX && !(step.refused && RefusedMoveAllowed()))) {
+					m_miss = Miss::AddressChanged;
+					return false;
+				}
+				captured_moved = true;
 			}
 		}
 		m_new_addresses[index] = address;
@@ -869,19 +1351,37 @@ bool MaterializeMemo::Replay(const ResourcePlan& plan, const SrtRuntime& runtime
 		m_key_words[step.key] = word;
 		m_new_words[index]    = word;
 	}
+	if (!m_patches.empty()
+	        ? !PatchDescriptors(plan, runtime, snapshot, specialization, captured_moved)
+	        : captured_moved && CapturedReadsOverlapWrites(plan, snapshot)) {
+		if (m_patches.empty()) {
+			m_miss = Miss::AddressChanged;
+		}
+		return false;
+	}
 	for (uint32_t index = 0; index < m_recorded.size(); index++) {
-		const auto& step = m_steps[index];
-		for (uint32_t slot = step.slot_begin; slot < step.slot_end; slot++) {
+		const auto slot_begin = hot ? m_hot[index].slot_begin : m_steps[index].slot_begin;
+		const auto slot_end   = hot ? m_hot[index].slot_end : m_steps[index].slot_end;
+		const auto capture    = hot ? m_hot[index].capture : m_steps[index].capture;
+		for (uint32_t slot = slot_begin; slot < slot_end; slot++) {
 			snapshot.flattened_srt[m_slots[slot]] = m_new_words[index];
 		}
-		if (step.capture != UINT32_MAX && m_capture_mapped &&
-		    step.capture < snapshot.specialization_reads.size()) {
-			snapshot.specialization_reads[step.capture].first = m_new_addresses[index];
+		if (capture != UINT32_MAX && m_capture_mapped &&
+		    capture < snapshot.specialization_reads.size()) {
+			snapshot.specialization_reads[capture].first = m_new_addresses[index];
 		}
 	}
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	m_miss = Miss::None;
 	return true;
+}
+
+void MaterializeMemoWays::ForgetCurrent() {
+	// With one way the caller's snapshot is that way's only copy, and the walk just replaced it.
+	if (m_current < m_ways.size() && MaterializeMemoConfig::Get().ways <= 1u) {
+		m_ways[m_current].memo.Invalidate();
+	}
+	m_current = UINT32_MAX;
 }
 
 bool MaterializeMemoWays::Valid() const {
@@ -896,7 +1396,7 @@ bool MaterializeMemoWays::Replay(const ResourcePlan& plan, const SrtRuntime& run
 	if (m_current < m_ways.size() && m_ways[m_current].memo.Valid()) {
 		auto& way = m_ways[m_current];
 		tried     = true;
-		if (way.memo.Replay(plan, runtime, snapshot)) {
+		if (way.memo.Replay(plan, runtime, snapshot, &specialization)) {
 			way.used = ++m_clock;
 			m_miss   = Miss::None;
 			return true;
@@ -914,7 +1414,7 @@ bool MaterializeMemoWays::Replay(const ResourcePlan& plan, const SrtRuntime& run
 	          [&](uint32_t a, uint32_t b) { return m_ways[a].used > m_ways[b].used; });
 	for (uint32_t position = 0; position < count; position++) {
 		auto& way = m_ways[order[position]];
-		if (way.memo.Replay(plan, runtime, way.snapshot)) {
+		if (way.memo.Replay(plan, runtime, way.snapshot, &way.specialization)) {
 			snapshot       = way.snapshot;
 			specialization = way.specialization;
 			m_current      = order[position];
@@ -951,7 +1451,9 @@ SrtRuntime MaterializeMemoWays::Record(const SrtRuntime& runtime) {
 			}
 		}
 	}
+	m_current       = UINT32_MAX;
 	auto& recording = m_ways[m_recording];
+	recording.memo.Invalidate();
 	for (const auto& way: m_ways) {
 		recording.memo.AdoptAnalysis(way.memo);
 	}
