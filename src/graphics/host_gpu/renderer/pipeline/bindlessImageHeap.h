@@ -80,6 +80,14 @@ private:
 		bool                  stale         = true;
 		uint32_t              arena_base    = 0;
 		std::vector<uint32_t> words;
+		// The heap bytes `words` were translated from, so a rescan re-translates only what changed.
+		std::vector<uint32_t> dwords;
+		// Records to re-translate even if their bytes did not move: their element was killed.
+		std::vector<uint32_t> dirty;
+		// Records no image could be admitted for yet; a full rescan would retry them, so do we.
+		std::vector<uint32_t> unresolved;
+		// The next rescan has to translate every record (new heap, reset or integer arrays).
+		bool full = true;
 	};
 	struct Element {
 		ImageId                 id;
@@ -125,6 +133,9 @@ private:
 	[[nodiscard]] bool                    ReadHeap(const HeapKey& key, uint32_t records,
 	                                               std::vector<uint32_t>& dwords) const;
 	[[nodiscard]] bool Rescan(const HeapKey& key, Heap& heap, const std::vector<uint32_t>& dwords);
+	[[nodiscard]] bool RescanChanged(const HeapKey& key, Heap& heap,
+	                                 const std::vector<uint32_t>& dwords);
+	void NoteUnresolved(const HeapKey& key, Heap& heap, const std::vector<uint32_t>& dwords);
 	void               ResetElements();
 	void               BuildArena();
 	void               BuildVersion();
