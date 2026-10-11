@@ -125,6 +125,22 @@ bool BarrierElisionEnabled() {
 	return enabled;
 }
 
+bool DispatchOverlapEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_DISPATCH_OVERLAP");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+bool DispatchOverlapTrustsGuest() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_DISPATCH_OVERLAP_TRUST_GUEST");
+		return text != nullptr && text[0] != '\0' && std::strcmp(text, "0") != 0;
+	}();
+	return enabled;
+}
+
 void ShaderAccessBarrier(vk::CommandBuffer vk_buffer, vk::PipelineStageFlags source_stages) {
 	EXIT_IF(vk_buffer == nullptr || !source_stages);
 	const auto barrier = MakeShaderAccessDependency();

@@ -1421,6 +1421,8 @@ void CommandProcessor::EmitGlobalBarrier() {
 	dependency.memoryBarrierCount = 1;
 	dependency.pMemoryBarriers    = &barrier;
 	auto& command                 = CurrentBuffer();
+	// A guest sync ends the dispatch group; a group that began fully ordered still elides this.
+	command.FlushDeferredBarrier();
 	if (BarrierElisionEnabled() && command.FullBarrierIsLast()) {
 		return;
 	}

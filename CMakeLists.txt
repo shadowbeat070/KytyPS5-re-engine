@@ -697,6 +697,12 @@ if(BUILD_TESTING)
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --context-state-only)
 	add_test(NAME gpu_tiler
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --gpu-tiler-only)
+	add_test(NAME dispatch_overlap
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
+	add_test(NAME dispatch_overlap_kill_switch
+		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --dispatch-overlap-only)
+	set_tests_properties(dispatch_overlap_kill_switch
+		PROPERTIES ENVIRONMENT "KYTY_NO_DISPATCH_OVERLAP=1")
 	add_test(NAME long_recording_submit
 		COMMAND $<TARGET_FILE:shader_recompiler_compute_tests> --long-recording-only)
 	add_test(NAME long_recording_submit_kill_switch
