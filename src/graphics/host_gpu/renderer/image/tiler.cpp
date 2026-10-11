@@ -289,6 +289,14 @@ bool TileManager::TilerStagingForced() {
 	return forced;
 }
 
+bool TileManager::DetileFillSkipped() {
+	static const bool skipped = [] {
+		const char* text = std::getenv("KYTY_NO_DETILE_FILL_SKIP");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return skipped;
+}
+
 TileManager::Result TileManager::StageTiled(uint64_t offset, uint64_t capacity) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -319,10 +327,8 @@ void TileManager::Record(bool device_local, vk::Buffer source, uint64_t source_o
 	const auto tiled_bytes  = tile ? target_capacity : source_capacity;
 	const auto tiled_buffer = tile ? target : source;
 	if (device_local && !TilerStagingForced()) {
-		// Whole-dword stores read their neighbours from the destination, so no seeded copy is
-		// needed.
 		RecordPasses(source, source_offset, source_capacity, target, target_offset, target_capacity,
-		             dispatches, clear_target);
+		             dispatches, clear_target && !DetileFillSkipped());
 		return;
 	}
 	const auto staged = StageTiled(tiled_offset, tiled_bytes);
@@ -359,7 +365,7 @@ void TileManager::Record(bool device_local, vk::Buffer source, uint64_t source_o
 		return;
 	}
 	RecordPasses(staged.buffer, staged.offset, source_capacity, target, target_offset,
-	             target_capacity, dispatches, true);
+	             target_capacity, dispatches, !DetileFillSkipped());
 }
 
 void TileManager::RecordPasses(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,

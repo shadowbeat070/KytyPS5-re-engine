@@ -75,8 +75,9 @@ public:
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint64_t linear_capacity,
 	               std::span<const GpuTileInfo> infos,
 	               ColorTransform transform = ColorTransform::None, bool device_local = false);
-	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
+	[[nodiscard]] Result      GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
 	[[nodiscard]] static bool TilerStagingForced();
+	[[nodiscard]] static bool DetileFillSkipped();
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
 	[[nodiscard]] Result TransformColor(Result input, ColorTransform transform, bool to_host);

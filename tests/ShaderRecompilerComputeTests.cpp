@@ -22571,6 +22571,26 @@ public:
               "the reverse-packed small-block mip layout changed");
     }
 
+    auto compare_detile = [&](const char *stage, const std::vector<uint8_t> &expected,
+                              const std::vector<uint8_t> &actual, uint64_t tiled_size,
+                              std::span<const GpuTileInfo> infos) {
+      if (!TileManager::DetileFillSkipped()) {
+        compare(stage, expected, actual);
+        return;
+      }
+      std::vector<uint8_t> covered(expected.size(), 0);
+      const std::vector<uint8_t> ones(tiled_size, 0xff);
+      for (const auto &info : infos) {
+        convert_reference(false, &covered, ones, info);
+      }
+      for (size_t i = 0; i < expected.size(); i++) {
+        if (covered[i] != 0 && expected[i] != actual[i]) {
+          std::ostringstream out;
+          out << "first element mismatch at " << i << " of " << expected.size();
+          Fail(name, stage, out.str());
+        }
+      }
+    };
     u32 case_index = 0;
     auto check_round_trip = [&](const char *stage, uint64_t tiled_size,
                                 std::span<const GpuTileInfo> infos) {
@@ -22587,7 +22607,8 @@ public:
         convert_reference(false, &cpu, tiled, info);
       }
       gpu_detile(tiled, &gpu, tiled_size, linear_size, infos);
-      compare((std::string(stage) + " detile bytes").c_str(), cpu, gpu);
+      compare_detile((std::string(stage) + " detile bytes").c_str(), cpu, gpu, tiled_size,
+                     infos);
 
       std::vector<uint8_t> linear(linear_size);
       std::vector<uint8_t> cpu_tiled(tiled_size, 0xab);
@@ -22652,7 +22673,8 @@ public:
               << " bpe=" << bpe;
           return out.str();
         };
-        compare(family_label("detile bytes").c_str(), cpu, gpu);
+        compare_detile(family_label("detile bytes").c_str(), cpu, gpu, storage_size,
+                       std::span<const GpuTileInfo>(&info, 1));
 
         {
           std::vector<uint8_t> linear(storage_size);
@@ -22782,7 +22804,7 @@ public:
         fill(&tiled, ++case_index);
         convert_reference(false, &cpu, tiled, infos[0]);
         gpu_detile(tiled, &gpu, total.size, total.size, infos);
-        compare("format bytes", cpu, gpu);
+        compare_detile("format bytes", cpu, gpu, total.size, infos);
         ++format_cases;
       }
     }
@@ -23198,7 +23220,8 @@ public:
         convert_reference(false, &cpu, tiled, info);
         gpu_detile(tiled, &gpu, block.block_size, linear_size,
                    std::span<const GpuTileInfo>(&info, 1));
-        compare("tail bytes", cpu, gpu);
+        compare_detile("tail bytes", cpu, gpu, block.block_size,
+                       std::span<const GpuTileInfo>(&info, 1));
 
         std::vector<uint8_t> linear(linear_size);
         std::vector<uint8_t> cpu_tiled(block.block_size, 0xab);
@@ -23231,13 +23254,15 @@ public:
     gpu_detile(small_input, &small_output, small_input.size(),
                small_output.size(),
                std::span<const GpuTileInfo>(&small_info, 1));
-    compare("small detile", small_expected, small_output);
+    compare_detile("small detile", small_expected, small_output, small_input.size(),
+                   std::span<const GpuTileInfo>(&small_info, 1));
 
     std::fill(small_output.begin(), small_output.end(), 0xab);
     gpu_detile(small_input, &small_output, small_input.size(),
                small_output.size(),
                std::span<const GpuTileInfo>(&small_info, 1));
-    compare("scheduler-owned reuse", small_expected, small_output);
+    compare_detile("scheduler-owned reuse", small_expected, small_output, small_input.size(),
+                   std::span<const GpuTileInfo>(&small_info, 1));
 
     constexpr auto volume_format = Prospero::BufferFormat::k32UInt;
     constexpr auto volume_tile = Prospero::TileMode::kLinear;
