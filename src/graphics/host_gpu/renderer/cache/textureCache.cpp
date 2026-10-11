@@ -2471,6 +2471,352 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.MarkGpuModified();
 }
 
+namespace {
+
+bool DestinationImageCreationEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_COPY_DESTINATION_CREATE");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+bool AliasedImageCopyEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_ALIASED_IMAGE_COPY");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+struct BlockPiece {
+	uint32_t level   = 0;
+	uint32_t block_x = 0;
+	uint32_t block_y = 0;
+	uint32_t texel_x = 0;
+	uint32_t texel_y = 0;
+	uint32_t width   = 0;
+	uint32_t height  = 0;
+};
+
+bool RenderTargetBlockPieces(const TileSurfaceLayout& surface, uint32_t levels, uint64_t offset,
+                             std::vector<BlockPiece>& pieces) {
+	const auto& block = surface.texture.block;
+	if (block.family != TileBlockFamily::RenderTarget64KB || block.block_depth != 1 ||
+	    block.block_width == 0 || block.block_height == 0 || block.block_size == 0 ||
+	    surface.texture.texel_width != 1 || surface.texture.texel_height != 1 || levels > 16) {
+		return false;
+	}
+	pieces.clear();
+	for (uint32_t level = 0; level < levels; level++) {
+		const auto& mip = surface.mips[level];
+		if (mip.size == 0 || offset + block.block_size <= mip.offset ||
+		    offset >= mip.offset + mip.size) {
+			continue;
+		}
+		// A mip tail packs several levels into one block; leave those to guest memory.
+		if (level >= surface.first_tail_level) {
+			return false;
+		}
+		if ((offset - mip.offset) % block.block_size != 0 || mip.padded_width == 0) {
+			return false;
+		}
+		const uint64_t index   = (offset - mip.offset) / block.block_size;
+		const uint64_t per_row = (mip.padded_width + block.block_width - 1) / block.block_width;
+		const uint64_t texel_x = index % per_row * block.block_width;
+		const uint64_t texel_y = index / per_row * block.block_height;
+		if (texel_x >= mip.width || texel_y >= mip.height) {
+			continue; // padding only
+		}
+		pieces.push_back(
+		    {level, 0, 0, static_cast<uint32_t>(texel_x), static_cast<uint32_t>(texel_y),
+		     static_cast<uint32_t>(std::min<uint64_t>(block.block_width, mip.width - texel_x)),
+		     static_cast<uint32_t>(std::min<uint64_t>(block.block_height, mip.height - texel_y))});
+	}
+	return true;
+}
+
+} // namespace
+
+bool BufferCache::CopyImageForBufferCopy(uint64_t source, uint64_t destination, uint64_t size) {
+	if (!GuestRange {source, size}.Valid() || !GuestRange {destination, size}.Valid()) {
+		return false;
+	}
+	auto& textures = m_texture_cache;
+	struct Plan {
+		ImageId from;
+		ImageId to;
+		// No live destination: wake this parked one, or create one with the source's layout.
+		ImageId              parked;
+		bool                 create = false;
+		std::vector<ImageId> aliases;
+
+		bool operator==(const Plan&) const = default;
+	};
+	const auto plan_copy = [&]() -> std::optional<Plan> {
+		Plan plan;
+		for (const auto id: textures.FindImagesInRegion(source, size, false)) {
+			const auto* image = textures.m_slot_images.try_get(id);
+			if (image != nullptr && !image->dormant && !image->depth_id &&
+			    image->info.data == GuestRange {source, size}) {
+				if (plan.from) {
+					return std::nullopt;
+				}
+				plan.from = id;
+			}
+		}
+		if (!plan.from) {
+			return std::nullopt;
+		}
+		const auto& from     = textures.m_slot_images[plan.from];
+		const auto  copyable = [](const Image& image) {
+			const auto kind = image.info.metadata.kind;
+			return image.registered && image.backing.image != nullptr && image.info.samples == 1 &&
+			       image.backing.samples == 1 &&
+			       image.info.metadata.compression == VideoOutCompression::Uncompressed &&
+			       (kind == ImageMetadataKind::None ||
+			        (image.info.IsDepth() && kind == ImageMetadataKind::Htile) ||
+			        (!image.info.IsDepth() &&
+			         (kind == ImageMetadataKind::Dcc || kind == ImageMetadataKind::Cmask)));
+		};
+		const auto same_layout = [&](const Image& image) {
+			const auto& a = from.info;
+			const auto& b = image.info;
+			const auto  formats =
+			    from.backing.format == image.backing.format ||
+			    (vk::blockSize(from.backing.format) == vk::blockSize(image.backing.format) &&
+			     (a.IsDepth() || b.IsDepth()) &&
+			     Image::DepthColorCopyCompatible(from.backing.format, image.backing.format));
+			return formats && a.guest_format == b.guest_format && a.tile_mode == b.tile_mode &&
+			       a.type == b.type && a.extent == b.extent && a.resources == b.resources &&
+			       a.bytes_per_block == b.bytes_per_block && a.pitch == b.pitch &&
+			       a.GetColorTransform() == b.GetColorTransform() &&
+			       a.resources.levels <= a.mip_layout.size() &&
+			       std::equal(
+			           a.mip_layout.begin(), a.mip_layout.begin() + a.resources.levels,
+			           b.mip_layout.begin(), [](const ImageMipInfo& x, const ImageMipInfo& y) {
+				           return x.offset == y.offset && x.size == y.size && x.pitch == y.pitch;
+			           });
+		};
+		for (const auto id: textures.FindImagesInRegion(destination, size, false)) {
+			const auto* image = textures.m_slot_images.try_get(id);
+			if (image == nullptr) {
+				continue;
+			}
+			const bool candidate = !image->depth_id &&
+			                       image->info.data == GuestRange {destination, size} &&
+			                       copyable(*image) && same_layout(*image);
+			if (candidate && !image->dormant) {
+				if (plan.to) {
+					return std::nullopt;
+				}
+				plan.to = id;
+			} else if (candidate && !plan.parked) {
+				plan.parked = id;
+			} else {
+				plan.aliases.push_back(id);
+			}
+		}
+		if (plan.to && plan.parked) {
+			plan.aliases.push_back(plan.parked);
+			plan.parked = {};
+		}
+		plan.create = !plan.to && !plan.parked &&
+		              from.info.metadata.kind == ImageMetadataKind::None &&
+		              !from.info.HasStencil() && DestinationImageCreationEnabled();
+		if ((!plan.to && !plan.parked && !plan.create) ||
+		    ((!plan.aliases.empty() || !plan.to) && !AliasedImageCopyEnabled())) {
+			return std::nullopt;
+		}
+		// The source image must hold the bytes: nothing newer may sit in guest memory or a buffer.
+		if (!copyable(from) || from.IsBufferModified() || from.IsCpuDirty() ||
+		    from.IsMaybeCpuDirty() || from.IsSuperseded()) {
+			return std::nullopt;
+		}
+		// Nor may another surface over the source have written its share of the bytes since.
+		for (const auto id: textures.FindImagesInRegion(source, size, false)) {
+			const auto* other = textures.m_slot_images.try_get(id);
+			if (id != plan.from && other != nullptr &&
+			    ((other->IsGpuModified() && other->GpuWriteEpoch() > from.GpuWriteEpoch()) ||
+			     other->IsBufferModified())) {
+				return std::nullopt;
+			}
+		}
+		std::ranges::sort(plan.aliases);
+		return plan;
+	};
+
+	const auto copy_image = [&](ImageId to_id, ImageId from_id) {
+		auto& to   = textures.m_slot_images[to_id];
+		auto& from = textures.m_slot_images[from_id];
+		if (!Image::CopyCarriesStencil(from.backing.format, to.backing.format)) {
+			textures.CopyImage(to_id, from_id);
+			return;
+		}
+		textures.RefreshCopySource(from_id);
+		textures.PrepareImageCopy(to);
+		std::vector<vk::ImageCopy> regions;
+		const auto levels = std::min(from.backing.mip_levels, to.backing.mip_levels);
+		const auto layers = std::min(from.backing.layers, to.backing.layers);
+		for (uint32_t level = 0; level < levels; level++) {
+			vk::ImageCopy copy {};
+			copy.srcSubresource = {vk::ImageAspectFlagBits::eDepth, level, 0, layers};
+			copy.dstSubresource = {vk::ImageAspectFlagBits::eDepth, level, 0, layers};
+			copy.extent         = vk::Extent3D {
+			    std::max(std::min(from.backing.extent.width, to.backing.extent.width) >> level, 1u),
+			    std::max(std::min(from.backing.extent.height, to.backing.extent.height) >> level,
+			             1u),
+			    1};
+			regions.push_back(copy);
+		}
+		to.CopyRegions(from, regions);
+		if (from.IsGpuModified()) {
+			to.MarkGpuModified();
+		}
+		to.ClearBufferModified();
+	};
+
+	std::optional<Plan> plan;
+	{
+		std::scoped_lock lock {textures.m_lock};
+		plan = plan_copy();
+		if (!plan) {
+			return false;
+		}
+		if (plan->aliases.empty() && plan->to) {
+			// No other surface sees these bytes: the destination image is all of them.
+			auto& to = textures.m_slot_images[plan->to];
+			copy_image(plan->to, plan->from);
+			textures.TrackImage(plan->to);
+			textures.CommitGpuWrite(to);
+			textures.TrackImageDownload(plan->to, to);
+			return true;
+		}
+	}
+
+	const auto source_id            = FindBuffer(source, size);
+	const auto destination_id       = FindBuffer(destination, size);
+	auto [from_buffer, from_offset] = ObtainBuffer(source, size, false, false, source_id, true);
+	auto [buffer, offset]           = ObtainBuffer(destination, size, true, false, destination_id);
+	std::scoped_lock lock {textures.m_lock};
+	const auto       again = plan_copy();
+	if (buffer == nullptr || from_buffer == nullptr || !again || *again != *plan) {
+		return false;
+	}
+	if (plan->parked) {
+		(void)textures.UnparkImage(plan->parked);
+		plan->to = plan->parked;
+	} else if (plan->create) {
+		auto info                   = textures.m_slot_images[plan->from].info;
+		info.data.address           = destination;
+		plan->to                    = textures.InsertImage(info);
+		auto& created               = textures.m_slot_images[plan->to];
+		created.tick_accessed_last  = m_scheduler.CurrentTick();
+		created.frame_accessed_last = textures.m_frame_index.load(std::memory_order_relaxed);
+		textures.TouchImage(created);
+	}
+	if (!plan->parked && !plan->create) {
+	}
+	auto& to = textures.m_slot_images[plan->to];
+	buffer->CopyFrom(m_scheduler.Current(), *from_buffer, from_offset, offset, size);
+	copy_image(plan->to, plan->from);
+	textures.TrackImage(plan->to);
+	textures.CommitGpuWrite(to);
+	{
+		constexpr uint64_t PageBits = 16;
+		const auto         epoch    = NextImageWriteEpoch();
+		for (auto page = destination >> PageBits; page <= (destination + size - 1) >> PageBits;
+		     page++) {
+			textures.m_buffer_write_epochs[page] = epoch;
+		}
+	}
+	to.MarkGpuModified();
+	textures.TrackImageDownload(plan->to, to);
+
+	std::vector<BlockPiece>    to_pieces;
+	std::vector<BlockPiece>    alias_pieces;
+	std::vector<vk::ImageCopy> regions;
+	const auto to_transfer = textures.BuildTextureTransfer(to, textures.UploadBinding(to),
+	                                                       TextureCache::TransferDirection::Upload);
+	for (const auto id: plan->aliases) {
+		auto&      alias  = textures.m_slot_images[id];
+		bool       synced = false;
+		const auto begin  = std::max(alias.info.data.address, destination);
+		const auto end    = std::min(alias.info.data.End(), destination + size);
+		if (alias.backing.image != nullptr && alias.registered && !alias.depth_id &&
+		    alias.info.samples == 1 && alias.backing.samples == 1 && !alias.info.IsDepth() &&
+		    !alias.info.HasStencil() && !alias.info.IsBlock() &&
+		    alias.info.metadata.compression == VideoOutCompression::Uncompressed &&
+		    alias.info.metadata.kind == ImageMetadataKind::None &&
+		    alias.info.resources.layers == 1 && alias.info.type == to.info.type &&
+		    to.info.resources.layers == 1 && !to.info.IsBlock() &&
+		    alias.info.bytes_per_block == to.info.bytes_per_block && !alias.IsBufferModified() &&
+		    !alias.IsCpuDirty() && !alias.IsMaybeCpuDirty() && !alias.IsSuperseded() &&
+		    to_transfer.valid && begin < end) {
+			const auto alias_transfer = textures.BuildTextureTransfer(
+			    alias, textures.UploadBinding(alias), TextureCache::TransferDirection::Upload);
+			const auto& to_surface    = to_transfer.layout.surface;
+			const auto& alias_surface = alias_transfer.layout.surface;
+			const auto  block_size    = uint64_t {to_surface.texture.block.block_size};
+			synced =
+			    alias_transfer.valid && block_size != 0 &&
+			    alias_surface.texture.block.block_size == block_size &&
+			    alias_surface.texture.block.block_width == to_surface.texture.block.block_width &&
+			    alias_surface.texture.block.block_height == to_surface.texture.block.block_height &&
+			    (begin - destination) % block_size == 0 &&
+			    (begin - alias.info.data.address) % block_size == 0 &&
+			    (end - begin) % block_size == 0 &&
+			    vk::blockSize(alias.backing.format) == vk::blockSize(to.backing.format);
+			regions.clear();
+			for (auto block = begin; synced && block < end; block += block_size) {
+				synced = RenderTargetBlockPieces(to_surface, to.info.resources.levels,
+				                                 block - destination, to_pieces) &&
+				         RenderTargetBlockPieces(alias_surface, alias.info.resources.levels,
+				                                 block - alias.info.data.address, alias_pieces);
+				for (const auto& from_piece: to_pieces) {
+					for (const auto& into: alias_pieces) {
+						const auto x0 = std::max(from_piece.block_x, into.block_x);
+						const auto y0 = std::max(from_piece.block_y, into.block_y);
+						const auto x1 = std::min(from_piece.block_x + from_piece.width,
+						                         into.block_x + into.width);
+						const auto y1 = std::min(from_piece.block_y + from_piece.height,
+						                         into.block_y + into.height);
+						if (x0 >= x1 || y0 >= y1) {
+							continue;
+						}
+						vk::ImageCopy copy {};
+						copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, from_piece.level, 0,
+						                       1};
+						copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, into.level, 0, 1};
+						copy.srcOffset      = vk::Offset3D {
+						    static_cast<int32_t>(from_piece.texel_x + x0 - from_piece.block_x),
+						    static_cast<int32_t>(from_piece.texel_y + y0 - from_piece.block_y), 0};
+						copy.dstOffset = vk::Offset3D {
+						    static_cast<int32_t>(into.texel_x + x0 - into.block_x),
+						    static_cast<int32_t>(into.texel_y + y0 - into.block_y), 0};
+						copy.extent = vk::Extent3D {x1 - x0, y1 - y0, 1};
+						regions.push_back(copy);
+					}
+				}
+			}
+		}
+		if (synced) {
+			alias.CopyRegions(to, regions);
+			alias.MarkGpuModified();
+			continue;
+		}
+		if ((alias.info.data.address != destination || SupersedeAtBaseEnabled()) &&
+		    alias.IsGpuModified() && !alias.Supersede(destination, size)) {
+			continue;
+		}
+		if (alias.IsGpuModified()) {
+			alias.ClearGpuModified();
+		}
+		alias.MarkBufferModified();
+	}
+	return true;
+}
+
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
                                         uint32_t packed_clear) {
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {

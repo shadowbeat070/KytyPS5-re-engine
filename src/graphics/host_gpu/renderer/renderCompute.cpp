@@ -187,6 +187,58 @@ bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t grou
 	return true;
 }
 
+// KYTY_NO_COMPUTE_IMAGE_COPY=1 runs every buffer-copy dispatch as recorded.
+static bool ComputeImageCopyEnabled() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_COMPUTE_IMAGE_COPY");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
+
+bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+                              uint32_t group_y, uint32_t group_z, uint32_t mode, uint64_t& source,
+                              uint64_t& destination, uint64_t& size) {
+	const auto& resources = *input.stage.resources;
+	const auto& copy      = resources.buffer_copy;
+	if (!copy.valid || copy.pairs == 0 || copy.pairs > ShaderRecompiler::IR::BufferCopy::MaxPairs ||
+	    copy.src >= resources.buffers.size() || copy.dst >= resources.buffers.size() ||
+	    mode != 0x41u || input.dispatch_thread_dimensions) {
+		return false;
+	}
+	const uint64_t threads = input.threads_num[0];
+	if (threads == 0 || input.threads_num[1] != 1 || input.threads_num[2] != 1 || group_x == 0 ||
+	    group_y != 1 || group_z != 1 || copy.group_stride != threads * copy.pairs) {
+		return false;
+	}
+	std::array<uint32_t, ShaderRecompiler::IR::BufferCopy::MaxPairs> offsets = copy.offsets;
+	std::sort(offsets.begin(), offsets.begin() + copy.pairs);
+	for (uint32_t k = 0; k < copy.pairs; ++k) {
+		if (offsets[k] != k * threads) {
+			return false;
+		}
+	}
+	const auto     from = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.src]);
+	const auto     to   = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[copy.dst]);
+	const uint64_t element = uint64_t {copy.words} * sizeof(uint32_t);
+	for (const auto& descriptor: {from, to}) {
+		if (descriptor.Base48() == 0 || descriptor.Stride() != element ||
+		    descriptor.SwizzleEnabled() || descriptor.IndexStride() != 0 || descriptor.AddTid()) {
+			return false;
+		}
+	}
+	const uint64_t records = to.NumRecords();
+	const uint64_t covered = uint64_t {group_x} * copy.group_stride;
+	if (records == 0 || from.NumRecords() != records || covered < records ||
+	    covered - records >= copy.group_stride || records > UINT64_MAX / element) {
+		return false;
+	}
+	size        = records * element;
+	source      = from.Base48();
+	destination = to.Base48();
+	return size <= 0x40000000u && (source + size <= destination || destination + size <= source);
+}
+
 bool ResolveComputeRecordFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                               uint32_t group_y, uint32_t group_z, uint32_t mode,
                               ShaderBufferResource&    resolved_descriptor,
@@ -325,6 +377,22 @@ bool RenderExecutor::TryConsumeComputeImageClear(const ShaderComputeInputInfo& i
 	return true;
 }
 
+bool RenderExecutor::TryConsumeComputeImageCopy(const ShaderComputeInputInfo& input,
+                                                CommandBuffer& command, uint32_t group_x,
+                                                uint32_t group_y, uint32_t group_z, uint32_t mode) {
+	if (!ComputeImageCopyEnabled()) {
+		return false;
+	}
+	uint64_t source      = 0;
+	uint64_t destination = 0;
+	uint64_t size        = 0;
+	if (!ResolveComputeBufferCopy(input, group_x, group_y, group_z, mode, source, destination,
+	                              size)) {
+		return false;
+	}
+	return command.GetContext().GetBufferCache().CopyImageForBufferCopy(source, destination, size);
+}
+
 static void ReportOverLimitDispatch(RenderContext& context, uint64_t shader_hash,
                                     std::array<uint32_t, 3> counts, uint32_t mode,
                                     std::array<uint32_t, 3> local_size, const DispatchPlan& plan,
@@ -455,7 +523,8 @@ static void CollectDispatchAccess(TextureCache& textures, const ShaderStageRunti
 
 static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& input,
                              PreparedBindings& bindings, uint64_t indirect_args = 0) {
-	if (ShaderRecompiler::IR::FindBinding(input.stage.program->bindings,
+	if (ShaderRecompiler::IR::FindBinding(
+	        input.stage.program->bindings,
 	        ShaderRecompiler::IR::DescriptorBindingKind::SharedMemory) == nullptr) {
 		return;
 	}
@@ -596,7 +665,9 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	     TryConsumeComputeImageClear(input_info, buffer, thread_group_x, thread_group_y,
 	                                 thread_group_z, mode) ||
 	     TryConsumeComputeRecordFill(input_info, buffer, thread_group_x, thread_group_y,
-	                                 thread_group_z, mode))) {
+	                                 thread_group_z, mode) ||
+	     TryConsumeComputeImageCopy(input_info, buffer, thread_group_x, thread_group_y,
+	                                thread_group_z, mode))) {
 		ResetBindings();
 		return;
 	}

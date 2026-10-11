@@ -308,6 +308,10 @@ private:
 	                                                      CommandBuffer& command, uint32_t group_x,
 	                                                      uint32_t group_y, uint32_t group_z,
 	                                                      uint32_t mode);
+	[[nodiscard]] bool        TryConsumeComputeImageCopy(const ShaderComputeInputInfo& input,
+	                                                     CommandBuffer& command, uint32_t group_x,
+	                                                     uint32_t group_y, uint32_t group_z,
+	                                                     uint32_t mode);
 	[[nodiscard]] ThreadDispatcher& ThreadDispatch();
 
 	RenderContext&                        m_context;
@@ -327,6 +331,10 @@ private:
 	friend struct RenderExecutorTestAccess;
 };
 
+[[nodiscard]] bool ResolveComputeBufferCopy(const ShaderComputeInputInfo& input, uint32_t group_x,
+                                            uint32_t group_y, uint32_t group_z, uint32_t mode,
+                                            uint64_t& source, uint64_t& destination,
+                                            uint64_t& size);
 [[nodiscard]] bool ResolveComputeBufferFill(const ShaderComputeInputInfo& input, uint32_t group_x,
                                             uint32_t group_y, uint32_t group_z, uint32_t mode,
                                             ShaderBufferResource& descriptor,
