@@ -117,12 +117,31 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 
 	const auto& block     = info.tiling.block;
 	const auto  transform = info.GetColorTransform();
-	EXIT_NOT_IMPLEMENTED(
-	    !info.IsTiled() || info.samples != 1 || Prospero::IsFmaskTextureFormat(info.guest_format) ||
+	// Name the offending job and level when the tiler rejects one.
+	const auto reject = [&](uint32_t level, const char* reason) {
+		const auto& mip    = info.mip_layout[level];
+		const auto  extent = info.MipExtent(level);
+		EXIT("TileManager: invalid %s job (%s) level %u/%u: family=%u bpe=%u format=%u "
+		     "tile_mode=%u block=%ux%ux%u texel=%ux%u extent=%ux%ux%u pitch=%u height=%u "
+		     "linear_pitch=%u surface_z=%u tail=%u tail_xy=%u,%u linear=0x%" PRIx64 "+0x%" PRIx64
+		     "/0x%" PRIx64 " slice_stride=0x%" PRIx64 " tiled=0x%" PRIx64 "+0x%" PRIx64
+		     "/0x%" PRIx64 " tiled_slice_stride=0x%" PRIx64 "\n",
+		     tile ? "tile" : "detile", reason, level, levels, static_cast<uint32_t>(block.family),
+		     block.bytes_per_element, static_cast<uint32_t>(info.guest_format),
+		     static_cast<uint32_t>(info.tile_mode), block.block_width, block.block_height,
+		     block.block_depth, info.tiling.texel_width, info.tiling.texel_height, extent.width,
+		     extent.height, extent.depth, mip.pitch, mip.height, mip.linear_pitch, mip.surface_z,
+		     level >= info.first_tail_level ? 1u : 0u, mip.tail_x, mip.tail_y, mip.linear_offset,
+		     mip.linear_size, linear_capacity, info.linear_slice_stride, mip.offset, mip.size,
+		     tiled_capacity, info.tiled_slice_stride);
+	};
+	if (!info.IsTiled() || info.samples != 1 || Prospero::IsFmaskTextureFormat(info.guest_format) ||
 	    block.family >= TileBlockFamily::Count || !std::has_single_bit(block.bytes_per_element) ||
 	    block.bytes_per_element > 16 || block.block_width == 0 || block.block_height == 0 ||
 	    block.block_depth == 0 || block.block_size == 0 || info.tiling.texel_width == 0 ||
-	    info.tiling.texel_height == 0 || info.tiled_slice_stride == 0);
+	    info.tiling.texel_height == 0 || info.tiled_slice_stride == 0) {
+		reject(0, "surface");
+	}
 	EXIT_IF((transform == ColorTransform::SwapBgra16 && block.bytes_per_element != 8u) ||
 	        (transform == ColorTransform::Reverse10_11_11 && block.bytes_per_element != 4u));
 	const auto checked_multiply = [](uint64_t left, uint64_t right, uint64_t& result) {
@@ -135,87 +154,79 @@ TileManager::Tiling TileManager::Prepare(bool tile, uint64_t tiled_capacity,
 		return size != 0 && offset <= capacity && size <= capacity - offset;
 	};
 
-	dispatches.clear();
-	dispatches.reserve(infos.size());
-	for (const auto& info: infos) {
-		EXIT_IF((transform == ColorTransform::SwapBgra16 && info.bytes_per_element != 8u) ||
-		        (transform == ColorTransform::Reverse10_11_11 && info.bytes_per_element != 4u));
-		TileBlockLayout block {};
-		const uint32_t  tiled_width  = info.tiled_width != 0 ? info.tiled_width : info.pitch;
-		const uint32_t  tiled_height = info.tiled_height != 0 ? info.tiled_height : info.height;
-		const uint64_t  groups_x     = (static_cast<uint64_t>(info.width) + 7u) / 8u;
-		const uint64_t  groups_y     = (static_cast<uint64_t>(info.height) + 7u) / 8u;
-		const bool      block_ok = TileGetBlockLayout(info.family, info.bytes_per_element, block);
-		const bool linear_ok = valid_range(info.linear_offset, info.linear_size, linear_capacity);
-		const bool tiled_ok  = valid_range(info.tiled_offset, info.tiled_size, tiled_capacity);
-		if (!block_ok || info.width == 0 || info.height == 0 || info.depth == 0 ||
-		    info.pitch < info.width || groups_x > limits.maxComputeWorkGroupCount[0] ||
-		    groups_y > limits.maxComputeWorkGroupCount[1] ||
-		    info.depth > limits.maxComputeWorkGroupCount[2] ||
-		    (!info.tail && (tiled_width < info.width || tiled_height < info.height)) ||
-		    !linear_ok || !tiled_ok || (block.block_depth == 1 && info.depth != 1)) {
-			EXIT("TileManager: invalid %s job %zu/%zu: family=%u bpe=%u block_ok=%u "
-			     "block=%ux%ux%u extent=%ux%ux%u pitch=%u tiled_extent=%ux%u surface_z=%u "
-			     "tail=%u tail_xy=%u,%u linear=0x%" PRIx64 "+0x%" PRIx64 "/0x%" PRIx64
-			     " ok=%u slice_stride=0x%" PRIx64 " tiled=0x%" PRIx64 "+0x%" PRIx64 "/0x%" PRIx64
-			     " ok=%u\n",
-			     tile ? "tile" : "detile", static_cast<size_t>(&info - infos.data()), infos.size(),
-			     static_cast<uint32_t>(info.family), info.bytes_per_element, block_ok ? 1u : 0u,
-			     block.block_width, block.block_height, block.block_depth, info.width, info.height,
-			     info.depth, info.pitch, tiled_width, tiled_height, info.surface_z,
-			     info.tail ? 1u : 0u, info.tail_x, info.tail_y, info.linear_offset,
-			     info.linear_size, linear_capacity, linear_ok ? 1u : 0u, info.linear_slice_stride,
-			     info.tiled_offset, info.tiled_size, tiled_capacity, tiled_ok ? 1u : 0u);
+	// ImageInfo owns the layout. Upload only the header and active mip records.
+	TilingParams params;
+	params.color_transform = static_cast<uint32_t>(transform);
+	for (uint32_t level = 0; level < levels; ++level) {
+		const auto& mip    = info.mip_layout[level];
+		const auto  extent = info.MipExtent(level);
+		const auto  width  = static_cast<uint32_t>(
+		    (uint64_t {extent.width} + info.tiling.texel_width - 1u) / info.tiling.texel_width);
+		const auto height = static_cast<uint32_t>(
+		    (uint64_t {extent.height} + info.tiling.texel_height - 1u) / info.tiling.texel_height);
+		const auto depth = extent.depth;
+		const bool tail  = level >= info.first_tail_level;
+		if (width == 0 || height == 0 || depth == 0 || mip.linear_pitch < width ||
+		    mip.linear_size == 0 || mip.size == 0 ||
+		    (!tail && (mip.pitch < width || mip.height < height)) ||
+		    (!info.IsVolume() && mip.size % depth != 0)) {
+			reject(level, "extent");
 		}
 
 		uint64_t pitch_bytes = 0;
-		EXIT_NOT_IMPLEMENTED(
-		    !checked_multiply(mip.linear_pitch, block.bytes_per_element, pitch_bytes) ||
-		    pitch_bytes > UINT32_MAX);
+		if (!checked_multiply(mip.linear_pitch, block.bytes_per_element, pitch_bytes) ||
+		    pitch_bytes > UINT32_MAX) {
+			reject(level, "pitch");
+		}
 		const uint64_t slice_bytes =
 		    info.linear_slice_stride != 0 ? info.linear_slice_stride : mip.linear_size;
 		uint64_t minimum_slice = 0;
 		uint64_t linear_used = 0;
 		uint64_t bytes         = 0;
 		uint64_t linear_span   = 0;
-		EXIT_NOT_IMPLEMENTED(!checked_multiply(pitch_bytes, height, minimum_slice) ||
-		                     (depth > 1 && slice_bytes < minimum_slice) ||
-		                     !checked_multiply(height - 1u, pitch_bytes, linear_used) ||
-		                     !checked_multiply(width, block.bytes_per_element, bytes) ||
-		                     !checked_add(linear_used, bytes, linear_used) ||
-		                     linear_used > mip.linear_size || slice_bytes > UINT32_MAX ||
-		                     !checked_multiply(depth - 1u, slice_bytes, linear_span) ||
-		                     !checked_add(linear_span, mip.linear_size, linear_span) ||
-		                     !valid_range(mip.linear_offset, linear_span, linear_capacity));
+		if (!checked_multiply(pitch_bytes, height, minimum_slice) ||
+		    (depth > 1 && slice_bytes < minimum_slice) ||
+		    !checked_multiply(height - 1u, pitch_bytes, linear_used) ||
+		    !checked_multiply(width, block.bytes_per_element, bytes) ||
+		    !checked_add(linear_used, bytes, linear_used) || linear_used > mip.linear_size ||
+		    slice_bytes > UINT32_MAX || !checked_multiply(depth - 1u, slice_bytes, linear_span) ||
+		    !checked_add(linear_span, mip.linear_size, linear_span) ||
+		    !valid_range(mip.linear_offset, linear_span, linear_capacity)) {
+			reject(level, "linear range");
+		}
 
 		const uint64_t columns =
 		    (uint64_t {mip.pitch} + block.block_width - 1u) / block.block_width;
-		if (tail) {
-			EXIT_NOT_IMPLEMENTED(
-			    block.family == TileBlockFamily::Standard256B || mip.tail_x >= block.block_width ||
-			    width > block.block_width - mip.tail_x || mip.tail_y >= block.block_height ||
-			    height > block.block_height - mip.tail_y);
+		if (tail &&
+		    (block.family == TileBlockFamily::Standard256B || mip.tail_x >= block.block_width ||
+		     width > block.block_width - mip.tail_x || mip.tail_y >= block.block_height ||
+		     height > block.block_height - mip.tail_y)) {
+			reject(level, "tail");
 		}
 		const uint64_t tiled_plane = info.IsVolume() ? mip.size : mip.size / depth;
 		const uint64_t tiled_slice = info.tiled_slice_stride;
 		const uint64_t slices     = (uint64_t {depth} + block.block_depth - 1u) / block.block_depth;
 		uint64_t       tiled_span = 0;
-		EXIT_NOT_IMPLEMENTED(columns > UINT32_MAX || tiled_slice > UINT32_MAX ||
-		                     (slices > 1 && tiled_slice < tiled_plane) ||
-		                     !checked_multiply(slices - 1u, tiled_slice, tiled_span) ||
-		                     !checked_add(tiled_span, tiled_plane, tiled_span) ||
-		                     !valid_range(mip.offset, tiled_span, tiled_capacity));
+		if (columns > UINT32_MAX || tiled_slice > UINT32_MAX ||
+		    (slices > 1 && tiled_slice < tiled_plane) ||
+		    !checked_multiply(slices - 1u, tiled_slice, tiled_span) ||
+		    !checked_add(tiled_span, tiled_plane, tiled_span) ||
+		    !valid_range(mip.offset, tiled_span, tiled_capacity)) {
+			reject(level, "tiled range");
+		}
 
 		const uint32_t alignment = std::min(block.bytes_per_element, 4u);
-		EXIT_NOT_IMPLEMENTED(
-		    ((mip.linear_offset | mip.offset | pitch_bytes | slice_bytes | tiled_slice) &
-		     (alignment - 1u)) != 0);
+		if (((mip.linear_offset | mip.offset | pitch_bytes | slice_bytes | tiled_slice) &
+		     (alignment - 1u)) != 0) {
+			reject(level, "alignment");
+		}
 		uint64_t src = 0, dst = 0, texels = 0;
-		EXIT_NOT_IMPLEMENTED(
-		    !checked_add(source_base, tile ? mip.linear_offset : mip.offset, src) ||
+		if (!checked_add(source_base, tile ? mip.linear_offset : mip.offset, src) ||
 		    !checked_add(target_base, tile ? mip.offset : mip.linear_offset, dst) ||
 		    src > UINT32_MAX || dst > UINT32_MAX || !checked_multiply(width, height, texels) ||
-		    !checked_multiply(texels, depth, texels) || texels > UINT32_MAX - params.num_texels);
+		    !checked_multiply(texels, depth, texels) || texels > UINT32_MAX - params.num_texels) {
+			reject(level, "offsets");
+		}
 		params.mips[level] = {static_cast<uint32_t>(src),
 		                      static_cast<uint32_t>(dst),
 		                      width,
@@ -294,6 +305,14 @@ bool TileManager::TilerStagingForced() {
 	return forced;
 }
 
+bool TileManager::DetileFillSkipped() {
+	static const bool skipped = [] {
+		const char* text = std::getenv("KYTY_NO_DETILE_FILL_SKIP");
+		return text == nullptr || std::strcmp(text, "0") == 0;
+	}();
+	return skipped;
+}
+
 TileManager::Result TileManager::StageTiled(uint64_t offset, uint64_t capacity) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -317,17 +336,14 @@ TileManager::Result TileManager::StageTiled(uint64_t offset, uint64_t capacity) 
 
 void TileManager::Record(bool device_local, vk::Buffer source, uint64_t source_offset,
                          uint64_t source_capacity, vk::Buffer target, uint64_t target_offset,
-                         uint64_t target_capacity, std::span<Dispatch> dispatches,
-                         bool clear_target) {
+                         uint64_t target_capacity, const Tiling& tiling, bool clear_target) {
 	const bool tile         = !clear_target;
 	const auto tiled_offset = tile ? target_offset : source_offset;
 	const auto tiled_bytes  = tile ? target_capacity : source_capacity;
 	const auto tiled_buffer = tile ? target : source;
 	if (device_local && !TilerStagingForced()) {
-		// Whole-dword stores read their neighbours from the destination, so no seeded copy is
-		// needed.
 		RecordPasses(source, source_offset, source_capacity, target, target_offset, target_capacity,
-		             dispatches, clear_target);
+		             tiling, clear_target && !DetileFillSkipped());
 		return;
 	}
 	const auto staged = StageTiled(tiled_offset, tiled_bytes);
@@ -346,7 +362,7 @@ void TileManager::Record(bool device_local, vk::Buffer source, uint64_t source_o
 	command.copyBuffer(tiled_buffer, staged.buffer, 1, &copy_in);
 	if (tile) {
 		RecordPasses(source, source_offset, source_capacity, staged.buffer, staged.offset,
-		             target_capacity, dispatches, false);
+		             target_capacity, tiling, false);
 		command = m_scheduler.Current().Handle();
 		const vk::BufferCopy copy_out {staged.offset, target_offset, target_capacity};
 		command.copyBuffer(staged.buffer, target, 1, &copy_out);
@@ -364,12 +380,12 @@ void TileManager::Record(bool device_local, vk::Buffer source, uint64_t source_o
 		return;
 	}
 	RecordPasses(staged.buffer, staged.offset, source_capacity, target, target_offset,
-	             target_capacity, dispatches, true);
+	             target_capacity, tiling, !DetileFillSkipped());
 }
 
 void TileManager::RecordPasses(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
                                vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
-                               std::span<Dispatch> dispatches, bool clear_target) {
+                               const Tiling& tiling, bool clear_target) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
@@ -424,26 +440,16 @@ void TileManager::RecordPasses(vk::Buffer source, uint64_t source_offset, uint64
 
 	const vk::DescriptorBufferInfo source_info {source, source_descriptor_offset, source_range};
 	const vk::DescriptorBufferInfo target_info {target, target_descriptor_offset, target_range};
-	for (auto& dispatch: dispatches) {
-		const vk::DescriptorBufferInfo        params_info {m_stream_buffer.Handle(),
-		                                                   dispatch.params_offset, sizeof(Push)};
-		const vk::DescriptorBufferInfo        infos[] {source_info, target_info, params_info};
-		std::array<vk::WriteDescriptorSet, 3> writes {};
-		for (uint32_t index = 0; index < writes.size(); index++) {
-			writes[index].dstBinding      = index;
-			writes[index].descriptorCount = 1;
-			writes[index].descriptorType  = index == 2 ? vk::DescriptorType::eUniformBuffer
-			                                           : vk::DescriptorType::eStorageBuffer;
-			writes[index].pBufferInfo     = &infos[index];
-		}
-		command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
-		                             static_cast<uint32_t>(writes.size()), writes.data());
-		command.bindPipeline(vk::PipelineBindPoint::eCompute, GetPipeline(dispatch.pipeline_slot));
-		const uint32_t element_bytes = 1u << (dispatch.pipeline_slot % BytesPerElementCount);
-		const uint32_t group         = element_bytes >= 4u ? 1u : 4u / element_bytes;
-		const uint32_t columns       = (dispatch.push.width + group - 1u) / group;
-		command.dispatch((columns + 7u) / 8u, (dispatch.push.height + 7u) / 8u,
-		                 dispatch.push.depth);
+	const vk::DescriptorBufferInfo params_info {m_stream_buffer.Handle(), tiling.params_offset,
+	                                            tiling.params_size};
+	const vk::DescriptorBufferInfo infos[] {source_info, target_info, params_info};
+	std::array<vk::WriteDescriptorSet, 3> writes {};
+	for (uint32_t index = 0; index < writes.size(); index++) {
+		writes[index].dstBinding      = index;
+		writes[index].descriptorCount = 1;
+		writes[index].descriptorType =
+		    index == 2 ? vk::DescriptorType::eUniformBuffer : vk::DescriptorType::eStorageBuffer;
+		writes[index].pBufferInfo = &infos[index];
 	}
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_pipeline_layout, 0,
 	                             static_cast<uint32_t>(writes.size()), writes.data());
@@ -463,41 +469,44 @@ void TileManager::RecordPasses(vk::Buffer source, uint64_t source_offset, uint64
 }
 
 TileManager::Result TileManager::Detile(vk::Buffer tiled, uint64_t tiled_offset,
-                                        uint64_t tiled_capacity, uint64_t linear_capacity,
-                                        std::span<const GpuTileInfo> infos,
-                                        ColorTransform transform, bool device_local) {
+                                        const ImageInfo& info, bool device_local) {
+	if (!info.IsTiled()) {
+		const Result source {tiled, tiled_offset, info.data.size};
+		return info.GetColorTransform() == ColorTransform::None
+		           ? source
+		           : TransformColor(source, info.GetColorTransform(), true);
+	}
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t        source_base = tiled_offset & (descriptor_alignment - 1);
-	std::vector<Dispatch> dispatches;
-	StreamHold            hold(m_stream_buffer);
-	Prepare(false, tiled_capacity, linear_capacity, infos, source_base, 0, dispatches, transform);
+	const uint64_t source_base     = tiled_offset & (descriptor_alignment - 1);
+	const auto     linear_capacity = info.LinearSize();
+	StreamHold     hold(m_stream_buffer);
+	const auto tiling  = Prepare(false, info.data.size, linear_capacity, info, 0, source_base, 0);
 	auto scratch = GetScratchBuffer(linear_capacity, tiled);
-	Record(device_local, tiled, tiled_offset, tiled_capacity, scratch.buffer, 0, scratch.size,
-	       dispatches, true);
+	Record(device_local, tiled, tiled_offset, info.data.size, scratch.buffer, 0, scratch.size,
+	       tiling, true);
 	return {scratch.buffer, 0, linear_capacity};
 }
 
 void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
                        vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                       std::span<const GpuTileInfo> infos, bool device_local) {
+                       const ImageInfo& info, uint32_t levels, bool device_local) {
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
 	    std::max<uint64_t>(limits.minStorageBufferOffsetAlignment, 4);
-	const uint64_t        source_base = linear_offset & (descriptor_alignment - 1);
-	const uint64_t        target_base = tiled_offset & (descriptor_alignment - 1);
-	std::vector<Dispatch> dispatches;
-	StreamHold            hold(m_stream_buffer);
-	Prepare(true, tiled_capacity, linear_capacity, infos, source_base, target_base, dispatches);
+	const uint64_t source_base = linear_offset & (descriptor_alignment - 1);
+	const uint64_t target_base = tiled_offset & (descriptor_alignment - 1);
+	StreamHold     hold(m_stream_buffer);
+	const auto     tiling =
+	    Prepare(true, tiled_capacity, linear_capacity, info, levels, source_base, target_base);
 	Record(device_local, linear, linear_offset, linear_capacity, tiled, tiled_offset,
-	       tiled_capacity, dispatches, false);
+	       tiled_capacity, tiling, false);
 }
 
 void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
                             vk::Buffer tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
-                            uint64_t linear_capacity, std::span<const GpuTileInfo> infos,
-                            ColorTransform transform, bool device_local) {
+                            uint32_t levels, bool device_local) {
 	EXIT_IF(regions.empty());
 	const auto&    limits = m_graphics.GetPhysicalDeviceProperties().limits;
 	const uint64_t descriptor_alignment =
@@ -506,11 +515,12 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	const auto     linear_capacity = image.info.LinearSize(levels);
 	// Reserve stream parameters before recording the image download.
 	StreamHold hold(m_stream_buffer);
-	Prepare(true, tiled_capacity, linear_capacity, infos, 0, target_base, dispatches, transform);
+	const auto tiling =
+	    Prepare(true, tiled_capacity, linear_capacity, image.info, levels, 0, target_base);
 	auto linear = GetScratchBuffer(linear_capacity, tiled);
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Record(device_local, linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity,
-	       dispatches, false);
+	       tiling, false);
 }
 
 void TileManager::ReleaseScratch() {
