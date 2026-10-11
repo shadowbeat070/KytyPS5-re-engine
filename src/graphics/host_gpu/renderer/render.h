@@ -319,6 +319,9 @@ private:
 	PreparedBindings                      m_compute_bindings;
 	DispatchAccess                        m_dispatch_access;
 	std::vector<ImageId>                  m_bound_images;
+	// Scratch for CommitBindings: the ranges this op writes, checked against captured reads.
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_image_ranges;
+	std::vector<std::pair<uint64_t, uint64_t>> m_written_buffer_ranges;
 	std::vector<vk::DescriptorBufferInfo> m_descriptor_buffers;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
