@@ -10,6 +10,8 @@
 #include "kernel/memory.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <mutex>
 #include <xxhash.h>
 
@@ -36,6 +38,15 @@ constexpr uint32_t PoolSets = 8;
 
 constexpr vk::PipelineStageFlags2 SampleStages =
     vk::PipelineStageFlagBits2::eAllGraphics | vk::PipelineStageFlagBits2::eComputeShader;
+
+// KYTY_NO_INCREMENTAL_BINDLESS=1: every heap change re-translates every record.
+bool IncrementalRescans() {
+	static const bool enabled = [] {
+		const char* text = std::getenv("KYTY_NO_INCREMENTAL_BINDLESS");
+		return text == nullptr || text[0] == '\0' || std::strcmp(text, "0") == 0;
+	}();
+	return enabled;
+}
 
 [[nodiscard]] std::optional<BindlessShape> ArrayOfWord(uint32_t word) {
 	const auto code = word >> 16u;
@@ -174,6 +185,7 @@ void BindlessImageHeap::EnableIntegers() {
 	});
 	for (auto& [key, heap]: m_heaps) {
 		heap.stale = true;
+		heap.full  = true;
 	}
 	m_set_dirty = true;
 }
@@ -288,13 +300,25 @@ void BindlessImageHeap::ForgetKilled() {
 		return entry.second != 0u && slot < IR::BindlessImageSlots && array.has_value() &&
 		       m_killed_mask[static_cast<uint32_t>(*array) * IR::BindlessImageSlots + slot];
 	});
+	for (auto& [key, heap]: m_heaps) {
+		heap.stale = true;
+		if (heap.full) {
+			continue;
+		}
+		for (uint32_t record = 0; record < heap.words.size(); record++) {
+			const auto word  = heap.words[record];
+			const auto slot  = word & 0xffffu;
+			const auto array = ArrayOfWord(word);
+			if (word != 0u && slot < IR::BindlessImageSlots && array.has_value() &&
+			    m_killed_mask[static_cast<uint32_t>(*array) * IR::BindlessImageSlots + slot]) {
+				heap.dirty.push_back(record);
+			}
+		}
+	}
 	for (const auto killed: m_killed) {
 		m_killed_mask[killed] = false;
 	}
 	m_killed.clear();
-	for (auto& [key, heap]: m_heaps) {
-		heap.stale = true;
-	}
 }
 
 void BindlessImageHeap::SweepDeadElements() {
@@ -459,6 +483,10 @@ std::optional<uint32_t> BindlessImageHeap::AdmitRecord(const Bindless::TSharp&  
 
 bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
                                const std::vector<uint32_t>& dwords) {
+	if (IncrementalRescans() && heap.scanned && !heap.full && heap.dwords.size() == dwords.size() &&
+	    heap.words.size() == heap.records) {
+		return RescanChanged(key, heap, dwords);
+	}
 	const auto missing =
 	    Bindless::MissingRecords(dwords, key.stride, key.offset, heap.records, m_cache, m_integer);
 	for (const auto& tsharp: missing) {
@@ -483,6 +511,87 @@ bool BindlessImageHeap::Rescan(const HeapKey& key, Heap& heap,
 	heap.scanned  = true;
 	heap.stale    = false;
 	m_arena_dirty = true;
+	NoteUnresolved(key, heap, dwords);
+	return true;
+}
+
+void BindlessImageHeap::NoteUnresolved(const HeapKey& key, Heap& heap,
+                                       const std::vector<uint32_t>& dwords) {
+	heap.dirty.clear();
+	heap.unresolved.clear();
+	if (!IncrementalRescans()) {
+		return;
+	}
+	heap.dwords = dwords;
+	heap.full   = false;
+	for (uint32_t record = 0; record < heap.records; record++) {
+		if (heap.words[record] != 0u) {
+			continue;
+		}
+		const auto tsharp = Bindless::RecordAt(dwords, key.stride, key.offset, record);
+		if (!m_cache.contains(tsharp) && Bindless::ClassifyRecord(tsharp, m_integer).has_value()) {
+			heap.unresolved.push_back(record);
+		}
+	}
+}
+
+bool BindlessImageHeap::RescanChanged(const HeapKey& key, Heap& heap,
+                                      const std::vector<uint32_t>& dwords) {
+	static thread_local std::vector<uint32_t> candidates;
+	candidates.clear();
+	const auto  record_bytes = sizeof(Bindless::TSharp);
+	const auto  heap_bytes   = dwords.size() * sizeof(uint32_t);
+	const auto* now          = reinterpret_cast<const uint8_t*>(dwords.data());
+	const auto* before       = reinterpret_cast<const uint8_t*>(heap.dwords.data());
+	for (uint32_t record = 0; record < heap.records; record++) {
+		const auto first = static_cast<size_t>(record) * key.stride + key.offset;
+		if (first >= heap_bytes) {
+			break;
+		}
+		const auto bytes = std::min<size_t>(record_bytes, heap_bytes - first);
+		if (std::memcmp(now + first, before + first, bytes) != 0) {
+			candidates.push_back(record);
+		}
+	}
+	candidates.insert(candidates.end(), heap.dirty.begin(), heap.dirty.end());
+	candidates.insert(candidates.end(), heap.unresolved.begin(), heap.unresolved.end());
+	std::sort(candidates.begin(), candidates.end());
+	candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+	for (const auto record: candidates) {
+		const auto tsharp = Bindless::RecordAt(dwords, key.stride, key.offset, record);
+		if (m_cache.contains(tsharp)) {
+			continue;
+		}
+		const auto shape = Bindless::ClassifyRecord(tsharp, m_integer);
+		if (!shape.has_value()) {
+			continue;
+		}
+		const auto binding = ResolveRecord(tsharp, *shape);
+		if (binding.desc.info.data.Empty()) {
+			m_cache[tsharp] = 0u;
+			continue;
+		}
+		bool exhausted = false;
+		if (!AdmitRecord(tsharp, *shape, binding, exhausted).has_value() && exhausted) {
+			return false;
+		}
+	}
+	heap.unresolved.clear();
+	bool changed = false;
+	for (const auto record: candidates) {
+		const auto tsharp = Bindless::RecordAt(dwords, key.stride, key.offset, record);
+		const auto found  = m_cache.find(tsharp);
+		const auto word   = found != m_cache.end() ? found->second : 0u;
+		if (found == m_cache.end() && Bindless::ClassifyRecord(tsharp, m_integer).has_value()) {
+			heap.unresolved.push_back(record);
+		}
+		changed            = changed || heap.words[record] != word;
+		heap.words[record] = word;
+	}
+	heap.dwords = dwords;
+	heap.dirty.clear();
+	heap.stale    = false;
+	m_arena_dirty = m_arena_dirty || changed;
 	return true;
 }
 
@@ -500,6 +609,7 @@ void BindlessImageHeap::ResetElements() {
 	}
 	for (auto& [key, heap]: m_heaps) {
 		heap.stale = true;
+		heap.full  = true;
 	}
 	m_set_dirty = true;
 }
