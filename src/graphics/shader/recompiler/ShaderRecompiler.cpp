@@ -1176,8 +1176,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	     GetDumpLabel(options), StageName(options.stage), options.shader_hash,
 	     static_cast<uint64_t>(code.size()));
 
-	Decoder::Program      decoded;
-	std::vector<uint32_t> joined_code;
+	const Decoder::DecodeContextScope decode_context(options.shader_hash, code.data());
+	Decoder::Program                  decoded;
+	std::vector<uint32_t>             joined_code;
 	if (!options.back_code.empty()) {
 		decoded = DecodeFusedProgram(code, options.back_code, joined_code);
 	} else if (options.stage == ShaderType::Local) {
