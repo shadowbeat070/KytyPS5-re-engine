@@ -14482,9 +14482,10 @@ public:
   }
 
   // A narrow read at the address of a wider surface with the same pitch gets its own image
-  // holding the shared corner, not the wider image.
-  void CheckLayoutAliasNarrowWidth() {
-    constexpr const char *name = "LayoutAliasNarrowWidth";
+  // holding the shared corner; `buffer_written_first` lands a buffer write before the render.
+  void CheckLayoutAliasNarrowWidth(bool buffer_written_first = false) {
+    const char *name =
+        buffer_written_first ? "LayoutAliasNarrowAfterBuffer" : "LayoutAliasNarrowWidth";
     constexpr uintptr_t base = 0x0000000205000000ull;
     constexpr uint64_t allocation_size = 0x100000;
     constexpr auto tile = Prospero::TileMode::kStandard64KB;
@@ -14584,6 +14585,11 @@ public:
         }
       };
 
+      if (buffer_written_first) {
+        context.InitializeGpu(nullptr);
+        (void)context.GetBufferCache().ObtainBuffer(base, wide.info.data.size, true);
+        cache.InvalidateMemoryFromGPU(base, wide.info.data.size);
+      }
       const auto wide_id = cache.FindImage(wide);
       (void)cache.FindTexture(wide_id, wide);
       fill(wide_id, wide_bits);
@@ -14607,6 +14613,9 @@ public:
 
       context.UnmapMemory(base, allocation_size);
       scheduler.Finish();
+      if (buffer_written_first) {
+        context.ShutdownGpu();
+      }
     }
     Require(name, "release",
             Libs::LibKernel::Memory::KernelMunmap(base, allocation_size) == 0 &&
@@ -51390,6 +51399,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layout-alias-narrow-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLayoutAliasNarrowWidth();
+    vulkan.CheckLayoutAliasNarrowWidth(true);
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--raw-image-read-only") == 0) {

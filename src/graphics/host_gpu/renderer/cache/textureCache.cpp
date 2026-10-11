@@ -2204,7 +2204,8 @@ ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
 			auto& inserted = m_slot_images[result];
 			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
 			                                    inserted.info.data.size)) {
-				inserted.MarkBufferModified();
+				inserted.MarkBufferModified(
+				    BufferWriteEpochOf(inserted.info.data.address, inserted.info.data.size));
 			}
 		}
 		SyncLayoutAlias(result, candidates);
@@ -3099,11 +3100,30 @@ bool TextureCache::DownloadImageBatch(Image& image, ImageDownload& transfer,
 	return true;
 }
 
+uint64_t TextureCache::BufferWriteEpochOf(uint64_t address, uint64_t size) const {
+	constexpr uint64_t PageBits = 16;
+	uint64_t           epoch    = 0;
+	for (auto page = address >> PageBits; page <= (address + size - 1) >> PageBits; page++) {
+		if (const auto found = m_buffer_write_epochs.find(page);
+		    found != m_buffer_write_epochs.end()) {
+			epoch = std::max(epoch, found->second);
+		}
+	}
+	return epoch != 0 ? epoch : NextImageWriteEpoch();
+}
+
 void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
 	if (!GuestRange {address, size}.Valid()) {
 		return;
 	}
 	std::scoped_lock lock {m_lock};
+	{
+		constexpr uint64_t PageBits = 16;
+		const auto         epoch    = NextImageWriteEpoch();
+		for (auto page = address >> PageBits; page <= (address + size - 1) >> PageBits; page++) {
+			m_buffer_write_epochs[page] = epoch;
+		}
+	}
 	for (const auto id: FindImagesInRegion(address, size, true)) {
 		auto& image = m_slot_images[id];
 		if (!image.Overlaps(address, size)) {
@@ -3304,6 +3324,9 @@ bool TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
 		EXIT("TextureCache: invalid unmap range\n");
 	}
 	std::scoped_lock lock {m_lock};
+	for (auto page = address >> 16; page <= (address + size - 1) >> 16; page++) {
+		m_buffer_write_epochs.erase(page);
+	}
 	for (auto metadata = m_surface_metas.begin(); metadata != m_surface_metas.end();) {
 		const auto base = metadata->first;
 		if (base >= address && base < address + size) {
