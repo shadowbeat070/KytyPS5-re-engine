@@ -111,15 +111,6 @@ void StoreDispatcherPhiCopies(ValueEmitContext& ctx, const DispatcherPhiCopies& 
 	}
 }
 
-const IR::Block* TargetBlock(const IR::Program& program, uint32_t id) {
-	const auto found = std::ranges::find_if(
-	    program.block_info, [&](const IR::BlockInfo& info) { return info.id == id; });
-	if (found == program.block_info.end()) {
-		return nullptr;
-	}
-	return program.blocks[static_cast<size_t>(found - program.block_info.begin())];
-}
-
 // KYTY_CS_LOOP_BUDGET: the per-invocation ceiling on loop-header executions, summed over every
 // loop in the module. 0, the default, disables the guard and the emitted module is byte-identical
 // to an unguarded build. The largest provable per-invocation total over a 186-binary corpus is
@@ -236,7 +227,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 				EmitReturn(ctx);
 				return;
 			}
-			auto       condition = ctx.Def(info.condition);
+			auto       condition = ctx.Def(block->condition);
 			const auto latch     = ctx.state.loop_budget_latch.find(block);
 			const auto allowed =
 			    latch != ctx.state.loop_budget_latch.end()
@@ -244,7 +235,7 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 			        : 0u;
 			if (allowed != 0) {
 				const auto folded = ctx.state.builder.AllocateId();
-				if (term.true_block == latch->second) {
+				if (term.true_block->id == latch->second) {
 					// Back edge on the true arm: stay in the loop only while under budget.
 					ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), folded,
 					                              condition, allowed);
@@ -267,9 +258,8 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block) {
 }
 
 void CollectDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                             const IR::Block* from, uint32_t target,
+                             const IR::Block* from, const IR::Block* block,
                              DispatcherPhiCopies& copies) {
-	const auto* block = TargetBlock(ctx.state.program, target);
 	if (block != nullptr) {
 		CollectDispatcherPhiEdge(ctx, dispatcher, from, block, copies);
 		if (ctx.other_half != nullptr) {
@@ -283,8 +273,8 @@ void CollectDispatcherTarget(ValueEmitContext& ctx, const DispatcherFunctionStat
 // indirect selector are themselves values this block may have to load out of a spill slot, and a
 // slot a target's phi is about to be given is not the value the terminator was reached with.
 uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
-                              const IR::Block* block, const IR::BlockInfo& info) {
-	const auto&         term = info.terminator;
+                              const IR::Block* block) {
+	const auto&         term = block->terminator;
 	DispatcherPhiCopies copies;
 	const auto          finish = [&](uint32_t selected) {
 		StoreDispatcherPhiCopies(ctx, copies);
@@ -293,18 +283,19 @@ uint32_t EmitDispatcherNextPc(ValueEmitContext& ctx, const DispatcherFunctionSta
 	switch (term.kind) {
 		case CFG::TerminatorKind::Branch:
 			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
-			return finish(ConstantU32(ctx.state, term.true_block));
+			return finish(ConstantU32(ctx.state, term.true_block->id));
 		case CFG::TerminatorKind::ConditionalBranch: {
 			CollectDispatcherTarget(ctx, dispatcher, block, term.true_block, copies);
 			CollectDispatcherTarget(ctx, dispatcher, block, term.false_block, copies);
 			const auto selected = ctx.state.builder.AllocateId();
-			ctx.state.builder.AddFunction(
-			    spv::OpSelect, TypeU32(ctx.state), selected, ctx.Def(info.condition),
-			    ConstantU32(ctx.state, term.true_block), ConstantU32(ctx.state, term.false_block));
+			ctx.state.builder.AddFunction(spv::OpSelect, TypeU32(ctx.state), selected,
+			                              ctx.Def(block->condition),
+			                              ConstantU32(ctx.state, term.true_block->id),
+			                              ConstantU32(ctx.state, term.false_block->id));
 			return finish(selected);
 		}
 		case CFG::TerminatorKind::IndirectBranch: {
-			for (const auto target: term.indirect_targets) {
+			for (const auto* target: block->ImmSuccessors()) {
 				CollectDispatcherTarget(ctx, dispatcher, block, target, copies);
 			}
 			uint32_t selected = ConstantU32(ctx.state, UINT32_MAX);
@@ -471,15 +462,16 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 // threads queue whose idle workgroups spin until the last worker signs off. A worker that leaves
 // after a BDA miss never signs off, so its loop must not take the BDA exit. The body runs from the
 // header up to the merge block in structured order; without a merge after the header, assume one.
+size_t LoopEnd(const IR::Program& program, size_t header_index) {
+	const auto* merge_block = program.blocks[header_index]->terminator.merge_block;
+	const auto  merge       = std::ranges::find(program.blocks, merge_block);
+	const auto  end         = static_cast<size_t>(merge - program.blocks.begin());
+	return merge_block != nullptr && merge != program.blocks.end() && end > header_index ? end : 0;
+}
+
 bool LoopHasAtomics(const IR::Program& program, size_t header_index) {
-	const auto merge_id = program.block_info[header_index].terminator.merge_block;
-	const auto merge    = std::ranges::find_if(
-	    program.block_info, [&](const IR::BlockInfo& other) { return other.id == merge_id; });
-	if (merge == program.block_info.end()) {
-		return true;
-	}
-	const auto end = static_cast<size_t>(merge - program.block_info.begin());
-	if (end <= header_index) {
+	const auto end = LoopEnd(program, header_index);
+	if (end == 0) {
 		return true;
 	}
 	for (size_t index = header_index; index < end && index < program.blocks.size(); index++) {
@@ -492,6 +484,21 @@ bool LoopHasAtomics(const IR::Program& program, size_t header_index) {
 			    shared == IR::SharedAccess::Consume) {
 				return true;
 			}
+		}
+	}
+	return false;
+}
+
+// The exit returns from the whole invocation, so it also skips every loop around this one.
+bool LoopNestHasAtomics(const IR::Program& program, size_t header_index) {
+	for (size_t index = 0; index <= header_index; index++) {
+		if (!program.blocks[index]->terminator.loop_header) {
+			continue;
+		}
+		const auto end      = LoopEnd(program, index);
+		const bool encloses = index == header_index || (end != 0 && header_index < end);
+		if (encloses && LoopHasAtomics(program, index)) {
+			return true;
 		}
 	}
 	return false;
@@ -512,34 +519,30 @@ std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	// A continue target must be structurally post-dominated by its back-edge block, so splitting
 	// one puts an OpReturn inside the continue construct that never reaches the back edge.
-	std::unordered_set<uint32_t> continue_targets;
-	for (const auto& info: program.block_info) {
-		if (info.terminator.loop_header) {
-			continue_targets.insert(info.terminator.continue_block);
+	std::unordered_set<const IR::Block*> continue_targets;
+	for (const auto* block: program.blocks) {
+		if (block->terminator.loop_header) {
+			continue_targets.insert(block->terminator.continue_block);
 		}
 	}
-	for (size_t index = 0; index < program.block_info.size(); index++) {
-		const auto& info = program.block_info[index];
-		if (!info.terminator.loop_header) {
+	for (size_t index = 0; index < program.blocks.size(); index++) {
+		const auto* header = program.blocks[index];
+		const auto& term   = header->terminator;
+		if (!term.loop_header) {
 			continue;
 		}
-		if (continue_targets.contains(info.terminator.true_block)) {
+		if (term.true_block != nullptr && continue_targets.contains(term.true_block)) {
 			// A tight loop whose body IS the latch cannot be split, but its latch already branches
 			// to exactly (header, merge), so the budget folds into that test.
-			const auto* latch = TargetBlock(program, info.terminator.true_block);
-			const auto  found = std::ranges::find_if(
-			    program.block_info,
-			    [&](const IR::BlockInfo& other) { return other.id == info.terminator.true_block; });
-			const bool foldable =
-			    latch != nullptr && found != program.block_info.end() &&
-			    found->terminator.kind == CFG::TerminatorKind::ConditionalBranch &&
-			    ((found->terminator.true_block == info.id &&
-			      found->terminator.false_block == info.terminator.merge_block) ||
-			     (found->terminator.false_block == info.id &&
-			      found->terminator.true_block == info.terminator.merge_block));
-			if (foldable && ctx.state.loop_budget_latch.emplace(latch, info.id).second) {
+			const auto* latch      = term.true_block;
+			const auto& latch_term = latch->terminator;
+			const bool  foldable =
+			    latch_term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			    ((latch_term.true_block == header && latch_term.false_block == term.merge_block) ||
+			     (latch_term.false_block == header && latch_term.true_block == term.merge_block));
+			if (foldable && ctx.state.loop_budget_latch.emplace(latch, header->id).second) {
 				ctx.state.loop_budget_guarded++;
-				if (LoopHasAtomics(program, index)) {
+				if (LoopNestHasAtomics(program, index)) {
 					ctx.state.loop_bda_exit_exempt.insert(latch);
 				}
 			} else if (!foldable) {
@@ -547,22 +550,18 @@ std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 			}
 			continue;
 		}
-		const auto* body = info.terminator.kind == CFG::TerminatorKind::Branch
-		                       ? TargetBlock(program, info.terminator.true_block)
-		                       : nullptr;
-		if (body == nullptr || body == program.blocks[index]) {
+		const auto* body = term.kind == CFG::TerminatorKind::Branch ? term.true_block : nullptr;
+		if (body == nullptr || body == header) {
 			ctx.state.loop_budget_unguardable++;
 			continue;
 		}
-		const auto found = std::ranges::find_if(
-		    program.block_info, [&](const IR::BlockInfo& other) { return other.id == info.terminator.true_block; });
-		if (found != program.block_info.end() && found->terminator.loop_header) {
+		if (body->terminator.loop_header) {
 			ctx.state.loop_budget_unguardable++;
 			continue;
 		}
 		if (sites.insert(body).second) {
 			ctx.state.loop_budget_guarded++;
-			if (LoopHasAtomics(program, index)) {
+			if (LoopNestHasAtomics(program, index)) {
 				ctx.state.loop_bda_exit_exempt.insert(body);
 			}
 		}
@@ -589,7 +588,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
 	const auto charge_sites = LoopChargeSites(ctx);
-	ctx.state.builder.AddFunction(spv::OpBranch, ctx.Label(program.blocks.front()));
+	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
@@ -617,8 +616,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	if (state.Refused()) {
 		return;
 	}
-	const auto initial_pc =
-	    EmitDispatcherNextPc(ctx, dispatcher, entry, state.program.block_info.front());
+	const auto initial_pc     = EmitDispatcherNextPc(ctx, dispatcher, entry);
 	const auto initial_parent = state.current_label;
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 
@@ -655,8 +653,7 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 		if (state.Refused()) {
 			return;
 		}
-		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index],
-		                                           state.program.block_info[index]);
+		const auto selected = EmitDispatcherNextPc(ctx, dispatcher, state.program.blocks[index]);
 		next_pc_words.push_back(selected);
 		next_pc_words.push_back(state.current_label);
 		state.builder.AddFunction(spv::OpBranch, dispatcher.after_switch_label);
@@ -910,7 +907,7 @@ void EmitProgram(EmitterState& state) {
 	state.loop_budget_limit =
 	    state.program.stage == ShaderType::Compute ? LoopBudgetLimit() : 0u;
 	const bool has_loops = std::ranges::any_of(
-	    program.block_info, [](const IR::BlockInfo& info) { return info.terminator.loop_header; });
+	    program.blocks, [](const IR::Block* block) { return block->terminator.loop_header; });
 	if (state.loop_budget_limit != 0 && has_loops) {
 		state.loop_budget_variable = state.builder.AllocateId();
 		state.builder.AddName(state.loop_budget_variable, "loop_budget");
