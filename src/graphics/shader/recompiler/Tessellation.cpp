@@ -21,6 +21,7 @@ struct TessellationAddress {
 	Kind     kind        = Kind::Unknown;
 	uint32_t coefficient = 0;
 	uint32_t constant    = 0;
+	bool     operator==(const TessellationAddress&) const = default;
 };
 
 uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
@@ -81,12 +82,38 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		           ? value
 		           : Address {};
 	};
-	uint32_t stride = 0;
+	using Registers = decltype(registers);
+	const auto join = [](Registers& into, const Registers& from) {
+		for (size_t index = 0; index < into.size(); index++) {
+			if (into[index] != from[index]) into[index] = {};
+		}
+	};
+	// Forward branch targets with the join of every incoming branch's registers.
+	std::unordered_map<uint32_t, Registers> joins;
+	bool                                    reachable = true;
+	uint32_t                                stride    = 0;
 	for (const auto& inst: program.instructions) {
-		// Stage exits preserve the active path's definitions. An internal join
-		// would require merging register definitions.
-		EXIT_NOT_IMPLEMENTED(IsDirectBranch(inst.opcode) &&
-		                     inst.branch_target != program.instructions.back().pc);
+		if (const auto found = joins.find(inst.pc); found != joins.end()) {
+			if (reachable) join(found->second, registers);
+			registers = found->second;
+			reachable = true;
+			joins.erase(found);
+		}
+		if (!reachable) continue;
+		if (IsDirectBranch(inst.opcode)) {
+			if (inst.branch_target <= inst.pc) {
+				EXIT("%s tessellation stride reflection does not support the loop at pc 0x%08x\n",
+				     local ? "LS" : "HS", inst.pc);
+			}
+			// The walk ignores EXEC; a skipped block with no active lanes defines nothing.
+			if (inst.opcode == Opcode::S_CBRANCH_EXECZ) continue;
+			if (const auto [target, inserted] = joins.try_emplace(inst.branch_target, registers);
+			    !inserted) {
+				join(target->second, registers);
+			}
+			reachable = inst.opcode != Opcode::S_BRANCH;
+			continue;
+		}
 		const bool local_store =
 		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
 		    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE2_B64 ||
