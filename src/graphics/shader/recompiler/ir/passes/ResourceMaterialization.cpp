@@ -225,8 +225,8 @@ const DescriptorSource* Source(const ResourcePlan& program, uint32_t source) {
 	return &program.descriptor_sources[source];
 }
 
-void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
-                    const DescriptorSource* source, Value extra = {}) {
+void MarkCleanFlatSlots(const ResourcePlan& program, const DescriptorSource* source,
+                        std::span<uint8_t> slots, Value extra = {}) {
 	if (source == nullptr && extra.IsEmpty()) {
 		return;
 	}
@@ -237,7 +237,7 @@ void MarkCleanReads(const std::unordered_set<const Inst*>& planned_reads,
 	if (!extra.IsEmpty()) pending.push_back(extra);
 	std::unordered_set<const Inst*> visited;
 	while (!pending.empty()) {
-		auto* inst = pending.back().Resolve().TryInstruction();
+		auto value = pending.back().Resolve();
 		pending.pop_back();
 		const auto* inst = value.TryInstruction();
 		if (inst == nullptr || !visited.insert(inst).second) {
@@ -738,34 +738,38 @@ bool EnumerateIndirectImage(const ResourcePlan&                         program,
 		ShaderBufferResource material;
 		uint32_t             first = 0;
 		uint32_t             count = 0;
+		// A scalar read steps by its instruction's byte stride when the shader names one; the V#
+		// stride then only bounds the range.
+		const bool scalar_stride = indirect.selector_stride != 0u;
 		if (!DecodeBufferDescriptor(material_value, material) || material.Type() != 0u ||
 		    ((indirect.selector_shift != 0u || indirect.key_mask != UINT32_MAX) &&
 		     (material.Base48() & 3u) != 0u) ||
 		    material.SwizzleEnabled() || material.AddTid() || material.OutOfBounds() != 0u ||
-		    uint64_t {indirect.selector_offset} + 4u > material.Stride() ||
+		    (!scalar_stride && uint64_t {indirect.selector_offset} + 4u > material.Stride()) ||
 		    !clean.Evaluate(indirect.selector_first, first) ||
 		    !clean.Evaluate(indirect.key_count, count) ||
-		    uint64_t {first} + count > material.NumRecords()) {
+		    (!scalar_stride && uint64_t {first} + count > material.NumRecords())) {
 			return Refuse(IndirectImageFailure::Stage::MaterialDescriptorUndecodable);
 		}
+		const uint64_t step = scalar_stride ? indirect.selector_stride : material.Stride();
+		const uint64_t end =
+		    count != 0u ? (uint64_t {first} + count - 1u) * step + indirect.selector_offset + 4u
+		                : 0u;
 		failure.probe_count  = count;
 		failure.probe_budget = MaxIndirectImageProbes;
-		if (count > MaxIndirectImageProbes ||
-		    (count != 0u &&
-		     (uint64_t {first} + count - 1u) * material.Stride() + indirect.selector_offset + 4u >
-		         uint64_t {UINT32_MAX} + 1u)) {
+		if (count > MaxIndirectImageProbes || end > uint64_t {UINT32_MAX} + 1u ||
+		    (scalar_stride && end > material.GetSize())) {
 			return Refuse(IndirectImageFailure::Stage::ProbeCountOverBudget);
 		}
 		keys.resize(count);
-		if (material.Stride() == 4u && indirect.selector_offset == 0u) {
+		if (step == 4u && indirect.selector_offset == 0u) {
 			if (!ReadScalarTable(material.Base48(), material.GetSize(), uint64_t {first} * 4u,
 			                     runtime, keys)) {
 				return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
 			}
 		} else {
 			for (uint32_t index = 0; index < count; ++index) {
-				const auto offset =
-				    (uint64_t {first} + index) * material.Stride() + indirect.selector_offset;
+				const auto offset = (uint64_t {first} + index) * step + indirect.selector_offset;
 				if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime,
 				                     {&keys[index], 1})) {
 					failure.offset = offset;
@@ -1004,7 +1008,7 @@ bool EnumerateIndirectImage(const ResourcePlan&                         program,
 	return true;
 }
 
-// Slot words place each ordinal exactly as AllocateBindings does.
+// Slot words place each ordinal exactly where the emitter assigns its descriptor_index.
 bool WriteIndirectImageSlots(const ResourcePlan& program, ResourceSnapshot& snapshot,
                              const ResourceSpecialization& specialization) {
 	const auto& images = specialization.images;
@@ -2033,6 +2037,10 @@ bool BuildSamplerPlan(const ShaderInfo& base, SamplerPlan& plan) {
 		}
 		usage[pair.sampler] |=
 		    1u << static_cast<uint32_t>(ClassifySampler(base.images[pair.image]));
+		for (const auto candidate: base.samplers[pair.sampler].indirect_resources) {
+			if (candidate >= base.samplers.size()) return false;
+			usage[candidate] |= usage[pair.sampler];
+		}
 	}
 	for (uint32_t index = 0; index < base.samplers.size(); index++) {
 		auto& mapping = plan.mapping[index];
@@ -2066,15 +2074,15 @@ static std::vector<ResourceBlock> ResourceControlFlow(const Program&   program,
 	}
 	std::vector<ResourceBlock> blocks(program.blocks.size());
 	for (uint32_t i = 0; i < blocks.size(); i++) {
-		auto&                 block      = blocks[i];
+		auto&                   block      = blocks[i];
 		const auto&             info       = *program.blocks[i];
-		const auto&           terminator = info.terminator;
+		const auto&             terminator = info.terminator;
 		const std::array        targets {terminator.true_block, terminator.false_block};
 		std::span<Block* const> successors;
 		switch (terminator.kind) {
 			case CFG::TerminatorKind::Branch: successors = std::span(targets).first(1); break;
 			case CFG::TerminatorKind::ConditionalBranch:
-				successors      = {terminator.true_block, terminator.false_block};
+				successors      = targets;
 				block.condition = info.condition;
 				break;
 			case CFG::TerminatorKind::IndirectBranch: successors = info.ImmSuccessors(); break;
@@ -2303,18 +2311,17 @@ static UniformFillPlan AnalyzeUniformFill(const Program& program) {
 }
 
 static BufferCopy AnalyzeBufferCopy(const Program& program) {
-	if (program.stage != ShaderType::Compute || program.blocks.empty() ||
-	    program.blocks.size() != program.block_info.size() || program.info.uses_dma ||
+	if (program.stage != ShaderType::Compute || program.blocks.empty() || program.info.uses_dma ||
 	    !program.info.samplers.empty() || !program.info.images.empty() ||
 	    program.info.buffers.size() != 2) {
 		return {};
 	}
-	std::unordered_set<uint32_t> visited;
-	std::vector<const Inst*>     stores;
-	uint32_t                     index = 0;
+	std::unordered_set<const Block*> visited;
+	std::vector<const Inst*>         stores;
+	const auto*                      block = program.blocks.front();
 	for (;;) {
-		if (!visited.insert(index).second) return {};
-		for (const auto& inst: *program.blocks[index]) {
+		if (block == nullptr || !visited.insert(block).second) return {};
+		for (const auto& inst: *block) {
 			if (AddressOpcodeInfoOf(inst.GetOpcode()).access != AddressAccess::None) return {};
 			if (!inst.MayHaveSideEffects()) continue;
 			if (BufferAccessOf(inst.GetOpcode()) != BufferAccess::Write ||
@@ -2322,12 +2329,10 @@ static BufferCopy AnalyzeBufferCopy(const Program& program) {
 				return {};
 			stores.push_back(&inst);
 		}
-		const auto& term = program.block_info[index].terminator;
+		const auto& term = block->terminator;
 		if (term.kind == CFG::TerminatorKind::Return) break;
 		if (term.kind != CFG::TerminatorKind::Branch) return {};
-		const auto next = std::ranges::find(program.block_info, term.true_block, &BlockInfo::id);
-		if (next == program.block_info.end()) return {};
-		index = static_cast<uint32_t>(next - program.block_info.begin());
+		block = term.true_block;
 	}
 	if (stores.empty() || visited.size() != program.blocks.size()) return {};
 
@@ -2412,25 +2417,26 @@ static BufferCopy AnalyzeBufferCopy(const Program& program) {
 
 static std::vector<SrtReadWriteOrder> OrderSrtReadsAgainstWrites(const Program& program) {
 	const auto count = program.blocks.size();
-	if (count == 0u || count != program.block_info.size()) {
+	if (count == 0u) {
 		return {};
 	}
-	std::unordered_map<uint32_t, uint32_t> indices;
+	std::unordered_map<const Block*, uint32_t> indices;
 	for (uint32_t i = 0; i < count; i++) {
-		if (!indices.emplace(program.block_info[i].id, i).second) {
+		if (!indices.emplace(program.blocks[i], i).second) {
 			return {};
 		}
 	}
 	std::vector<std::vector<uint32_t>> successors(count);
 	for (uint32_t i = 0; i < count; i++) {
-		const auto&           terminator = program.block_info[i].terminator;
-		std::vector<uint32_t> targets;
+		const auto&             terminator = program.blocks[i]->terminator;
+		const std::array        branches {terminator.true_block, terminator.false_block};
+		std::span<Block* const> targets;
 		switch (terminator.kind) {
-			case CFG::TerminatorKind::Branch: targets.push_back(terminator.true_block); break;
-			case CFG::TerminatorKind::ConditionalBranch:
-				targets = {terminator.true_block, terminator.false_block};
+			case CFG::TerminatorKind::Branch: targets = std::span(branches).first(1); break;
+			case CFG::TerminatorKind::ConditionalBranch: targets = branches; break;
+			case CFG::TerminatorKind::IndirectBranch:
+				targets = program.blocks[i]->ImmSuccessors();
 				break;
-			case CFG::TerminatorKind::IndirectBranch: targets = terminator.indirect_targets; break;
 			case CFG::TerminatorKind::Return: break;
 			default: return {};
 		}
@@ -2523,8 +2529,56 @@ static std::vector<SrtReadWriteOrder> OrderSrtReadsAgainstWrites(const Program& 
 	return order;
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program) {
-	ResourcePlan plan;
+namespace {
+
+// Copies a value graph out of a translated program into a plan that owns it. Shared by the plan
+// extraction and the table check, so the check evaluates exactly what the materialization will.
+class PlanValueCloner {
+public:
+	PlanValueCloner(const Program& program, ResourcePlan& plan): m_program(program), m_plan(plan) {}
+
+	Value operator()(Value value) {
+		value              = value.Resolve();
+		const auto* source = value.TryInstruction();
+		if (source == nullptr) {
+			return value;
+		}
+		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
+		    ValidateRuntimeValue(m_program, source->Arg(0))) {
+			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
+			return (*this)(source->Arg(0));
+		}
+		if (source->GetOpcode() == ValueOpcode::Phi) {
+			const auto invariant = ResolveInvariantPhi(m_program, value);
+			if (!invariant.IsEmpty() && invariant != value) {
+				return (*this)(invariant);
+			}
+		}
+		if (const auto found = m_cloned.find(source); found != m_cloned.end()) {
+			return Value(found->second);
+		}
+		auto& target =
+		    m_plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+		m_cloned.emplace(source, &target);
+		if (source->GetOpcode() == ValueOpcode::Phi) {
+			for (size_t index = 0; index < source->NumArgs(); index++) {
+				target.AddPhiOperand(nullptr, (*this)(source->Arg(index)));
+			}
+		} else {
+			for (size_t index = 0; index < source->NumArgs(); index++) {
+				target.SetArg(index, (*this)(source->Arg(index)));
+			}
+		}
+		return Value(&target);
+	}
+
+private:
+	const Program&                         m_program;
+	ResourcePlan&                          m_plan;
+	std::unordered_map<const Inst*, Inst*> m_cloned;
+};
+
+void CopyPlanHeader(const Program& program, ResourcePlan& plan) {
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
 	plan.user_data_base             = program.user_data_base;
@@ -2536,55 +2590,48 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 	plan.frozen_values              = true;
+}
 
-	std::unordered_map<const Inst*, Inst*> cloned;
-	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
-		value              = value.Resolve();
-		const auto* source = value.TryInstruction();
-		if (source == nullptr) {
-			return value;
-		}
-		if (source->GetOpcode() == ValueOpcode::ReadConst) {
-			const auto slot = source->Arg(1).Resolve();
-			EXIT_IF(!slot.IsImmediate() || slot.GetType() != Type::U32 ||
-			        slot.U32() >= program.srt_reads.size());
-			return Clone(program.srt_reads[slot.U32()].value);
-		}
-		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
-		    ValidateRuntimeValue(program, source->Arg(0))) {
-			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
-			return Clone(source->Arg(0));
-		}
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			const auto invariant = ResolveInvariantPhi(program, value);
-			if (!invariant.IsEmpty() && invariant != value) {
-				return Clone(invariant);
-			}
-		}
-		if (const auto found = cloned.find(source); found != cloned.end()) {
-			return Value(found->second);
-		}
-		auto& target =
-		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
-		if (source->GetOpcode() == ValueOpcode::LoadAddressU32 ||
-		    source->GetOpcode() == ValueOpcode::ReadConstBuffer ||
-		    source->GetOpcode() == ValueOpcode::LoadBufferU32) {
-			target.SetFlags(SrtReadFlags {.index = source->Flags<MemoryFlags>().index});
-		}
-		cloned.emplace(source, &target);
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
-			}
-		} else {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.SetArg(index, Clone(source->Arg(index)));
-			}
-		}
-		return Value(&target);
-	};
+} // namespace
 
-	bool capture_indirect_reads = false;
+bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
+                                uint32_t table_source, const SrtRuntime& runtime) {
+	KYTY_PROFILER_FUNCTION();
+	if (table_source >= sources.size() || !sources[table_source].indirect_buffer.has_value() ||
+	    runtime.read_specialization_memory == nullptr) {
+		return false;
+	}
+	const auto& indirect = *sources[table_source].indirect_buffer;
+	if (indirect.heap_source >= sources.size()) {
+		return false;
+	}
+	const auto&  heap = sources[indirect.heap_source];
+	ResourcePlan plan;
+	CopyPlanHeader(program, plan);
+	PlanValueCloner clone(program, plan);
+	auto&           target = plan.descriptor_sources.emplace_back();
+	target.dword_count     = heap.dword_count;
+	for (uint32_t dword = 0; dword < heap.dword_count; dword++) {
+		target.dwords[dword] = clone(heap.dwords[dword]);
+	}
+	DescriptorValue heap_value;
+	SrtWalker       clean(plan, CleanRuntime(runtime));
+	if (!clean.EvaluateDescriptor(0, heap_value)) {
+		return false;
+	}
+	std::shared_ptr<const IndirectBuffer> result;
+	bool                                  refused = false;
+	MaterializeIndirectBuffer(indirect, heap_value, runtime, program.shader_hash, result, refused);
+	return refused;
+}
+
+ResourcePlan ExtractResourcePlan(const Program& program) {
+	ResourcePlan plan;
+	CopyPlanHeader(program, plan);
+
+	PlanValueCloner cloner(program, plan);
+	const auto      Clone = [&](Value value) { return cloner(value); };
+
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
 	for (const auto& source: program.descriptor_sources) {
 		auto& target               = plan.descriptor_sources.emplace_back();
@@ -2594,8 +2641,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		// plan binds the heap V# in place of the record the table selects.
 		target.indirect_buffer = source.indirect_buffer;
 		if (target.indirect_descriptor.has_value()) {
-			plan.requires_specialization_memory = true;
-			capture_indirect_reads = true;
 			target.indirect_descriptor->key_count = Clone(target.indirect_descriptor->key_count);
 			target.indirect_descriptor->selector_first =
 			    Clone(target.indirect_descriptor->selector_first);
@@ -2616,29 +2661,35 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	// Keep only that Boolean structure, never the varying shader dependency graph.
 	CyclicPhiEntryCache                   cyclic_entries {.program = &program};
 	std::unordered_map<const Inst*, bool> validated;
-	// Exec chains reuse each subterm on both sides of an AND, so an unmemoized walk is exponential.
+	Value                                  unknown;
+	bool                                   capture_control_reads = false;
 	std::unordered_map<const Inst*, Value> predicates;
-	Value                                 unknown;
-	std::function<Value(Value)>            ClonePredicate;
-	const auto                             ClonePredicateUncached = [&](Value value) -> Value {
+	std::function<Value(Value)>            ClonePredicate = [&](Value value) -> Value {
+		value = value.Resolve();
+		if (value.IsEmpty()) return {};
 		const auto* inst = value.TryInstruction();
-		if (inst != nullptr && inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) {
-			return Value(true);
-		}
+		if (inst == nullptr)
+			return ValidateRuntimeValue(program, value, RuntimeValueType::Integer) ? value
+			                                                                       : Value {};
+		// Preserve shared EXEC predicates, including subgraphs with no uniform factor.
+		const auto [found, inserted] = predicates.try_emplace(inst);
+		if (!inserted) return found->second;
+		auto& result = found->second;
+		if (inst->GetOpcode() == ValueOpcode::DispatchThreadInRange) return result = Value(true);
 		const auto runtime = [&] {
-			if (inst == nullptr) {
-				return ValidateRuntimeValue(program, value, RuntimeValueType::Integer);
-			}
-			if (const auto found = validated.find(inst); found != validated.end()) {
-				return found->second;
+			if (const auto known = validated.find(inst); known != validated.end()) {
+				return known->second;
 			}
 			const bool valid = ValidateRuntimeValue(program, value, RuntimeValueType::Integer,
 			                                        nullptr, &cyclic_entries);
 			validated.emplace(inst, valid);
 			return valid;
 		};
-		if (runtime()) return Clone(value);
-		if (inst == nullptr) return {};
+		if (runtime()) {
+			capture_control_reads |= !ValidateRuntimeValue(
+			    program, value, RuntimeValueType::ImmutableInteger, nullptr, &cyclic_entries);
+			return result = Clone(value);
+		}
 		const auto op = inst->GetOpcode();
 		if (op == ValueOpcode::ConditionRef || op == ValueOpcode::LogicalNot) {
 			const auto operand = ClonePredicate(inst->Arg(0));
@@ -2650,8 +2701,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		if (op != ValueOpcode::LogicalAnd && op != ValueOpcode::LogicalOr) return {};
 		auto left  = ClonePredicate(inst->Arg(0));
 		auto right = ClonePredicate(inst->Arg(1));
-		if (op == ValueOpcode::LogicalAnd && left == Value(true)) return right;
-		if (op == ValueOpcode::LogicalAnd && right == Value(true)) return left;
+		if (op == ValueOpcode::LogicalAnd && left == Value(true)) return result = right;
+		if (op == ValueOpcode::LogicalAnd && right == Value(true)) return result = left;
 		if (left.IsEmpty() && right.IsEmpty()) return {};
 		if (left.IsEmpty() || right.IsEmpty()) {
 			if (unknown.IsEmpty())
@@ -2663,18 +2714,6 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		node.SetArg(0, left);
 		node.SetArg(1, right);
 		return result = Value(&node);
-	};
-	ClonePredicate = [&](Value value) -> Value {
-		value = value.Resolve();
-		if (value.IsEmpty()) return {};
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return ClonePredicateUncached(value);
-		if (const auto found = predicates.find(inst); found != predicates.end()) {
-			return found->second;
-		}
-		const auto result = ClonePredicateUncached(value);
-		predicates.emplace(inst, result);
-		return result;
 	};
 	plan.control_flow = ResourceControlFlow(program, ClonePredicate);
 	plan.uniform_fill = AnalyzeUniformFill(program);
@@ -2715,7 +2754,9 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 			}
 		}
 	}
-	plan.capture_specialization_reads = capture_image_reads || !plan.control_flow.empty();
+	// Guest code a linked SWAPPC leaf was read from is revalidated with the other captured reads.
+	plan.capture_specialization_reads =
+	    capture_image_reads || capture_control_reads || !plan.source_reads.empty();
 	if (plan.capture_specialization_reads) {
 		// Clean writable addresses prove that shader writes cannot overlap captured reads.
 		for (const auto& buffer: plan.info.buffers) {
@@ -2727,7 +2768,8 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 				MarkCleanFlatSlots(plan, Source(plan, image.source), plan.clean_flat_slots);
 		}
 	}
-	if (capture_image_reads) plan.resource_tracking_complete &= !program.has_address_writes;
+	if (capture_image_reads || !plan.source_reads.empty())
+		plan.resource_tracking_complete &= !program.has_address_writes;
 	for (const auto& buffer: plan.info.buffers) {
 		const auto* source = Source(plan, buffer.source);
 		if (source == nullptr || !source->indirect_buffer.has_value()) {
@@ -2765,7 +2807,9 @@ static bool CapturedReadsAvoidWrittenBuffers(const ResourcePlan& program,
 		const auto base = buffer.Base48();
 		const auto size = buffer.GetSize();
 		if (size == 0u) continue;
-		for (size_t r = 0; r < reads.size(); ++r) {
+		// The leading ranges are the linked code (source_reads). They only detect a changed
+		// leaf and never prune blocks, so a store over them does not invalidate the walk.
+		for (size_t r = program.source_reads.size(); r < reads.size(); ++r) {
 			const auto [address, bytes] = reads[r];
 			if (bytes == 0u || address >= base + size || base >= address + bytes) continue;
 			const auto slot = r < slots.size() ? slots[r] : UINT32_MAX;
@@ -2817,14 +2861,16 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
                      ResourceSnapshot& snapshot, ResourceSpecialization& specialization,
                      std::vector<uint32_t>* refused_tables, bool prune = true) {
 	if (!program.resource_tracking_complete ||
-	    (program.requires_specialization_memory && runtime.read_specialization_memory == nullptr)) {
+	    ((program.requires_specialization_memory || !program.source_reads.empty()) &&
+	     runtime.read_specialization_memory == nullptr)) {
 		MaterializeFailure() = "plan incomplete";
 		return false;
 	}
-	const bool capture_reads = program.capture_specialization_reads;
+	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
 	auto&      reads         = snapshot.specialization_reads;
-	reads.clear();
-	snapshot.specialization_read_slots.clear();
+	// Ranges read while linking the shader's code are revalidated like any captured read.
+	reads = program.source_reads;
+	snapshot.specialization_read_slots.assign(reads.size(), UINT32_MAX);
 	ReadCapture capture {runtime, reads, snapshot.specialization_read_slots};
 	SrtRuntime  observed = runtime;
 	if (capture_reads) {
@@ -3071,7 +3117,21 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 	PadIndirectImageShapes(program, snapshot, specialization);
 	snapshot.samplers.resize(program.info.samplers.size());
 	for (uint32_t i = 0; i < program.info.samplers.size(); ++i) {
-		if (!evaluate(program.info.samplers[i].source, snapshot.samplers[i])) {
+		auto source = program.info.samplers[i].source;
+		if (source >= program.descriptor_sources.size()) {
+			MaterializeFailure() = "sampler descriptor";
+			return false;
+		}
+		// A finite inline sampler's root binds its first candidate.
+		const auto& descriptor = program.descriptor_sources[source];
+		if (descriptor.indirect_descriptor) {
+			if (descriptor.indirect_descriptor->sources.empty()) {
+				MaterializeFailure() = "sampler descriptor";
+				return false;
+			}
+			source = descriptor.indirect_descriptor->sources[0];
+		}
+		if (!evaluate(source, snapshot.samplers[i])) {
 			MaterializeFailure() = "sampler descriptor";
 			return false;
 		}
@@ -3351,8 +3411,7 @@ void AddObservedIndirectKeys(uint64_t signature, std::span<const uint32_t> keys)
 }
 
 bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization& specialization) {
-	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete ||
-	        program.binding_layout_complete);
+	EXIT_IF(!program.resource_tracking_complete || program.shader_info_complete);
 	// Not a fault: a permutation can be keyed on a specialization that came from a different
 	// tracking of the same shader, and the caller refuses it rather than dying on it.
 	if (program.info.buffers.size() > specialization.buffers.size() ||
@@ -3562,6 +3621,8 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 			}
 			EXIT_IF(image.indirect_root == memory.resource &&
 			        inst.GetOpcode() != ValueOpcode::ImageSampleRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageGatherRaw &&
+			        inst.GetOpcode() != ValueOpcode::ImageRead &&
 			        !(image.bindless && BindlessReads(inst.GetOpcode())));
 		}
 	}

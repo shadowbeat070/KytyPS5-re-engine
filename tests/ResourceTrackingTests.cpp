@@ -615,6 +615,119 @@ void TestRefusedIndirectBufferTableDemotes() {
         "a formatted access through a refused table was decoded as raw dwords");
 }
 
+// The first translation asks the dispatch's memory whether a recognised table
+// would be refused, so a table already past the dense buffer limit is decoded
+// in the shader by that one translation - the same tracking the refusal would
+// have bought with a second one - while a table of the same shape that fits
+// stays an enumerated binding.
+void TestFirstTranslationChecksTableContents() {
+  constexpr uint32_t kStride = 48u;
+  constexpr uint32_t kRecords = ShaderInfo::MaxDenseBuffers + 2u;
+  LinearTestMemory memory;
+  const auto word = [&](uint64_t address) {
+    return (address - memory.base) / 4u;
+  };
+  const auto write_records = [&](uint32_t count) {
+    std::fill(memory.words.begin(), memory.words.end(), 0u);
+    for (uint32_t record = 0; record < count; record++) {
+      const std::array<uint32_t, 4> descriptor{
+          0x4000u + record * 0x100u, 0u, 64u,
+          Libs::Graphics::DstSel(4, 5, 6, 7)};
+      for (uint32_t dword = 0; dword < descriptor.size(); dword++) {
+        memory.words[word(0x1000u + record * kStride + 8u) + dword] =
+            descriptor[dword];
+      }
+    }
+  };
+  std::array<uint32_t, 4> user_data{0x1000u, 0u, kRecords * kStride, 0u};
+  SrtRuntime runtime{.user_data = user_data,
+                     .userdata = &memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  uint32_t asked = 0;
+  const auto check = [&](const Program &program,
+                         std::span<const DescriptorSource> sources,
+                         uint32_t source) {
+    asked++;
+    return IndirectBufferTableRefused(program, sources, source, runtime);
+  };
+  const auto dynamic_count = [](const Program &program) {
+    return std::ranges::count_if(
+        program.memory_info,
+        [](const auto &memory_info) { return memory_info.dynamic_buffer; });
+  };
+  const auto bound_as_table = [](const Program &program) {
+    return std::ranges::any_of(program.info.buffers, [&](const auto &buffer) {
+      return program.descriptor_sources[buffer.source]
+          .indirect_buffer.has_value();
+    });
+  };
+
+  auto plain = MakeIndirectBufferFixture(kStride, false);
+  plain->PlanAndTrack();
+  const auto table_pc = plain->program.info.buffers[1].first_use_pc;
+
+  // Over the cap: one translation, and it is the translation the refusal used
+  // to rebuild into.
+  write_records(kRecords);
+  auto over = MakeIndirectBufferFixture(kStride, false);
+  over->program.refuse_indirect_buffer_table = check;
+  over->PlanAndTrack();
+  Check(asked == 1u,
+        "the first translation did not ask about its table exactly once");
+  Check(!bound_as_table(over->program) && dynamic_count(over->program) == 1 &&
+            over->program.info.uses_dma,
+        "a table over the dense buffer limit was still bound by the first "
+        "translation");
+  auto relearned = MakeIndirectBufferFixture(kStride, false);
+  relearned->program.unfoldable_pcs = {table_pc};
+  relearned->PlanAndTrack();
+  Check(over->program.info.buffers.size() ==
+                relearned->program.info.buffers.size() &&
+            dynamic_count(over->program) == dynamic_count(relearned->program) &&
+            over->program.info.uses_dma == relearned->program.info.uses_dma &&
+            over->program.info.writes_dma == relearned->program.info.writes_dma,
+        "the first translation differs from the one the refusal rebuilds into");
+  auto over_plan = ExtractResourcePlan(over->program);
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  std::vector<uint32_t> refused;
+  Check(MaterializeResources(over_plan, runtime, snapshot, specialization,
+                             &refused) &&
+            refused.empty(),
+        "the first translation of an over-cap table still needed a refusal to "
+        "materialize");
+
+  // Under the cap, same layout and same heap: the table stays an enumerated
+  // binding.
+  asked = 0;
+  write_records(2u);
+  user_data[2] = 2u * kStride;
+  auto under = MakeIndirectBufferFixture(kStride, false);
+  under->program.refuse_indirect_buffer_table = check;
+  under->PlanAndTrack();
+  Check(asked == 1u && bound_as_table(under->program) &&
+            dynamic_count(under->program) == 0,
+        "a table that fits was moved off its enumerated binding");
+  auto under_plan = ExtractResourcePlan(under->program);
+  Check(MaterializeResources(under_plan, runtime, snapshot, specialization) &&
+            snapshot.buffers.size() == 4u,
+        "a table that fits did not expand into one binding per live record");
+
+  // A heap the check cannot read is left to the materialization, as before the
+  // check existed.
+  asked = 0;
+  write_records(kRecords);
+  user_data[2] = kRecords * kStride;
+  memory.fail_address = 0x1000u + 8u;
+  auto unreadable = MakeIndirectBufferFixture(kStride, false);
+  unreadable->program.refuse_indirect_buffer_table = check;
+  unreadable->PlanAndTrack();
+  Check(asked == 1u && bound_as_table(unreadable->program) &&
+            dynamic_count(unreadable->program) == 0,
+        "a table whose memory could not be read was demoted on a guess");
+  memory.fail_address = UINT64_MAX;
+}
+
 void TestInvariantIndirectImageMaterialization() {
   auto fixture = MakeIndirectImageFixture(false);
   fixture->PlanAndTrack();
@@ -6241,6 +6354,8 @@ int main() {
     Run("draw-uniform scalar image", TestUniformScalarBufferImage);
     Run("indirect buffer table", TestIndirectBufferMaterialization);
     Run("refused buffer table demotes", TestRefusedIndirectBufferTableDemotes);
+    Run("first translation checks table contents",
+        TestFirstTranslationChecksTableContents);
     Run("decoded buffer control flow", TestDecodedBufferControlFlow);
     Run("SRT runtime", TestSrtFlatteningAndRuntimeMemoization);
     Run("dynamic SRT", TestDynamicSrtReadRemainsExplicit);

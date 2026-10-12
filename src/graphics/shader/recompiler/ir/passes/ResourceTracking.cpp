@@ -3409,7 +3409,25 @@ private:
 	}
 
 	void DemoteRefusedTables() {
-		if (m_program.unfoldable_pcs.empty() || m_indirect_buffers.empty()) {
+		if (m_indirect_buffers.empty()) {
+			return;
+		}
+		// A table the materialization would refuse right now is demoted before the first
+		// translation binds it, so the shader is translated once instead of refused and rebuilt.
+		// Decided by the table's contents, never by its layout: a table of the same shape that
+		// fits stays an enumerated binding.
+		if (m_program.refuse_indirect_buffer_table) {
+			std::unordered_set<uint32_t> checked;
+			for (const auto& plan: m_indirect_buffers) {
+				if (m_demoted_tables.contains(plan.source) || !checked.insert(plan.source).second) {
+					continue;
+				}
+				if (m_program.refuse_indirect_buffer_table(m_program, m_sources, plan.source)) {
+					m_demoted_tables.insert(plan.source);
+				}
+			}
+		}
+		if (m_program.unfoldable_pcs.empty()) {
 			return;
 		}
 		for (auto* block: m_program.blocks) {
