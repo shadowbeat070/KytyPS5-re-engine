@@ -1,6 +1,9 @@
 #include "graphics/shader/recompiler/backend/spirv/SpirvDriverSimplify.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cstdlib>
+#include <cstring>
 #include <spirv-tools/libspirv.h>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
@@ -735,6 +738,691 @@ void RemoveUnused(Module& m, DriverSimplifyStats& stats) {
 	});
 }
 
+bool EnvSwitchOn(const char* name) {
+	const char* text = std::getenv(name);
+	return text != nullptr && text[0] != '\0' && text[0] != '0';
+}
+
+struct Dominators {
+	std::vector<uint32_t>              order; // reachable blocks, reverse postorder
+	std::vector<int32_t>               idom;  // by block index; -1 when unreachable
+	std::vector<std::vector<uint32_t>> children;
+};
+
+Dominators ComputeDominators(const Module& m, const Function& function) {
+	const auto                           count = function.blocks.size();
+	std::unordered_map<uint32_t, size_t> labels;
+	for (size_t i = 0; i < count; i++) {
+		if (!function.blocks[i].removed) {
+			labels[function.blocks[i].label] = i;
+		}
+	}
+	std::vector<std::vector<uint32_t>> successors(count);
+	std::vector<std::vector<uint32_t>> predecessors(count);
+	for (size_t i = 0; i < count; i++) {
+		const auto& block = function.blocks[i];
+		if (block.removed || block.insts.empty()) {
+			continue;
+		}
+		const auto& terminator = m.arena[block.insts.back()];
+		for (const auto offset: terminator.ids) {
+			if (const auto it = labels.find(terminator.words[offset]); it != labels.end()) {
+				successors[i].push_back(static_cast<uint32_t>(it->second));
+				predecessors[it->second].push_back(static_cast<uint32_t>(i));
+			}
+		}
+	}
+	Dominators result;
+	result.idom.assign(count, -1);
+	result.children.resize(count);
+	if (count == 0 || function.blocks[0].removed) {
+		return result;
+	}
+	std::vector<uint32_t>                    postorder;
+	std::vector<bool>                        visited(count, false);
+	std::vector<std::pair<uint32_t, size_t>> stack {{0u, 0u}};
+	visited[0] = true;
+	while (!stack.empty()) {
+		const auto block = stack.back().first;
+		const auto next  = stack.back().second;
+		if (next < successors[block].size()) {
+			stack.back().second++;
+			const auto successor = successors[block][next];
+			if (!visited[successor]) {
+				visited[successor] = true;
+				stack.emplace_back(successor, 0u);
+			}
+		} else {
+			postorder.push_back(block);
+			stack.pop_back();
+		}
+	}
+	result.order.assign(postorder.rbegin(), postorder.rend());
+	std::vector<int32_t> rank(count, -1);
+	for (size_t i = 0; i < result.order.size(); i++) {
+		rank[result.order[i]] = static_cast<int32_t>(i);
+	}
+	auto& idom = result.idom;
+	idom[0]    = 0;
+	for (bool changed = true; changed;) {
+		changed = false;
+		for (size_t i = 1; i < result.order.size(); i++) {
+			const auto block    = result.order[i];
+			int32_t    new_idom = -1;
+			for (const auto predecessor: predecessors[block]) {
+				if (rank[predecessor] < 0 || idom[predecessor] < 0) {
+					continue;
+				}
+				if (new_idom < 0) {
+					new_idom = static_cast<int32_t>(predecessor);
+					continue;
+				}
+				auto a = static_cast<int32_t>(predecessor);
+				auto b = new_idom;
+				while (a != b) {
+					while (rank[a] > rank[b]) {
+						a = idom[a];
+					}
+					while (rank[b] > rank[a]) {
+						b = idom[b];
+					}
+				}
+				new_idom = a;
+			}
+			if (new_idom >= 0 && idom[block] != new_idom) {
+				idom[block] = new_idom;
+				changed     = true;
+			}
+		}
+	}
+	for (size_t i = 1; i < result.order.size(); i++) {
+		const auto block = result.order[i];
+		if (idom[block] >= 0) {
+			result.children[idom[block]].push_back(block);
+		}
+	}
+	return result;
+}
+
+struct WordsHash {
+	size_t operator()(const std::vector<uint32_t>& key) const {
+		uint64_t hash = 1469598103934665603ull;
+		for (const auto word: key) {
+			hash = (hash ^ word) * 1099511628211ull;
+		}
+		return static_cast<size_t>(hash ^ (hash >> 29u));
+	}
+};
+
+// Replaces a value by an equal one it already has: a bit-preserving identity (a bitcast back to the
+// type a value came from, a mask that clears nothing, an unpack of bits a mask only narrowed) or a
+// lane-local instruction a dominating one already computed. Nothing is moved and no new
+// evaluation is introduced, so every replacement is an exact one.
+class ValueSimplifier {
+public:
+	ValueSimplifier(Module& module, bool peephole, bool cse, DriverSimplifyStats& stats)
+	    : m(module), peephole(peephole), cse(cse), stats(stats) {
+		decorated.assign(m.def.size(), false);
+		for (const auto index: m.preamble) {
+			const auto& inst = m.At(index);
+			if ((inst.op == spv::OpDecorate || inst.op == spv::OpDecorateId ||
+			     inst.op == spv::OpMemberDecorate) &&
+			    inst.words[1] < decorated.size()) {
+				decorated[inst.words[1]] = true;
+			}
+			if (inst.op == spv::OpConstant && inst.words.size() == 4) {
+				constants.try_emplace((static_cast<uint64_t>(inst.type) << 32u) | inst.words[3],
+				                      inst.result);
+			}
+			if (inst.op == spv::OpExtInstImport && inst.words.size() > 2) {
+				const auto* name = reinterpret_cast<const char*>(inst.words.data() + 2);
+				if (std::strncmp(name, "GLSL.std.450", 12) == 0) {
+					glsl_set = inst.result;
+				}
+			}
+		}
+	}
+
+	void Run(Function& function) {
+		const auto dominators = ComputeDominators(m, function);
+		if (dominators.order.empty()) {
+			return;
+		}
+		struct Frame {
+			uint32_t block;
+			size_t   child;
+			size_t   mark;
+		};
+		std::vector<Frame> stack;
+		const auto         enter = [&](uint32_t block) {
+			stack.push_back({block, 0, undo.size()});
+			Simplify(function.blocks[block]);
+		};
+		enter(dominators.order.front());
+		while (!stack.empty()) {
+			auto& frame = stack.back();
+			if (frame.child < dominators.children[frame.block].size()) {
+				const auto child = dominators.children[frame.block][frame.child++];
+				enter(child);
+				continue;
+			}
+			for (auto i = undo.size(); i > frame.mark; i--) {
+				table.erase(undo[i - 1]);
+			}
+			undo.resize(frame.mark);
+			stack.pop_back();
+		}
+	}
+
+	// Values defined later than a use (a phi's back edge) are only replaced here.
+	void RewriteAll() {
+		for (auto& function: m.functions) {
+			for (auto& block: function.blocks) {
+				if (block.removed) {
+					continue;
+				}
+				for (const auto index: block.insts) {
+					auto& inst = m.At(index);
+					for (const auto offset: inst.ids) {
+						inst.words[offset] = Resolve(inst.words[offset]);
+					}
+				}
+			}
+		}
+	}
+
+private:
+	uint32_t Resolve(uint32_t id) {
+		uint32_t current = id;
+		for (int guard = 0; guard < 64 && current < repl.size() && repl[current] != 0; guard++) {
+			current = repl[current];
+		}
+		return current;
+	}
+
+	void Replace(uint32_t result, uint32_t value) {
+		if (repl.size() <= result) {
+			repl.resize(m.def.size(), 0);
+		}
+		repl[result] = value;
+	}
+
+	const Inst* TypeDef(uint32_t type) const { return m.Def(type); }
+
+	bool IsInt32(uint32_t type) const {
+		const auto* def = TypeDef(type);
+		return def != nullptr && def->op == spv::OpTypeInt && def->words[2] == 32;
+	}
+
+	bool IsArithmetic(uint32_t type) const {
+		const auto* def = TypeDef(type);
+		return def != nullptr && (def->op == spv::OpTypeInt || def->op == spv::OpTypeFloat ||
+		                          def->op == spv::OpTypeVector);
+	}
+
+	uint32_t TypeOf(uint32_t id) const {
+		const auto* def = m.Def(id);
+		return def != nullptr ? def->type : 0;
+	}
+
+	bool ConstantValue(uint32_t id, uint32_t& value) const {
+		const auto* def = m.Def(id);
+		if (def == nullptr || def->op != spv::OpConstant || def->words.size() != 4) {
+			return false;
+		}
+		value = def->words[3];
+		return true;
+	}
+
+	bool IsBoolConstant(uint32_t id, bool& value) const {
+		const auto* def = m.Def(id);
+		if (def == nullptr || (def->op != spv::OpConstantTrue && def->op != spv::OpConstantFalse)) {
+			return false;
+		}
+		value = def->op == spv::OpConstantTrue;
+		return true;
+	}
+
+	// Bits of a 32-bit integer that may be set.
+	uint32_t MaybeOnes(uint32_t id, int depth = 0) {
+		uint32_t value = 0;
+		if (ConstantValue(id, value)) {
+			return value;
+		}
+		const auto* def = m.Def(id);
+		if (def == nullptr || depth > 12 || def->result == 0 || !IsInt32(def->type)) {
+			return ~0u;
+		}
+		if (const auto found = maybe_ones.find(id); found != maybe_ones.end()) {
+			return found->second;
+		}
+		uint32_t result = ~0u;
+		uint32_t amount = 0;
+		switch (def->op) {
+			case spv::OpBitFieldUExtract:
+				if (ConstantValue(def->words[5], amount)) {
+					result = amount >= 32u ? ~0u : (1u << amount) - 1u;
+				}
+				break;
+			case spv::OpBitwiseAnd:
+				result = MaybeOnes(def->words[3], depth + 1) & MaybeOnes(def->words[4], depth + 1);
+				break;
+			case spv::OpBitwiseOr:
+			case spv::OpBitwiseXor:
+				result = MaybeOnes(def->words[3], depth + 1) | MaybeOnes(def->words[4], depth + 1);
+				break;
+			case spv::OpShiftRightLogical:
+				if (ConstantValue(def->words[4], amount) && amount < 32u) {
+					result = MaybeOnes(def->words[3], depth + 1) >> amount;
+				}
+				break;
+			case spv::OpShiftLeftLogical:
+				if (ConstantValue(def->words[4], amount) && amount < 32u) {
+					result = MaybeOnes(def->words[3], depth + 1) << amount;
+				}
+				break;
+			case spv::OpSelect:
+				result = MaybeOnes(def->words[4], depth + 1) | MaybeOnes(def->words[5], depth + 1);
+				break;
+			default: break;
+		}
+		maybe_ones.emplace(id, result);
+		return result;
+	}
+
+	uint32_t FindOrAddConstant(uint32_t type, uint32_t value) {
+		const auto key = (static_cast<uint64_t>(type) << 32u) | value;
+		if (const auto found = constants.find(key); found != constants.end()) {
+			return found->second;
+		}
+		Inst constant;
+		constant.op     = spv::OpConstant;
+		constant.type   = type;
+		constant.result = m.AllocateId();
+		constant.words  = {(4u << spv::WordCountShift) | spv::OpConstant, type, constant.result,
+		                   value};
+		constant.ids    = {1};
+		const auto id   = constant.result;
+		m.new_constants.push_back(m.Add(std::move(constant)));
+		constants.emplace(key, id);
+		return id;
+	}
+
+	// A float constant a driver keeps bit for bit: no NaN payload, no denormal to flush.
+	static bool PlainFloatBits(uint32_t bits) {
+		const auto exponent = bits & 0x7f800000u;
+		return exponent != 0x7f800000u ? (exponent != 0 || (bits & 0x007fffffu) == 0)
+		                               : (bits & 0x007fffffu) == 0;
+	}
+
+	std::vector<uint32_t> Key(const Inst& inst) const {
+		std::vector<uint32_t> key;
+		key.reserve(inst.words.size() - 1);
+		key.push_back(inst.words[0]);
+		key.push_back(inst.words[1]);
+		key.insert(key.end(), inst.words.begin() + 3, inst.words.end());
+		return key;
+	}
+
+	bool Deduplicable(const Inst& inst) const {
+		if (inst.result == 0 || inst.type == 0 || IsDecorated(inst.result)) {
+			return false;
+		}
+		return (IsTotalLaneLocal(inst) && inst.op != spv::OpCopyObject) || IsAccessChain(inst.op);
+	}
+
+	bool IsDecorated(uint32_t id) const { return id < decorated.size() && decorated[id]; }
+
+	// The value the instruction is equal to, or 0. May rewrite the instruction into a simpler
+	// equal form, and may append a new instruction to `out` for it to use.
+	uint32_t Fold(uint32_t index, std::vector<uint32_t>& out) {
+		auto& inst = m.At(index);
+		if (inst.result == 0 || IsDecorated(inst.result)) {
+			return 0;
+		}
+		const auto op    = inst.op;
+		uint32_t   value = 0;
+		bool       flag  = false;
+		const auto lhs   = inst.words.size() > 3 ? inst.words[3] : 0u;
+		const auto rhs   = inst.words.size() > 4 ? inst.words[4] : 0u;
+		switch (op) {
+			case spv::OpCopyObject: return lhs;
+			case spv::OpBitcast: {
+				if (!IsArithmetic(inst.type) || !IsArithmetic(TypeOf(lhs))) {
+					return 0;
+				}
+				if (TypeOf(lhs) == inst.type) {
+					return lhs;
+				}
+				const auto* source = m.Def(lhs);
+				if (source != nullptr && source->op == spv::OpBitcast &&
+				    IsArithmetic(TypeOf(source->words[3]))) {
+					const auto inner = source->words[3];
+					if (TypeOf(inner) == inst.type) {
+						return inner;
+					}
+					inst.words[3] = inner;
+					return 0;
+				}
+				// Either side a float NaN or denormal: leave it to the driver, which may
+				// canonicalize a float constant it materializes (an sNaN constant comes out quiet
+				// on NVIDIA) but not the same bits arriving as an integer.
+				const auto* type        = TypeDef(inst.type);
+				const auto* source_type = TypeDef(TypeOf(lhs));
+				if (ConstantValue(lhs, value) && type != nullptr && source_type != nullptr &&
+				    (type->op == spv::OpTypeInt || type->op == spv::OpTypeFloat) &&
+				    type->words[2] == 32 &&
+				    ((type->op != spv::OpTypeFloat && source_type->op != spv::OpTypeFloat) ||
+				     PlainFloatBits(value))) {
+					return FindOrAddConstant(inst.type, value);
+				}
+				return 0;
+			}
+			case spv::OpBitwiseAnd:
+				if (!IsInt32(inst.type)) {
+					return 0;
+				}
+				if (lhs == rhs) {
+					return lhs;
+				}
+				if (ConstantValue(rhs, value) && (MaybeOnes(lhs) & ~value) == 0) {
+					return lhs;
+				}
+				if (ConstantValue(lhs, value) && (MaybeOnes(rhs) & ~value) == 0) {
+					return rhs;
+				}
+				return 0;
+			case spv::OpBitwiseOr:
+			case spv::OpBitwiseXor:
+			case spv::OpIAdd:
+				if (!IsInt32(inst.type)) {
+					return 0;
+				}
+				if (op == spv::OpBitwiseOr && lhs == rhs) {
+					return lhs;
+				}
+				if (ConstantValue(rhs, value) && value == 0) {
+					return lhs;
+				}
+				if (ConstantValue(lhs, value) && value == 0) {
+					return rhs;
+				}
+				return 0;
+			case spv::OpShiftLeftLogical:
+			case spv::OpShiftRightLogical:
+			case spv::OpShiftRightArithmetic:
+				return IsInt32(inst.type) && ConstantValue(rhs, value) && value == 0 ? lhs : 0u;
+			case spv::OpSelect: {
+				const auto if_true  = inst.words[4];
+				const auto if_false = inst.words[5];
+				if (if_true == if_false) {
+					return if_true;
+				}
+				if (IsBoolConstant(lhs, flag)) {
+					return flag ? if_true : if_false;
+				}
+				return 0;
+			}
+			case spv::OpLogicalNot: {
+				const auto* source = m.Def(lhs);
+				return source != nullptr && source->op == spv::OpLogicalNot ? source->words[3] : 0u;
+			}
+			case spv::OpLogicalAnd:
+			case spv::OpLogicalOr: {
+				if (lhs == rhs) {
+					return lhs;
+				}
+				const bool neutral = op == spv::OpLogicalAnd;
+				if (IsBoolConstant(rhs, flag) && flag == neutral) {
+					return lhs;
+				}
+				if (IsBoolConstant(lhs, flag) && flag == neutral) {
+					return rhs;
+				}
+				return 0;
+			}
+			case spv::OpCompositeExtract: {
+				if (inst.words.size() != 5) {
+					return 0;
+				}
+				const auto* source = m.Def(lhs);
+				if (source == nullptr) {
+					return 0;
+				}
+				const auto component = inst.words[4];
+				if (source->op == spv::OpCompositeConstruct) {
+					const auto* type = TypeDef(source->type);
+					if (type != nullptr && type->op == spv::OpTypeVector &&
+					    source->words.size() == 3u + type->words[3] && component < type->words[3] &&
+					    TypeOf(source->words[3 + component]) == inst.type) {
+						return source->words[3 + component];
+					}
+					return 0;
+				}
+				if (source->op == spv::OpExtInst && source->words[3] == glsl_set && glsl_set != 0 &&
+				    source->words[4] == GLSLstd450UnpackHalf2x16 && component < 2) {
+					return NarrowUnpack(index, out);
+				}
+				return 0;
+			}
+			default: return 0;
+		}
+	}
+
+	// UnpackHalf2x16 reads only the half it is asked for, so a mask or extract that merely isolated
+	// that half can be skipped and both halves of a register share one unpack.
+	uint32_t NarrowUnpack(uint32_t index, std::vector<uint32_t>& out) {
+		const auto& extract   = m.At(index);
+		const auto* unpack    = m.Def(extract.words[3]);
+		uint32_t    bits      = unpack->words[5];
+		uint32_t    component = extract.words[4];
+		uint32_t    value     = 0;
+		uint32_t    count     = 0;
+		bool        narrowed  = false;
+		for (int step = 0; step < 4; step++) {
+			const auto* def = m.Def(bits);
+			if (def == nullptr || !IsInt32(def->type)) {
+				break;
+			}
+			if (def->op == spv::OpBitwiseAnd) {
+				if (ConstantValue(def->words[4], value) && (value & 0xffffu) == 0xffffu &&
+				    component == 0) {
+					bits = def->words[3];
+				} else if (ConstantValue(def->words[3], value) && (value & 0xffffu) == 0xffffu &&
+				           component == 0) {
+					bits = def->words[4];
+				} else {
+					break;
+				}
+			} else if (def->op == spv::OpBitFieldUExtract && ConstantValue(def->words[4], value) &&
+			           ConstantValue(def->words[5], count)) {
+				if (value == 0 && count >= 16 && component == 0) {
+					bits = def->words[3];
+				} else if (value == 16 && count == 16 && component == 0) {
+					bits      = def->words[3];
+					component = 1;
+				} else {
+					break;
+				}
+			} else if (def->op == spv::OpShiftRightLogical && ConstantValue(def->words[4], value) &&
+			           value == 16 && component == 0) {
+				bits      = def->words[3];
+				component = 1;
+			} else {
+				break;
+			}
+			narrowed = true;
+		}
+		if (!narrowed || !IsInt32(TypeOf(bits))) {
+			return 0;
+		}
+		Inst replacement     = *unpack;
+		replacement.words[5] = bits;
+		uint32_t unpacked    = 0;
+		if (cse) {
+			if (const auto found = table.find(Key(replacement)); found != table.end()) {
+				unpacked = found->second;
+			}
+		}
+		if (unpacked == 0) {
+			replacement.result   = m.AllocateId();
+			replacement.words[2] = replacement.result;
+			unpacked             = replacement.result;
+			const auto key       = Key(replacement);
+			out.push_back(m.Add(std::move(replacement)));
+			if (cse) {
+				table.emplace(key, unpacked);
+				undo.push_back(key);
+			}
+		}
+		auto& rewritten    = m.At(index);
+		rewritten.words[3] = unpacked;
+		rewritten.words[4] = component;
+		stats.folded++;
+		return 0;
+	}
+
+	void Simplify(Block& block) {
+		std::vector<uint32_t> out;
+		out.reserve(block.insts.size() + 8);
+		for (const auto index: block.insts) {
+			{
+				auto& inst = m.At(index);
+				for (const auto offset: inst.ids) {
+					inst.words[offset] = Resolve(inst.words[offset]);
+				}
+			}
+			if (peephole) {
+				if (const auto value = Fold(index, out); value != 0) {
+					Replace(m.At(index).result, value);
+					stats.folded++;
+					out.push_back(index);
+					continue;
+				}
+			}
+			const auto& inst = m.At(index);
+			if (cse && Deduplicable(inst)) {
+				auto key = Key(inst);
+				if (const auto found = table.find(key); found != table.end()) {
+					Replace(inst.result, found->second);
+					stats.deduplicated++;
+				} else {
+					table.emplace(key, inst.result);
+					undo.push_back(std::move(key));
+				}
+			}
+			out.push_back(index);
+		}
+		block.insts = std::move(out);
+	}
+
+	Module&                                                        m;
+	bool                                                           peephole;
+	bool                                                           cse;
+	DriverSimplifyStats&                                           stats;
+	std::vector<uint32_t>                                          repl;
+	std::vector<bool>                                              decorated;
+	std::unordered_map<uint64_t, uint32_t>                         constants;
+	std::unordered_map<uint32_t, uint32_t>                         maybe_ones;
+	std::unordered_map<std::vector<uint32_t>, uint32_t, WordsHash> table;
+	std::vector<std::vector<uint32_t>>                             undo;
+	uint32_t                                                       glsl_set = 0;
+};
+
+// Moves each lane-local instruction down to just before its first user in the same block. The
+// emitter writes a wave64 instruction for both halves before the next one, so every value of both
+// halves is live at once in the order the driver reads; NVIDIA's compile time follows that order
+// (measured: up to a third of a large module's build). Only pure instructions move, and never
+// past their users or out of their block, so this is a reordering and nothing else.
+void SinkToUses(Module& m, Function& function, DriverSimplifyStats& stats) {
+	std::unordered_map<uint32_t, uint32_t>   position; // result id -> index in the block
+	std::vector<uint32_t>                    order;
+	std::vector<uint8_t>                     state; // 0 = waiting, 1 = on the stack, 2 = placed
+	std::vector<std::pair<uint32_t, size_t>> stack;
+	for (auto& block: function.blocks) {
+		if (block.removed || block.insts.size() < 3) {
+			continue;
+		}
+		const auto& insts = block.insts;
+		const auto  count = insts.size();
+		size_t      tail  = count - 1; // the terminator, with its merge instruction before it
+		if (tail > 0 && (m.At(insts[tail - 1]).op == spv::OpSelectionMerge ||
+		                 m.At(insts[tail - 1]).op == spv::OpLoopMerge)) {
+			tail--;
+		}
+		position.clear();
+		std::vector<bool> movable(count, false);
+		std::vector<bool> used_here(count, false);
+		for (size_t i = 0; i < tail; i++) {
+			const auto& inst = m.At(insts[i]);
+			if (inst.result != 0 && inst.op != spv::OpPhi && IsTotalLaneLocal(inst)) {
+				movable[i] = true;
+				position.emplace(inst.result, static_cast<uint32_t>(i));
+			}
+		}
+		for (size_t i = 0; i < count; i++) {
+			const auto& inst = m.At(insts[i]);
+			if (inst.op == spv::OpPhi) {
+				continue;
+			}
+			for (const auto offset: inst.ids) {
+				if (const auto found = position.find(inst.words[offset]);
+				    found != position.end() && found->second != i) {
+					used_here[found->second] = true;
+				}
+			}
+		}
+		order.clear();
+		state.assign(count, 0);
+		const auto place = [&](size_t root) {
+			stack.clear();
+			stack.emplace_back(static_cast<uint32_t>(root), 0);
+			state[root] = 1;
+			while (!stack.empty()) {
+				auto&       top    = stack.back();
+				const auto& inst   = m.At(insts[top.first]);
+				bool        pushed = false;
+				if (inst.op != spv::OpPhi) {
+					while (top.second < inst.ids.size()) {
+						const auto id = inst.words[inst.ids[top.second++]];
+						if (const auto found = position.find(id);
+						    found != position.end() && state[found->second] == 0) {
+							state[found->second] = 1;
+							stack.emplace_back(found->second, 0);
+							pushed = true;
+							break;
+						}
+					}
+				}
+				if (!pushed) {
+					state[stack.back().first] = 2;
+					order.push_back(insts[stack.back().first]);
+					stack.pop_back();
+				}
+			}
+		};
+		for (size_t i = 0; i < tail; i++) {
+			if (state[i] == 0 && !(movable[i] && used_here[i])) {
+				place(i);
+			}
+		}
+		for (size_t i = 0; i < tail; i++) {
+			if (state[i] == 0) {
+				place(i); // a value only a phi of this block reads
+			}
+		}
+		for (size_t i = tail; i < count; i++) {
+			if (state[i] == 0) {
+				place(i);
+			}
+		}
+		if (order != insts) {
+			stats.sunk_blocks++;
+			block.insts = order;
+		}
+	}
+}
+
 void Append(std::vector<uint32_t>& out, const Inst& inst) {
 	out.insert(out.end(), inst.words.begin(), inst.words.end());
 }
@@ -797,7 +1485,22 @@ bool SimplifyForDriver(std::vector<uint32_t>& words, DriverSimplifyStats* stats)
 		}
 		ForwardPredicatedValues(module, function, local);
 	}
+	static const bool no_peephole = EnvSwitchOn("KYTY_NO_SPV_PEEPHOLE");
+	static const bool no_cse      = EnvSwitchOn("KYTY_NO_SPV_CSE");
+	if (!no_peephole || !no_cse) {
+		ValueSimplifier simplifier(module, !no_peephole, !no_cse, local);
+		for (auto& function: module.functions) {
+			simplifier.Run(function);
+		}
+		simplifier.RewriteAll();
+	}
 	RemoveUnused(module, local);
+	static const bool no_sink = EnvSwitchOn("KYTY_NO_SPV_SINK");
+	if (!no_sink) {
+		for (auto& function: module.functions) {
+			SinkToUses(module, function, local);
+		}
+	}
 	words = Serialize(module);
 	if (stats != nullptr) {
 		*stats = local;
