@@ -15,9 +15,11 @@
 #include <array>
 #include <bit>
 #include <deque>
+#include <functional>
 #include <list>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string_view>
 #include <unordered_map>
 #include <vector>
@@ -915,6 +917,14 @@ struct Program: ResourcePlan {
 	// Typed memory and export instructions reference shader-local metadata by dense index.
 	// Decoder-only details (such as NSA register numbers) have already become IR operands.
 	std::vector<ExportInfo> export_info;
+	// Set only for the duration of one translation, by a caller that can read guest memory: asks
+	// whether the materialization would refuse the recognised indirect buffer table `source`
+	// (an index into `sources`, the tracker's interned descriptor sources) against the memory as
+	// it is now. A refused table is decoded in the shader from this translation on, exactly as the
+	// unfoldable channel would have demoted it one translation later.
+	std::function<bool(const Program& program, std::span<const DescriptorSource> sources,
+	                   uint32_t source)>
+	                        refuse_indirect_buffer_table;
 	bool                    has_address_writes   = false;
 	bool                    shader_info_complete = false;
 	BindingLayout           bindings;

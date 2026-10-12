@@ -788,6 +788,21 @@ struct PipelineCache::ProgramCache {
 		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
 	}
 
+	// The materialization refused a descriptor it cannot resolve on the host, and the shader is
+	// translated again with that descriptor decoded in the shader. The draw that hit the refusal is
+	// served by the re-translation in the same call, so this is not a skip; ReportUnmaterialized
+	// still fires if the re-translation draws nothing. Its own dedupe set, so a later real skip of
+	// the same hash is not swallowed by this line.
+	void ReportRelearned(ShaderType stage, uint64_t hash, std::string_view reason, size_t pcs) {
+		if (!relearned_shaders.insert(hash).second) {
+			return;
+		}
+		PipelineCacheLog("shader re-translated with {} descriptor source(s) decoded in the shader: "
+		                 "hash=0x{:016x} stage={} host materialization refused: {}",
+		                 pcs, hash, StageShortName(stage),
+		                 reason.empty() ? std::string_view {"no recorded reason"} : reason);
+	}
+
 	// A hardware ray-tracing intersect lowered to a constant miss: the shader runs, but its
 	// traced results are fabricated. Report each distinct hash once so the log says so.
 	void ReportStubbed(ShaderType stage, uint64_t hash) {
@@ -891,6 +906,26 @@ struct PipelineCache::ProgramCache {
 		return program;
 	}
 
+	// A materialization failed. When it named sources the channel had not proved yet, the shader
+	// is re-translated with them decoded in the shader and this draw is served by that; otherwise
+	// the draw is dropped and the next one tries again.
+	template <typename InputInfo>
+	ShaderProgram Unmaterialized(const ShaderParams& params, InputInfo& input_info,
+	                             uint32_t& push_data_cursor, ShaderType stage, uint64_t code_size,
+	                             uint64_t code_key, std::span<const uint32_t> reported) {
+		const std::string reason(ShaderRecompiler::IR::LastMaterializeFailure());
+		if (!unfoldable.Learn(code_size, code_key, reported)) {
+			ReportUnmaterialized(stage, params.hash);
+			return {};
+		}
+		ReportRelearned(stage, params.hash, reason, reported.size());
+		auto program = Relearned(params, input_info, push_data_cursor);
+		if (!program) {
+			ReportUnmaterialized(stage, params.hash);
+		}
+		return program;
+	}
+
 	template <typename InputInfo>
 	ShaderProgram Get(const ShaderParams& params, InputInfo& input_info,
 	                  uint32_t& push_data_cursor) {
@@ -964,11 +999,8 @@ struct PipelineCache::ProgramCache {
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, recorded, entry->second.resources,
 			        entry->second.specialization, &reported_unfoldable)) {
-				ReportUnmaterialized(stage, params.hash);
-				if (unfoldable.Learn(code_size, key(), reported_unfoldable)) {
-					return Relearned(params, input_info, push_data_cursor);
-				}
-				return {};
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      reported_unfoldable);
 			}
 			if (entry->second.memo_recording) {
 				memo.Commit(entry->second.resource_plan, entry->second.resources,
@@ -1084,7 +1116,21 @@ struct PipelineCache::ProgramCache {
 			}
 		}
 		DumpShaderOriginal(stage_name, options.shader_hash, params.code);
+		// Tracking asks the guest memory of this dispatch whether a recognised descriptor table
+		// would be refused, so such a table is decoded in the shader by this one translation
+		// instead of being refused by the materialization below and translated a second time.
+		static const bool no_table_check = EnvSwitch("KYTY_NO_FIRST_DISPATCH_TABLE_CHECK");
+		if (!no_table_check) {
+			options.refuse_indirect_buffer_table =
+			    [&runtime](const ShaderRecompiler::IR::Program&                    program,
+			               std::span<const ShaderRecompiler::IR::DescriptorSource> sources,
+			               uint32_t                                                source) {
+				    return ShaderRecompiler::IR::IndirectBufferTableRefused(program, sources,
+				                                                            source, runtime);
+			    };
+		}
 		auto translated = ShaderRecompiler::TranslateProgram(params.code, options);
+		options.refuse_indirect_buffer_table = nullptr;
 		// A rejected recompile leaves no usable program: a CFG-build rejection returns an empty
 		// one, and resource tracking rewrites the program in place so a rejected pass leaves it
 		// half-written - extracting a plan from that indexes past the end of a resource list.
@@ -1111,11 +1157,8 @@ struct PipelineCache::ProgramCache {
 			if (!ShaderRecompiler::IR::MaterializeResources(
 			        entry->second.resource_plan, runtime, entry->second.resources,
 			        entry->second.specialization, &reported_unfoldable)) {
-				ReportUnmaterialized(stage, params.hash);
-				if (unfoldable.Learn(code_size, key(), reported_unfoldable)) {
-					return Relearned(params, input_info, push_data_cursor);
-				}
-				return {};
+				return Unmaterialized(params, input_info, push_data_cursor, stage, code_size, key(),
+				                      reported_unfoldable);
 			}
 		}
 		// Whether this permutation exists only because the unfoldable channel asked for it. Read
@@ -1273,6 +1316,7 @@ struct PipelineCache::ProgramCache {
 	std::unordered_set<uint64_t> reported_shaders;
 	std::unordered_set<uint64_t> stubbed_shaders;
 	std::unordered_set<uint64_t> call_stubbed_shaders;
+	std::unordered_set<uint64_t> relearned_shaders;
 	ProgramKey                   lookup_key;
 	// A vertex or pixel stage has no workgroup input to carry the host subgroup width, and the
 	// translator needs it to know whether a wave64 guest mask has an upper half at all.

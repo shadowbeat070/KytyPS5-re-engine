@@ -2527,8 +2527,56 @@ static std::vector<SrtReadWriteOrder> OrderSrtReadsAgainstWrites(const Program& 
 	return order;
 }
 
-ResourcePlan ExtractResourcePlan(const Program& program) {
-	ResourcePlan plan;
+namespace {
+
+// Copies a value graph out of a translated program into a plan that owns it. Shared by the plan
+// extraction and the table check, so the check evaluates exactly what the materialization will.
+class PlanValueCloner {
+public:
+	PlanValueCloner(const Program& program, ResourcePlan& plan): m_program(program), m_plan(plan) {}
+
+	Value operator()(Value value) {
+		value              = value.Resolve();
+		const auto* source = value.TryInstruction();
+		if (source == nullptr) {
+			return value;
+		}
+		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
+		    ValidateRuntimeValue(m_program, source->Arg(0))) {
+			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
+			return (*this)(source->Arg(0));
+		}
+		if (source->GetOpcode() == ValueOpcode::Phi) {
+			const auto invariant = ResolveInvariantPhi(m_program, value);
+			if (!invariant.IsEmpty() && invariant != value) {
+				return (*this)(invariant);
+			}
+		}
+		if (const auto found = m_cloned.find(source); found != m_cloned.end()) {
+			return Value(found->second);
+		}
+		auto& target =
+		    m_plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
+		m_cloned.emplace(source, &target);
+		if (source->GetOpcode() == ValueOpcode::Phi) {
+			for (size_t index = 0; index < source->NumArgs(); index++) {
+				target.AddPhiOperand(nullptr, (*this)(source->Arg(index)));
+			}
+		} else {
+			for (size_t index = 0; index < source->NumArgs(); index++) {
+				target.SetArg(index, (*this)(source->Arg(index)));
+			}
+		}
+		return Value(&target);
+	}
+
+private:
+	const Program&                         m_program;
+	ResourcePlan&                          m_plan;
+	std::unordered_map<const Inst*, Inst*> m_cloned;
+};
+
+void CopyPlanHeader(const Program& program, ResourcePlan& plan) {
 	plan.stage                      = program.stage;
 	plan.shader_hash                = program.shader_hash;
 	plan.user_data_base             = program.user_data_base;
@@ -2539,42 +2587,47 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 	plan.srt_plan_complete          = program.srt_plan_complete;
 	plan.resource_tracking_complete = program.resource_tracking_complete;
 	plan.frozen_values              = true;
+}
 
-	std::unordered_map<const Inst*, Inst*> cloned;
-	std::function<Value(Value)>            Clone = [&](Value value) -> Value {
-		value              = value.Resolve();
-		const auto* source = value.TryInstruction();
-		if (source == nullptr) {
-			return value;
-		}
-		if (source->GetOpcode() == ValueOpcode::ReadFirstLane &&
-		    ValidateRuntimeValue(program, source->Arg(0))) {
-			// Uniform values need no new EXEC context; preserve their shared evaluation memo.
-			return Clone(source->Arg(0));
-		}
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			const auto invariant = ResolveInvariantPhi(program, value);
-			if (!invariant.IsEmpty() && invariant != value) {
-				return Clone(invariant);
-			}
-		}
-		if (const auto found = cloned.find(source); found != cloned.end()) {
-			return Value(found->second);
-		}
-		auto& target =
-		    plan.value_storage.emplace_back(source->GetOpcode(), source->Flags<uint64_t>());
-		cloned.emplace(source, &target);
-		if (source->GetOpcode() == ValueOpcode::Phi) {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.AddPhiOperand(nullptr, Clone(source->Arg(index)));
-			}
-		} else {
-			for (size_t index = 0; index < source->NumArgs(); index++) {
-				target.SetArg(index, Clone(source->Arg(index)));
-			}
-		}
-		return Value(&target);
-	};
+} // namespace
+
+bool IndirectBufferTableRefused(const Program& program, std::span<const DescriptorSource> sources,
+                                uint32_t table_source, const SrtRuntime& runtime) {
+	KYTY_PROFILER_FUNCTION();
+	if (table_source >= sources.size() || !sources[table_source].indirect_buffer.has_value() ||
+	    runtime.read_specialization_memory == nullptr) {
+		return false;
+	}
+	const auto& indirect = *sources[table_source].indirect_buffer;
+	if (indirect.heap_source >= sources.size()) {
+		return false;
+	}
+	const auto&  heap = sources[indirect.heap_source];
+	ResourcePlan plan;
+	CopyPlanHeader(program, plan);
+	PlanValueCloner clone(program, plan);
+	auto&           target = plan.descriptor_sources.emplace_back();
+	target.dword_count     = heap.dword_count;
+	for (uint32_t dword = 0; dword < heap.dword_count; dword++) {
+		target.dwords[dword] = clone(heap.dwords[dword]);
+	}
+	DescriptorValue heap_value;
+	SrtWalker       clean(plan, CleanRuntime(runtime));
+	if (!clean.EvaluateDescriptor(0, heap_value)) {
+		return false;
+	}
+	std::shared_ptr<const IndirectBuffer> result;
+	bool                                  refused = false;
+	MaterializeIndirectBuffer(indirect, heap_value, runtime, program.shader_hash, result, refused);
+	return refused;
+}
+
+ResourcePlan ExtractResourcePlan(const Program& program) {
+	ResourcePlan plan;
+	CopyPlanHeader(program, plan);
+
+	PlanValueCloner cloner(program, plan);
+	const auto      Clone = [&](Value value) { return cloner(value); };
 
 	plan.descriptor_sources.reserve(program.descriptor_sources.size());
 	for (const auto& source: program.descriptor_sources) {

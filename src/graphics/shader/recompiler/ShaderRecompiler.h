@@ -7,6 +7,7 @@
 #include "graphics/shader/recompiler/ir/passes/ResourceTracking.h"
 #include "graphics/shader/shader.h"
 
+#include <functional>
 #include <span>
 #include <string>
 #include <vector>
@@ -32,6 +33,11 @@ struct CompileOptions {
 	// cannot re-evaluate. Empty on the first translate of a shader; the caller grows it when a
 	// draw reports a degrade and re-translates once. See ResourcePlan::unfoldable_pcs.
 	std::span<const uint32_t>   unfoldable_pcs;
+	// See Program::refuse_indirect_buffer_table. Read by resource tracking only, and dropped
+	// before TranslateProgram returns, so it may capture state that lives only for this call.
+	std::function<bool(const IR::Program& program, std::span<const IR::DescriptorSource> sources,
+	                   uint32_t source)>
+	    refuse_indirect_buffer_table;
 };
 
 // Why a guest shader could not be recompiled: a CFG-build or resource-tracking rejection that

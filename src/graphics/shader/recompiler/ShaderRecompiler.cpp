@@ -1362,7 +1362,9 @@ TranslateResult TranslateProgram(std::span<const uint32_t> code, const CompileOp
 	// is the only pass that reads it: it is what lets a recognizer drop the guards that exist
 	// solely to avoid moving a descriptor that still resolves.
 	ir.unfoldable_pcs.assign(options.unfoldable_pcs.begin(), options.unfoldable_pcs.end());
-	auto            tracking = IR::TrackResources(ir, decoded, native_cfg);
+	ir.refuse_indirect_buffer_table = options.refuse_indirect_buffer_table;
+	auto tracking                   = IR::TrackResources(ir, decoded, native_cfg);
+	ir.refuse_indirect_buffer_table = nullptr;
 	TranslateResult result;
 	if (!tracking.ok) {
 		LOGF("%s resource tracking rejected: stage=%s hash=0x%016" PRIx64 " pc=0x%08" PRIx32
