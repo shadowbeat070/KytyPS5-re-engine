@@ -480,15 +480,17 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 // threads queue whose idle workgroups spin until the last worker signs off. A worker that leaves
 // after a BDA miss never signs off, so its loop must not take the BDA exit. The body runs from the
 // header up to the merge block in structured order; without a merge after the header, assume one.
-bool LoopHasAtomics(const IR::Program& program, size_t header_index) {
+size_t LoopEnd(const IR::Program& program, size_t header_index) {
 	const auto merge_id = program.block_info[header_index].terminator.merge_block;
 	const auto merge    = std::ranges::find_if(
 	    program.block_info, [&](const IR::BlockInfo& other) { return other.id == merge_id; });
-	if (merge == program.block_info.end()) {
-		return true;
-	}
 	const auto end = static_cast<size_t>(merge - program.block_info.begin());
-	if (end <= header_index) {
+	return merge != program.block_info.end() && end > header_index ? end : 0;
+}
+
+bool LoopHasAtomics(const IR::Program& program, size_t header_index) {
+	const auto end = LoopEnd(program, header_index);
+	if (end == 0) {
 		return true;
 	}
 	for (size_t index = header_index; index < end && index < program.blocks.size(); index++) {
@@ -501,6 +503,21 @@ bool LoopHasAtomics(const IR::Program& program, size_t header_index) {
 			    shared == IR::SharedAccess::Consume) {
 				return true;
 			}
+		}
+	}
+	return false;
+}
+
+// The exit returns from the whole invocation, so it also skips every loop around this one.
+bool LoopNestHasAtomics(const IR::Program& program, size_t header_index) {
+	for (size_t index = 0; index <= header_index; index++) {
+		if (!program.block_info[index].terminator.loop_header) {
+			continue;
+		}
+		const auto end      = LoopEnd(program, index);
+		const bool encloses = index == header_index || (end != 0 && header_index < end);
+		if (encloses && LoopHasAtomics(program, index)) {
+			return true;
 		}
 	}
 	return false;
@@ -548,7 +565,7 @@ std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 			      found->terminator.true_block == info.terminator.merge_block));
 			if (foldable && ctx.state.loop_budget_latch.emplace(latch, info.id).second) {
 				ctx.state.loop_budget_guarded++;
-				if (LoopHasAtomics(program, index)) {
+				if (LoopNestHasAtomics(program, index)) {
 					ctx.state.loop_bda_exit_exempt.insert(latch);
 				}
 			} else if (!foldable) {
@@ -571,7 +588,7 @@ std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 		}
 		if (sites.insert(body).second) {
 			ctx.state.loop_budget_guarded++;
-			if (LoopHasAtomics(program, index)) {
+			if (LoopNestHasAtomics(program, index)) {
 				ctx.state.loop_bda_exit_exempt.insert(body);
 			}
 		}
