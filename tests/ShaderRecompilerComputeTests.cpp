@@ -46747,7 +46747,8 @@ void CheckPs5GameExampleImageClearRuntimeShape() {
   std::printf("[host]    %-32s ok\n", "Ps5GameExampleImageClear");
 }
 
-void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
+void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride,
+                              bool branched = false) {
   using namespace ShaderRecompiler;
   const bool multiplied_stride = hs_stride == 112;
   const u32 local_address = multiplied_stride ? 18 : 21;
@@ -46775,6 +46776,15 @@ void CheckTessellationProgram(const char *name, u32 ls_stride, u32 hs_stride) {
              InlineU32(5));
   AppendVop3(&control, 0x148, relative_patch, Vgpr(1), InlineU32(0),
              InlineU32(8));
+  if (branched) {
+    // A uniform branch joins a path that defines an unrelated VGPR, and a jump
+    // skips dead code that would clobber the control point index.
+    control.push_back(EncodeSopc(0x06, 0, InlineU32(0)));
+    control.push_back(EncodeSopp(0x05, 1));
+    control.push_back(EncodeVop1(0x01, 40, Vgpr(0)));
+    control.push_back(EncodeSopp(0x02, 1));
+    control.push_back(EncodeVop1(0x01, control_point, InlineU32(0)));
+  }
   if (multiplied_stride) {
     // The later patch writes 112-byte outputs but reads 108-byte LS records.
     // The second multiply overwrites packed v1; only memory consumers identify
@@ -47005,6 +47015,7 @@ void CheckTessellationPrograms() {
   CheckSingleControlPointTessellation();
   CheckTessellationProgram("TessellationShiftedStride", 124, 128);
   CheckTessellationProgram("TessellationMultipliedStride", 108, 112);
+  CheckTessellationProgram("TessellationBranchedStride", 124, 128, true);
 }
 
 void CheckEmbeddedFetchVertexOffset() {
