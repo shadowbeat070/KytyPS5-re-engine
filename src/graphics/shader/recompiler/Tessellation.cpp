@@ -193,14 +193,30 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 		           ? ActiveAddress(block, before, source->Arg(1), predicate, resolved)
 		           : value;
 	}
-	if (source->GetOpcode() != ValueOpcode::IAdd32 && source->GetOpcode() != ValueOpcode::ISub32)
-		return value;
-	const auto lhs = ActiveAddress(block, before, source->Arg(0), predicate, resolved);
-	const auto rhs = ActiveAddress(block, before, source->Arg(1), predicate, resolved);
-	if (lhs != source->Arg(0).Resolve() || rhs != source->Arg(1).Resolve()) {
-		auto copy = block.PrependNewInst(before, source->GetOpcode(), {lhs, rhs},
-		                                 source->Flags<uint64_t>());
-		value     = Value(&*copy);
+	switch (source->GetOpcode()) {
+		case ValueOpcode::IAdd32:
+		case ValueOpcode::ISub32:
+		case ValueOpcode::IMul32:
+		case ValueOpcode::ShiftLeftLogical32:
+		case ValueOpcode::BitwiseAnd32:
+		case ValueOpcode::BitwiseOr32:
+		case ValueOpcode::BitFieldUExtract: break;
+		default: return value;
+	}
+	std::array<Value, 3> args {};
+	bool                 changed = false;
+	for (size_t index = 0; index < source->NumArgs(); index++) {
+		args[index] = ActiveAddress(block, before, source->Arg(index), predicate, resolved);
+		changed     = changed || args[index] != source->Arg(index).Resolve();
+	}
+	if (changed) {
+		auto copy =
+		    source->NumArgs() == 3u
+		        ? block.PrependNewInst(before, source->GetOpcode(), {args[0], args[1], args[2]},
+		                               source->Flags<uint64_t>())
+		        : block.PrependNewInst(before, source->GetOpcode(), {args[0], args[1]},
+		                               source->Flags<uint64_t>());
+		value = Value(&*copy);
 	}
 	resolved.emplace(source, value);
 	return value;
