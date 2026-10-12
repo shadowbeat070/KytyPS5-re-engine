@@ -24,7 +24,8 @@ struct TessellationAddress {
 };
 
 uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
-                                   uint32_t control_points, uint32_t input_stride) {
+                                   uint32_t control_points, uint32_t input_stride,
+                                   bool patch_ordinal = false) {
 	using namespace Decoder;
 	using Address = TessellationAddress;
 	using Kind    = Address::Kind;
@@ -45,7 +46,8 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		}
 		// The native packed HS ID's low byte is the patch ordinal. The logical
 		// interface addresses one patch, as in the frontend's v1 initialization.
-		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u) return constant(0u);
+		if (value.kind == Kind::PackedControlPoint && operand.sdwa_sel == 0u)
+			return patch_ordinal ? Address {Kind::Affine, 1u, 0u} : constant(0u);
 		return operand.sdwa_sel == 6u ? value : Address {};
 	};
 	const auto affine = [](uint64_t coefficient, uint64_t offset) {
@@ -86,7 +88,9 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		EXIT_NOT_IMPLEMENTED(IsDirectBranch(inst.opcode) &&
 		                     inst.branch_target != program.instructions.back().pc);
 		const bool local_store =
-		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32;
+		    inst.opcode == Opcode::DS_WRITE_B32 || inst.opcode == Opcode::DS_WRITE2_B32 ||
+		    inst.opcode == Opcode::DS_WRITE_B64 || inst.opcode == Opcode::DS_WRITE2_B64 ||
+		    inst.opcode == Opcode::DS_WRITE_B96 || inst.opcode == Opcode::DS_WRITE_B128;
 		const bool buffer_store = inst.opcode == Opcode::BUFFER_STORE_DWORD ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX2 ||
 		                          inst.opcode == Opcode::BUFFER_STORE_DWORDX3 ||
@@ -94,8 +98,14 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 		const bool control_store =
 		    !local && buffer_store && inst.src2.kind == OperandKind::Sgpr && inst.src2.reg == 2u;
 		const bool control_read =
-		    !local && (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32);
-		if ((local && local_store) || control_store || control_read) {
+		    !local && !patch_ordinal &&
+		    (inst.opcode == Opcode::DS_READ_B32 || inst.opcode == Opcode::DS_READ2_B32 ||
+		     inst.opcode == Opcode::DS_READ_B64 || inst.opcode == Opcode::DS_READ2_B64 ||
+		     inst.opcode == Opcode::DS_READ_B96 || inst.opcode == Opcode::DS_READ_B128);
+		// The patch-constant region is not affine in the patch ordinal.
+		const bool patch_constant =
+		    patch_ordinal && control_store && read(inst.src0).kind != Kind::Affine;
+		if (((local && local_store) || control_store || control_read) && !patch_constant) {
 			const auto address = read(inst.src0);
 			if (address.kind != Kind::Affine) {
 				EXIT("%s tessellation address is not affine at pc 0x%08x\n", local ? "LS" : "HS",
@@ -119,10 +129,12 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 				if (lhs.kind == Kind::PackedControlPoint && rhs.kind == Kind::Affine &&
 				    rhs.coefficient == 0u && third.kind == Kind::Affine &&
 				    third.coefficient == 0u) {
-					if (rhs.constant == 8u && third.constant == 5u) value = {Kind::Affine, 1u, 0u};
+					if (rhs.constant == 8u && third.constant == 5u)
+						value = patch_ordinal ? constant(0u) : Address {Kind::Affine, 1u, 0u};
 					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 				}
 				break;
+			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
 			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
 			case Opcode::V_LSHL_ADD_U32:
@@ -148,6 +160,14 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 			registers[inst.dst.reg + index] = {};
 		}
 		registers.at(inst.dst.reg) = value;
+	}
+	if (patch_ordinal) {
+		EXIT_NOT_IMPLEMENTED(stride == 0u || stride % control_points != 0u);
+		return stride / control_points;
+	}
+	// With one output control point the compiler may never extract its index; use the patch.
+	if (stride == 0u && !local && control_points == 1u) {
+		return ReflectTessellationStride(program, false, control_points, input_stride, true);
 	}
 	EXIT_NOT_IMPLEMENTED(stride == 0u);
 	return stride;
