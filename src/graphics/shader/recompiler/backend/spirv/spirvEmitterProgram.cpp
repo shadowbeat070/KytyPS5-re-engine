@@ -161,9 +161,10 @@ void ReportLoopBudget(const EmitterState& state) {
 	std::fflush(stdout);
 }
 
-// Returns "this invocation may keep looping": under budget and no BDA miss in its wave so far.
-// A wave leaves together: a lane that returns alone stays set in the guest's SGPR lane masks.
-uint32_t ChargeLoopBudget(EmitterState& state) {
+// Returns "this invocation may keep looping": under budget and, unless `bda_exit` is false, no BDA
+// miss in its wave so far, or 0 when there is nothing to check. A wave leaves together: a lane that
+// returns alone stays set in the guest's SGPR lane masks.
+uint32_t ChargeLoopBudget(EmitterState& state, bool bda_exit) {
 	uint32_t allowed = 0;
 	if (state.loop_budget_variable != 0) {
 		const auto before = state.builder.AllocateId();
@@ -176,7 +177,7 @@ uint32_t ChargeLoopBudget(EmitterState& state) {
 		state.builder.AddFunction(spv::OpULessThan, TypeBool(state), allowed, after,
 		                          ConstantU32(state, state.loop_budget_limit));
 	}
-	if (state.bda_miss_variable != 0) {
+	if (state.bda_miss_variable != 0 && bda_exit) {
 		const auto missed      = state.builder.AllocateId();
 		const auto wave_missed = state.builder.AllocateId();
 		const auto served      = state.builder.AllocateId();
@@ -241,9 +242,12 @@ void EmitStructuredTerminator(ValueEmitContext& ctx, const IR::Block* block,
 			}
 			auto       condition = ctx.Def(info.condition);
 			const auto latch     = ctx.state.loop_budget_latch.find(block);
-			if (latch != ctx.state.loop_budget_latch.end()) {
-				const auto allowed = ChargeLoopBudget(ctx.state);
-				const auto folded  = ctx.state.builder.AllocateId();
+			const auto allowed =
+			    latch != ctx.state.loop_budget_latch.end()
+			        ? ChargeLoopBudget(ctx.state, !ctx.state.loop_bda_exit_exempt.contains(block))
+			        : 0u;
+			if (allowed != 0) {
+				const auto folded = ctx.state.builder.AllocateId();
 				if (term.true_block == latch->second) {
 					// Back edge on the true arm: stay in the loop only while under budget.
 					ctx.state.builder.AddFunction(spv::OpLogicalAnd, TypeBool(ctx.state), folded,
@@ -472,6 +476,36 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 	}
 }
 
+// A loop with an atomic in it may be how invocations hand work to each other, like a persistent-
+// threads queue whose idle workgroups spin until the last worker signs off. A worker that leaves
+// after a BDA miss never signs off, so its loop must not take the BDA exit. The body runs from the
+// header up to the merge block in structured order; without a merge after the header, assume one.
+bool LoopHasAtomics(const IR::Program& program, size_t header_index) {
+	const auto merge_id = program.block_info[header_index].terminator.merge_block;
+	const auto merge    = std::ranges::find_if(
+	    program.block_info, [&](const IR::BlockInfo& other) { return other.id == merge_id; });
+	if (merge == program.block_info.end()) {
+		return true;
+	}
+	const auto end = static_cast<size_t>(merge - program.block_info.begin());
+	if (end <= header_index) {
+		return true;
+	}
+	for (size_t index = header_index; index < end && index < program.blocks.size(); index++) {
+		for (const auto& inst: *program.blocks[index]) {
+			const auto op     = inst.GetOpcode();
+			const auto shared = IR::SharedAccessOf(op);
+			if (IR::BufferAccessOf(op) == IR::BufferAccess::Atomic ||
+			    IR::ImageOpcodeInfoOf(op).access == IR::ImageAccess::Atomic ||
+			    shared == IR::SharedAccess::Atomic || shared == IR::SharedAccess::Append ||
+			    shared == IR::SharedAccess::Consume) {
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 // Where the budget is charged: not the loop header, the block the header branches into. A header
 // may only reach the body or the loop merge, and re-pointing either arm produces a module
 // spirv-val rejects. The body block is entered once per iteration, a structured selection inside
@@ -514,6 +548,9 @@ std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 			      found->terminator.true_block == info.terminator.merge_block));
 			if (foldable && ctx.state.loop_budget_latch.emplace(latch, info.id).second) {
 				ctx.state.loop_budget_guarded++;
+				if (LoopHasAtomics(program, index)) {
+					ctx.state.loop_bda_exit_exempt.insert(latch);
+				}
 			} else if (!foldable) {
 				ctx.state.loop_budget_unguardable++;
 			}
@@ -534,13 +571,20 @@ std::unordered_set<const IR::Block*> LoopChargeSites(ValueEmitContext& ctx) {
 		}
 		if (sites.insert(body).second) {
 			ctx.state.loop_budget_guarded++;
+			if (LoopHasAtomics(program, index)) {
+				ctx.state.loop_bda_exit_exempt.insert(body);
+			}
 		}
 	}
 	return sites;
 }
 
-void EmitLoopCharge(ValueEmitContext& ctx) {
-	const auto allowed = ChargeLoopBudget(ctx.state);
+void EmitLoopCharge(ValueEmitContext& ctx, const IR::Block* site) {
+	const auto allowed =
+	    ChargeLoopBudget(ctx.state, !ctx.state.loop_bda_exit_exempt.contains(site));
+	if (allowed == 0) {
+		return;
+	}
 	const auto abort   = ctx.state.builder.AllocateId();
 	const auto rest    = ctx.state.builder.AllocateId();
 	ctx.state.builder.AddFunction(spv::OpSelectionMerge, rest, spv::SelectionControlMaskNone);
@@ -564,7 +608,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			return;
 		}
 		if (charge_sites.contains(block)) {
-			EmitLoopCharge(ctx);
+			EmitLoopCharge(ctx, block);
 		}
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block, program.block_info[index]);
