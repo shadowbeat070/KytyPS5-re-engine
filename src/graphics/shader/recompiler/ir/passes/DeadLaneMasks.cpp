@@ -504,15 +504,24 @@ using Demand     = std::vector<DemandTerm>;
 constexpr size_t MaxDemandTerms     = 16;
 constexpr size_t MaxDemandConjuncts = 4;
 
-void Normalize(Demand& demand) {
+// Ordered by program position, never by address: the caps keep whichever conjuncts sort first, and
+// an address order changes the emitted SPIR-V from run to run, which defeats the pipeline cache.
+void Normalize(Demand& demand, const std::unordered_map<const Inst*, uint32_t>& position) {
+	const auto at = [&](const Inst* inst) {
+		const auto found = position.find(inst);
+		return found != position.end() ? found->second : UINT32_MAX;
+	};
+	const auto before = [&](const Inst* a, const Inst* b) { return at(a) < at(b); };
 	for (auto& term: demand) {
-		std::ranges::sort(term);
+		std::ranges::sort(term, before);
 		term.erase(std::unique(term.begin(), term.end()), term.end());
 		if (term.size() > MaxDemandConjuncts) {
 			term.resize(MaxDemandConjuncts);
 		}
 	}
-	std::ranges::sort(demand);
+	std::ranges::sort(demand, [&](const DemandTerm& a, const DemandTerm& b) {
+		return std::ranges::lexicographical_compare(a, b, before);
+	});
 	demand.erase(std::unique(demand.begin(), demand.end()), demand.end());
 	const bool every_lane = std::ranges::any_of(demand, [](const auto& t) { return t.empty(); });
 	if (every_lane || demand.size() > MaxDemandTerms) {
@@ -537,9 +546,11 @@ uint32_t EliminateUndemandedWriteMasks(Program& program) {
 	if (program.stage != ShaderType::Compute || !LaneDemandMasksEnabled()) {
 		return 0;
 	}
-	std::vector<const Inst*> insts;
+	std::vector<const Inst*>                  insts;
+	std::unordered_map<const Inst*, uint32_t> position;
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
+			position.emplace(&inst, static_cast<uint32_t>(insts.size()));
 			insts.push_back(&inst);
 		}
 	}
@@ -634,7 +645,7 @@ uint32_t EliminateUndemandedWriteMasks(Program& program) {
 		auto& current = demand[inst];
 		// Join with what is already known, so capping cannot make the iteration oscillate.
 		next.insert(next.end(), current.begin(), current.end());
-		Normalize(next);
+		Normalize(next, position);
 		if (next == current) {
 			continue;
 		}
