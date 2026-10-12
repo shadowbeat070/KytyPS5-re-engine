@@ -611,7 +611,9 @@ void BindlessImageHeap::ResetElements() {
 		heap.stale = true;
 		heap.full  = true;
 	}
-	m_set_dirty = true;
+	// Arena words name old slots; a heap whose rescan fails keeps them, so always rebuild.
+	m_arena_dirty = true;
+	m_set_dirty   = true;
 }
 
 void BindlessImageHeap::Prepare(const ShaderRecompiler::IR::BindlessImageTable& table) {
