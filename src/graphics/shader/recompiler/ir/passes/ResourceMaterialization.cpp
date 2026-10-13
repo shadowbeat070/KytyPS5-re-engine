@@ -100,6 +100,20 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+bool IsImageDimension2D(Decoder::ImageDimension dimension) {
+	return dimension == Decoder::ImageDimension::Dim2D ||
+	       dimension == Decoder::ImageDimension::Dim2DArray;
+}
+
+// Whether an enumerated heap record can be the image an access of this dimension reads. A broad
+// heap also holds the views of other typed operations; the 2D family shares one table through
+// its shape arms.
+bool ServesImageCoordinates(const DescriptorValue& descriptor, Decoder::ImageDimension requested) {
+	const auto dimension = DescriptorDimension(descriptor, requested);
+	return dimension == requested ||
+	       (IsImageDimension2D(dimension) && IsImageDimension2D(requested));
+}
+
 bool ValidImageDescriptor(const DescriptorValue& descriptor, bool r128 = false) {
 	const auto& words = descriptor.dwords;
 	// Reject texture descriptors with nonzero reserved bits.
@@ -954,7 +968,8 @@ bool EnumerateIndirectImage(const ResourcePlan&                         program,
 			return Refuse(IndirectImageFailure::Stage::HeapRecordUnreadable);
 		}
 		if (NullImageDescriptor(candidate) ||
-		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128)) {
+		    !ValidImageDescriptor(candidate, program.info.images[image_index].r128) ||
+		    !ServesImageCoordinates(candidate, program.info.images[image_index].dimension)) {
 			candidate.dwords.fill(0);
 		}
 		// A key the host failed to enumerate resolves to ordinal 0: the search starts there and
@@ -1991,10 +2006,6 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			return SpecializationFail("indirect image specialization has no typed candidate");
 		}
 		const auto& image_class = specialization.images[exemplar];
-		const auto  is_2d       = [](Decoder::ImageDimension dimension) {
-			return dimension == Decoder::ImageDimension::Dim2D ||
-			       dimension == Decoder::ImageDimension::Dim2DArray;
-		};
 		for (uint32_t candidate = 0; candidate < specialization.images.size(); candidate++) {
 			auto& image = specialization.images[candidate];
 			if (image.indirect_root != root_index) {
@@ -2012,14 +2023,34 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 			}
 			const bool same_coordinates =
 			    image.dimension == image_class.dimension && image.cube == image_class.cube;
-			if (image.numeric_class != image_class.numeric_class ||
-			    (!same_coordinates && !(is_2d(image.dimension) && is_2d(image_class.dimension))) ||
-			    image.mip_count != image_class.mip_count ||
-			    image.conversion_format != image_class.conversion_format ||
-			    image.shader_swizzle != image_class.shader_swizzle) {
-				return SpecializationFail(
-				    fmt::format("indirect image table at pc 0x{:08x} has incompatible candidates",
-				                program.info.images[root_index].first_use_pc));
+			const auto mismatch = [&](std::string_view property, uint32_t value,
+			                          uint32_t expected) {
+				return SpecializationFail(fmt::format(
+				    "indirect image table at pc 0x{:08x} has incompatible candidates: {} {} vs {}",
+				    program.info.images[root_index].first_use_pc, property, value, expected));
+			};
+			if (image.numeric_class != image_class.numeric_class) {
+				return mismatch("numeric class", static_cast<uint32_t>(image.numeric_class),
+				                static_cast<uint32_t>(image_class.numeric_class));
+			}
+			if (!same_coordinates && !(IsImageDimension2D(image.dimension) &&
+			                           IsImageDimension2D(image_class.dimension))) {
+				return mismatch("dimension",
+				                static_cast<uint32_t>(image.dimension) * 2u +
+				                    (image.cube ? 1u : 0u),
+				                static_cast<uint32_t>(image_class.dimension) * 2u +
+				                    (image_class.cube ? 1u : 0u));
+			}
+			if (image.mip_count != image_class.mip_count) {
+				return mismatch("mip count", image.mip_count, image_class.mip_count);
+			}
+			if (image.conversion_format != image_class.conversion_format) {
+				return mismatch("conversion format", static_cast<uint32_t>(image.conversion_format),
+				                static_cast<uint32_t>(image_class.conversion_format));
+			}
+			if (image.shader_swizzle != image_class.shader_swizzle) {
+				return mismatch("shader swizzle", static_cast<uint32_t>(image.shader_swizzle),
+				                static_cast<uint32_t>(image_class.shader_swizzle));
 			}
 		}
 	}
@@ -2659,11 +2690,11 @@ ResourcePlan ExtractResourcePlan(const Program& program) {
 		plan.srt_reads.push_back({Clone(read.value), read.flat_offset});
 	}
 	plan.data_flat_slots = program.data_flat_slots;
-	plan.srt_read_order = OrderSrtReadsAgainstWrites(program);
+	plan.srt_read_order  = OrderSrtReadsAgainstWrites(program);
 	// A proven uniform factor can decide a branch even when its other lanes are unknown.
 	// Keep only that Boolean structure, never the varying shader dependency graph.
-	CyclicPhiEntryCache                   cyclic_entries {.program = &program};
-	std::unordered_map<const Inst*, bool> validated;
+	CyclicPhiEntryCache                    cyclic_entries {.program = &program};
+	std::unordered_map<const Inst*, bool>  validated;
 	Value                                  unknown;
 	bool                                   capture_control_reads = false;
 	std::unordered_map<const Inst*, Value> predicates;
@@ -2869,8 +2900,9 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 		MaterializeFailure() = "plan incomplete";
 		return false;
 	}
-	const bool capture_reads = program.capture_specialization_reads || !program.source_reads.empty();
-	auto&      reads         = snapshot.specialization_reads;
+	const bool capture_reads =
+	    program.capture_specialization_reads || !program.source_reads.empty();
+	auto& reads = snapshot.specialization_reads;
 	// Ranges read while linking the shader's code are revalidated like any captured read.
 	reads = program.source_reads;
 	snapshot.specialization_read_slots.assign(reads.size(), UINT32_MAX);

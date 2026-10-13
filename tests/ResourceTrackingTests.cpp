@@ -878,6 +878,23 @@ void TestInvariantIndirectImageMaterialization() {
   Check(!MaterializeResources(resource_plan, runtime, mixed_snapshot,
                               mixed_specialization),
         "indirect images with different numeric classes were accepted");
+  // A heap also holds the views of other typed operations. A 3D record cannot be what this 2D
+  // sample reads, so its key reads null instead of refusing the whole table.
+  for (const auto dword : {1u, 2u, 3u, 4u}) {
+    memory.words[second_image + dword] = image_descriptor[dword];
+  }
+  memory.words[second_image + 3u] =
+      Libs::Graphics::DstSel(4, 5, 6, 7) |
+      (static_cast<uint32_t>(Libs::Graphics::Prospero::ImageType::kColor3D) << 28u);
+  const auto holds = [&](const auto &images, const uint32_t *words) {
+    return std::ranges::any_of(images, [&](const auto &image) {
+      return std::equal(image.dwords.begin(), image.dwords.end(), words);
+    });
+  };
+  Check(MaterializeResources(resource_plan, runtime, mixed_snapshot, mixed_specialization) &&
+            holds(mixed_snapshot.images, image_descriptor.data()) &&
+            !holds(mixed_snapshot.images, memory.words.data() + second_image),
+        "a 3D record in a 2D sample's heap table refused the table or was bound");
   for (const auto dword : {1u, 2u, 3u, 4u}) {
     memory.words[second_image + dword] = image_descriptor[dword];
   }
