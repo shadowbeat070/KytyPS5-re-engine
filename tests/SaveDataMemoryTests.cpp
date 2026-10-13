@@ -374,6 +374,45 @@ void TestDirNamePatterns() {
 	CHECK(!save_dialog_info(1, nullptr, "../LINE-0-1Slot", &entry, param.data()));
 }
 
+void TestSearchSortKeys() {
+	Reset("SORTED");
+	for (const char* text: {"LINE-0-0", "LINE-0--1"}) {
+		auto                  name = DirName(text);
+		struct SaveDataMount3 mount {};
+		mount.user_id    = 1;
+		mount.dir_name   = &name;
+		mount.mount_mode = 4;
+		mount.blocks     = 48;
+		SaveDataMountResult result {};
+		CHECK(SaveDataMount3(&mount, &result) == OK);
+		CHECK(SaveDataUmount2(0, &result.mount_point) == OK);
+	}
+	// RE4 picks its newest save from a modification-time search; the name order is the reverse.
+	const fs::path older = "_SaveData/SORTED/LINE-0-0";
+	for (const auto& entry: fs::recursive_directory_iterator(older)) {
+		if (entry.is_regular_file()) {
+			fs::last_write_time(entry.path(), fs::last_write_time(entry.path()) - std::chrono::hours(2));
+		}
+	}
+	const auto search = [](SaveDataSortKey key, SaveDataSortOrder order) {
+		auto                      pattern = DirName("LINE-0-%");
+		SaveDataDirNameSearchCond cond {};
+		cond.user_id  = 1;
+		cond.dir_name = &pattern;
+		cond.key      = key;
+		cond.order    = order;
+		std::array<SceSaveDataDirName, 8> names {};
+		SaveDataDirNameSearchResult       result {};
+		result.dir_names     = names.data();
+		result.dir_names_num = names.size();
+		CHECK(SaveDataDirNameSearch(&cond, &result) == OK && result.set_num == 2);
+		return std::string(names[0].data);
+	};
+	CHECK(search(SaveDataSortKey::Mtime, SaveDataSortOrder::Descent) == "LINE-0--1");
+	CHECK(search(SaveDataSortKey::Mtime, SaveDataSortOrder::Ascent) == "LINE-0-0");
+	CHECK(search(SaveDataSortKey::DirName, SaveDataSortOrder::Descent) == "LINE-0-0");
+}
+
 void TestClassicSavePaths() {
 	Reset("CLASSIC");
 	const std::vector<std::string> names {"save.1", "save1", "slot@A", "slotA"};
@@ -664,6 +703,7 @@ int main(int argc, char** argv) {
 	TestIsolationAndSync();
 	TestFailedWritePreservesSave();
 	TestDirNamePatterns();
+	TestSearchSortKeys();
 	TestClassicSavePaths();
 	TestSaveAllocations();
 	TestClassicSaveParams();
