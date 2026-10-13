@@ -127,7 +127,9 @@ public:
 		TouchImage(image);
 		return image;
 	}
-	void MarkGpuWritten(ImageId id);
+	// A write that left the stencil plane alone must not claim it: the plane may be shared with
+	// another depth surface that still holds its contents.
+	void MarkGpuWritten(ImageId id, bool stencil_written = true);
 
 	// Called once per presented frame. Image staleness is judged against this rather than against
 	// the queue submission counter, which this title advances dozens of times inside one frame.

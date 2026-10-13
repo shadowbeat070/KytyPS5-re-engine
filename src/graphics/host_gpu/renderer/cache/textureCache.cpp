@@ -2468,7 +2468,7 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc) {
 	return image.FindView(desc.view_info);
 }
 
-void TextureCache::MarkGpuWritten(ImageId id) {
+void TextureCache::MarkGpuWritten(ImageId id, bool stencil_written) {
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id) {
@@ -2476,7 +2476,7 @@ void TextureCache::MarkGpuWritten(ImageId id) {
 	}
 	TrackImage(id);
 	CommitGpuWrite(image);
-	if (image.info.HasStencil()) {
+	if (image.info.HasStencil() && stencil_written) {
 		const auto stencil_id = AssociateStencil(id, image.info.stencil);
 		TrackImage(stencil_id);
 		CommitGpuWrite(m_slot_images[stencil_id]);
