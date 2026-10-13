@@ -10,6 +10,8 @@
 
 #include <algorithm>
 #include <array>
+#include <mutex>
+#include <tuple>
 #include <unordered_map>
 #include <utility>
 
@@ -273,6 +275,40 @@ void AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<cons
 	                                           info.ls_stride);
 	LOGF("Tessellation interface: input_cp=%u output_cp=%u ls_stride=%u hs_stride=%u\n",
 	     info.input_control_points, info.output_control_points, info.ls_stride, info.hs_stride);
+}
+
+void AnalyzeTessellationPrograms(std::span<const uint32_t> local, uint64_t local_hash,
+                                 std::span<const uint32_t> control, uint64_t control_hash,
+                                 ShaderTessellationInputInfo& info) {
+	struct Key {
+		uint64_t local_hash;
+		uint64_t control_hash;
+		uint32_t input_control_points;
+		uint32_t output_control_points;
+		bool     operator==(const Key&) const = default;
+	};
+	struct KeyHash {
+		size_t operator()(const Key& key) const {
+			return key.local_hash ^ (key.control_hash * 0x9e3779b97f4a7c15ull) ^
+			       ((uint64_t {key.input_control_points} << 32u | key.output_control_points) *
+			        0xc2b2ae3d27d4eb4full);
+		}
+	};
+	static std::mutex                                                      mutex;
+	static std::unordered_map<Key, std::pair<uint32_t, uint32_t>, KeyHash> strides;
+	const Key key {local_hash, control_hash, info.input_control_points, info.output_control_points};
+	{
+		std::scoped_lock lock(mutex);
+		if (const auto found = strides.find(key); found != strides.end()) {
+			std::tie(info.ls_stride, info.hs_stride) = found->second;
+			return;
+		}
+	}
+	// Unsupported programs EXIT inside the analysis, so only successes are cached.
+	AnalyzeTessellationPrograms(local, control, info);
+	std::scoped_lock lock(mutex);
+	if (strides.size() >= 4096u) strides.clear();
+	strides.emplace(key, std::pair {info.ls_stride, info.hs_stride});
 }
 
 void LowerTessellationMemory(IR::Program& program, const CompileOptions& options) {
