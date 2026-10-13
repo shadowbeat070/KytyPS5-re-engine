@@ -736,29 +736,72 @@ private:
 		return selected.IsEmpty() ? value : selected;
 	}
 
+	// Iterative: descriptor dwords can sit on SSA chains tens of thousands of values deep, which
+	// would overflow the native stack if lowered recursively.
 	Value LowerDescriptorValue(Value value) {
-		value            = value.Resolve();
-		const auto* inst = value.TryInstruction();
-		if (inst == nullptr) return value;
-		// The scalar planner owns reads and lowers their address handles separately.
-		uint32_t memory_index = 0;
-		if (ScalarReadMemory(*inst, memory_index) != nullptr) return value;
-		const auto [cached, inserted] = m_descriptor_values.emplace(inst, value);
-		if (!inserted) return cached->second;
-		if (inst->GetOpcode() != ValueOpcode::Phi) {
-			Inst* projected = nullptr;
-			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) {
-				const auto lowered = LowerDescriptorValue(inst->Arg(arg));
-				if (lowered == inst->Arg(arg).Resolve()) continue;
-				if (projected == nullptr) {
-					projected = &m_program.value_storage.emplace_back(inst->GetOpcode(), inst->Flags<uint64_t>());
-					for (size_t i = 0; i < inst->NumArgs(); ++i) projected->SetArg(i, inst->Arg(i));
-				}
-				projected->SetArg(arg, lowered);
+		struct Frame {
+			const Inst*                            inst;
+			std::map<const Inst*, Value>::iterator cached;
+			size_t                                 arg       = 0;
+			Inst*                                  projected = nullptr;
+		};
+		std::vector<Frame> stack;
+		Value              lowered;
+		// Returns true with `lowered` set, or pushes a frame whose operands must be lowered first.
+		const auto enter = [&](Value operand) {
+			operand          = operand.Resolve();
+			const auto* inst = operand.TryInstruction();
+			lowered          = operand;
+			if (inst == nullptr) return true;
+			// The scalar planner owns reads and lowers their address handles separately.
+			uint32_t memory_index = 0;
+			if (ScalarReadMemory(*inst, memory_index) != nullptr) return true;
+			const auto [cached, inserted] = m_descriptor_values.emplace(inst, operand);
+			if (!inserted) {
+				lowered = cached->second;
+				return true;
 			}
-			if (projected != nullptr) cached->second = Value(projected);
-			return cached->second;
+			if (inst->GetOpcode() == ValueOpcode::Phi) {
+				cached->second = LowerDescriptorPhi(*inst, operand);
+				lowered        = cached->second;
+				return true;
+			}
+			stack.push_back({inst, cached});
+			return false;
+		};
+		if (enter(value)) return lowered;
+		bool pending = false;
+		for (;;) {
+			auto&       frame = stack.back();
+			const auto* inst  = frame.inst;
+			if (pending) {
+				pending = false;
+				if (lowered != inst->Arg(frame.arg).Resolve()) {
+					if (frame.projected == nullptr) {
+						frame.projected = &m_program.value_storage.emplace_back(
+						    inst->GetOpcode(), inst->Flags<uint64_t>());
+						for (size_t i = 0; i < inst->NumArgs(); ++i)
+							frame.projected->SetArg(i, inst->Arg(i));
+					}
+					frame.projected->SetArg(frame.arg, lowered);
+				}
+				++frame.arg;
+			}
+			if (frame.arg < inst->NumArgs()) {
+				// A pushed frame invalidates `frame` and lowers its own operands first.
+				pending = enter(inst->Arg(frame.arg));
+				continue;
+			}
+			if (frame.projected != nullptr) frame.cached->second = Value(frame.projected);
+			lowered = frame.cached->second;
+			stack.pop_back();
+			if (stack.empty()) return lowered;
+			pending = true;
 		}
+	}
+
+	Value LowerDescriptorPhi(const Inst& phi, Value value) {
+		const auto* inst = &phi;
 		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
 			return value;
 		}
@@ -810,8 +853,7 @@ private:
 		selected.SetArg(0, info.condition);
 		selected.SetArg(1, inst->Arg(true_arg));
 		selected.SetArg(2, inst->Arg(true_arg ^ 1u));
-		cached->second = Value(&selected);
-		return cached->second;
+		return Value(&selected);
 	}
 
 	// A guest shader this pass cannot model. Records the first reason and unwinds, leaving the
