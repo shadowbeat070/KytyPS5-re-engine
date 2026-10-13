@@ -20919,7 +20919,7 @@ public:
     view_info.image = ret.image;
     view_info.viewType = view_type;
     view_info.format = view_format == vk::Format::eUndefined ? format : view_format;
-    view_info.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    view_info.subresourceRange.aspectMask = ImageAspectFor(format);
     Require(shader_name, "dispatch", view_base_mip < ret.mip_levels,
             "image view base mip is out of bounds");
     view_info.subresourceRange.baseMipLevel = view_base_mip;
@@ -21020,8 +21020,11 @@ public:
   }
 
   vk::Sampler CreateSampler(const char *shader_name, u32 mip_levels = 1,
-                            vk::Filter filter = vk::Filter::eNearest) {
+                            vk::Filter filter = vk::Filter::eNearest,
+                            std::optional<vk::CompareOp> compare = std::nullopt) {
     vk::SamplerCreateInfo sampler_info{};
+    sampler_info.compareEnable = compare.has_value();
+    sampler_info.compareOp = compare.value_or(vk::CompareOp::eNever);
     sampler_info.sType = vk::StructureType::eSamplerCreateInfo;
     sampler_info.magFilter = filter;
     sampler_info.minFilter = filter;
@@ -25313,12 +25316,20 @@ private:
     m_device.freeCommandBuffers(m_command_pool, 1, &cmd);
   }
 
+  // A depth image is uploaded and viewed through its depth aspect.
+  static vk::ImageAspectFlags ImageAspectFor(vk::Format format) {
+    return format == vk::Format::eD16Unorm || format == vk::Format::eD32Sfloat
+               ? vk::ImageAspectFlagBits::eDepth
+               : vk::ImageAspectFlagBits::eColor;
+  }
+
   void AddImageBarrier(vk::CommandBuffer cmd, vk::Image image,
                        vk::ImageLayout old_layout, vk::ImageLayout new_layout,
                        vk::PipelineStageFlags src_stage,
                        vk::PipelineStageFlags dst_stage,
                        vk::AccessFlags src_access, vk::AccessFlags dst_access,
-                       u32 mip_levels = 1, u32 layers = 1) {
+                       u32 mip_levels = 1, u32 layers = 1,
+                       vk::ImageAspectFlags aspect = vk::ImageAspectFlagBits::eColor) {
     vk::ImageMemoryBarrier barrier{};
     barrier.sType = vk::StructureType::eImageMemoryBarrier;
     barrier.srcAccessMask = src_access;
@@ -25328,7 +25339,7 @@ private:
     barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barrier.image = image;
-    barrier.subresourceRange.aspectMask = vk::ImageAspectFlagBits::eColor;
+    barrier.subresourceRange.aspectMask = aspect;
     barrier.subresourceRange.baseMipLevel = 0;
     barrier.subresourceRange.levelCount = mip_levels;
     barrier.subresourceRange.baseArrayLayer = 0;
@@ -25358,19 +25369,20 @@ private:
   void UploadImageMips(const char *shader_name, Image *image,
                        vk::Buffer staging, vk::ImageLayout final_layout) {
     vk::CommandBuffer cmd = BeginCommands(shader_name, "dispatch");
+    const auto aspect = ImageAspectFor(image->format);
     AddImageBarrier(cmd, image->image, vk::ImageLayout::eUndefined,
                     vk::ImageLayout::eTransferDstOptimal,
                     vk::PipelineStageFlagBits::eTopOfPipe,
                     vk::PipelineStageFlagBits::eTransfer, {},
                     vk::AccessFlagBits::eTransferWrite, image->mip_levels,
-                    image->layers);
+                    image->layers, aspect);
     std::vector<vk::BufferImageCopy> copies;
     copies.reserve(image->mip_levels);
     vk::DeviceSize offset = 0;
     for (u32 level = 0; level < image->mip_levels; level++) {
       vk::BufferImageCopy copy{};
       copy.bufferOffset = offset;
-      copy.imageSubresource.aspectMask = vk::ImageAspectFlagBits::eColor;
+      copy.imageSubresource.aspectMask = aspect;
       copy.imageSubresource.mipLevel = level;
       copy.imageSubresource.baseArrayLayer = 0;
       copy.imageSubresource.layerCount = image->layers;
@@ -25391,7 +25403,7 @@ private:
                     vk::PipelineStageFlagBits::eComputeShader,
                     vk::AccessFlagBits::eTransferWrite,
                     AccessForLayout(final_layout), image->mip_levels,
-                    image->layers);
+                    image->layers, aspect);
     EndSubmitAndFree(shader_name, "dispatch", cmd);
     image->layout = final_layout;
   }
@@ -26650,6 +26662,242 @@ void CheckBindlessImageTable1D(VulkanHarness *vulkan) {
     vulkan->DestroyImage(&texture);
   }
   std::printf("[compute] %-32s ok\n", name);
+}
+
+// A gather and a depth-compare sample through a GPU-selected heap, served from the bindless set:
+// each gets its own typed arm per record shape.
+TestCase BindlessHeapGatherOrCompare(bool compare) {
+  using O = ShaderOpcode;
+  TestCase test;
+  test.name = compare ? "BindlessHeapCompare" : "BindlessHeapGather";
+  test.code = {
+      EncodeVop1(0x02, 16, Vgpr(0)),                  // v_readfirstlane_b32 s16, v0
+      EncodeSop2(0x26, 17, 16, 255u),                 // s_mul_i32 s17, s16, 224
+      kBindlessMaterialStride,
+      EncodeSmem0(0x08, 18, 6), EncodeSmem1(4, 17),   // s_buffer_load_dword s18, s[12:15], s17 offset:4
+      EncodeSop2(0x26, 20, 18, 255u),                 // s_mul_i32 s20, s18, 48
+      kBindlessHeapStride,
+      EncodeSmem0(0x0b, 24, 2), EncodeSmem1(kBindlessRecordOffset, 20), // s_buffer_load_dwordx8 s[24:31], s[4:7], s20 offset:16
+  };
+  if (compare) {
+    // The reference sits beside the key, so each dispatch can move it.
+    test.code.insert(test.code.end(), {
+        EncodeSmem0(0x08, 19, 6), EncodeSmem1(8, 17), // s_buffer_load_dword s19, s[12:15], s17 offset:8
+        EncodeVop1(0x01, 20, 19),                     // v_mov_b32 v20, s19
+    });
+    AppendVMovU32(&test.code, 21, std::bit_cast<u32>(0.5f));
+    AppendVMovU32(&test.code, 22, std::bit_cast<u32>(0.5f));
+    // image_sample_c_lz v0, v[20:22], s[24:31], s[8:11] dim:2d
+    test.code.insert(test.code.end(), {EncodeMimg0(0x2f, 0x1), EncodeMimg1(0, 20, 6, 2)});
+    AppendStoreVgpr(&test.code, 0, 0);
+  } else {
+    AppendVMovU32(&test.code, 20, std::bit_cast<u32>(0.5f));
+    AppendVMovU32(&test.code, 21, std::bit_cast<u32>(0.5f));
+    // image_gather4_lz v[0:3], v[20:21], s[24:31], s[8:11] dmask:0x1 dim:2d
+    test.code.insert(test.code.end(), {EncodeMimg0(0x47, 0x1), EncodeMimg1(0, 20, 6, 2)});
+    for (u32 channel = 0; channel < 4u; channel++) {
+      AppendStoreVgpr(&test.code, channel, channel);
+    }
+  }
+  AppendEnd(&test.code);
+  test.opcodes = {O::V_READFIRSTLANE_B32,    O::S_MUL_I32, O::S_BUFFER_LOAD_DWORD,
+                  O::S_BUFFER_LOAD_DWORDX8, O::V_MOV_B32, compare ? O::IMAGE_SAMPLE : O::IMAGE_GATHER4,
+                  O::BUFFER_STORE_DWORD,    O::S_ENDPGM};
+  test.has_user_data = true;
+  test.user_data[4] = kBindlessHeapBase;
+  test.user_data[5] = kBindlessHeapStride << 16u;
+  test.user_data[6] = kBindlessHeapRecords;
+  test.user_data[12] = kBindlessMaterialBase;
+  test.user_data[13] = kBindlessMaterialStride << 16u;
+  test.user_data[14] = 2u;
+  test.user_data[50] = (compare ? 1u : 4u) * sizeof(u32);
+  test.initial.assign((kBindlessHeapBase + kBindlessHeapRecords * kBindlessHeapStride) / 4u, 0u);
+  const auto Record = [&](u32 key, Prospero::ImageType type, Prospero::BufferFormat format) {
+    const auto at = (kBindlessHeapBase + key * kBindlessHeapStride + kBindlessRecordOffset) / 4u;
+    test.initial[at + 0u] = 0x10000u + key * 0x100u;
+    test.initial[at + 1u] = static_cast<u32>(format) << 20u;
+    test.initial[at + 2u] = 1u | (1u << 14u);
+    test.initial[at + 3u] = DstSel(4, 5, 6, 7) | (static_cast<u32>(type) << 28u);
+  };
+  if (compare) {
+    Record(1, Prospero::ImageType::kColor2D, Prospero::BufferFormat::k32Float);
+  } else {
+    Record(1, Prospero::ImageType::kColor2D, Prospero::BufferFormat::k32_32_32_32Float);
+    Record(2, Prospero::ImageType::kColor2D, Prospero::BufferFormat::k32_32_32_32UInt);
+  }
+  Record(3, Prospero::ImageType::kColor3D, Prospero::BufferFormat::k32_32_32_32Float);
+  test.specialization_memory = true;
+  return test;
+}
+
+void CheckBindlessImageGatherAndCompare(VulkanHarness *vulkan) {
+  using namespace ShaderRecompiler::IR;
+  for (const bool compare : {false, true}) {
+    const auto test = BindlessHeapGatherOrCompare(compare);
+    const char *name = compare ? "BindlessImageTableCompare" : "BindlessImageTableGather";
+    const auto compiled = CompileBindlessCase(test, vulkan->SubgroupSize(), true);
+    Require(name, "binding layout",
+            compiled.program.bindings.uses_bindless &&
+                compiled.program.bindings.bindless_integer == !compare &&
+                compiled.resources.bindless_tables.size() == 1u &&
+                std::ranges::count_if(compiled.program.info.images,
+                                      [&](const ImageResource &image) {
+                                        return image.bindless && image.depth_compare == compare;
+                                      }) == 1,
+            "the heap table was not served from the global set");
+    ValidateSpirv(name, compiled.spirv);
+    {
+      spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_2);
+      std::string text;
+      Require(name, "module", tools.Disassemble(compiled.spirv, &text), "disassembly failed");
+      // A gather has a float and an integer arm per 2D-family shape; a compared sample has
+      // float arms only, each a comparison.
+      const auto gathers = CountText(text, "OpImageGather");
+      const auto compares = CountText(text, "OpImageSampleDrefExplicitLod");
+      const auto arms = compare ? compares : gathers;
+      Require(name, "module",
+              arms != 0u && arms % (compare ? 3u : 6u) == 0u &&
+                  (compare ? gathers : compares) == 0u &&
+                  CountText(text, "OpImageSampleExplicitLod") == 0u &&
+                  (text.find("bindless_2d_uint") != std::string::npos) == !compare,
+              "the bindless arms are wrong: gathers=" + std::to_string(gathers) +
+                  " compares=" + std::to_string(compares));
+    }
+
+    using ImageType = VulkanHarness::Image;
+    // Texel (x, y) of key k holds k * 100 + y * 2 + x + 1 in its first component.
+    const auto Texel = [](u32 key, u32 x, u32 y) { return key * 100u + y * 2u + x + 1u; };
+    const auto Texture = [&](u32 key, bool integer) {
+      std::vector<u32> texels;
+      for (u32 y = 0; y < 2u; y++) {
+        for (u32 x = 0; x < 2u; x++) {
+          const auto value = Texel(key, x, y);
+          texels.insert(texels.end(), 4u,
+                        integer ? value : std::bit_cast<u32>(static_cast<float>(value)));
+        }
+      }
+      return vulkan->CreateImageMips(
+          name, 2, 2, integer ? vk::Format::eR32G32B32A32Uint : vk::Format::eR32G32B32A32Sfloat,
+          vk::ImageUsageFlagBits::eSampled, {texels}, 4, vk::ImageLayout::eShaderReadOnlyOptimal,
+          vk::ImageType::e2D, vk::ImageViewType::e2D, 1);
+    };
+    const auto Null = [&](vk::ImageType type, vk::ImageViewType view) {
+      return vulkan->CreateImageMips(name, 4, 4, vk::Format::eR32G32B32A32Sfloat,
+                                     vk::ImageUsageFlagBits::eSampled,
+                                     {std::vector<u32>(64u, std::bit_cast<u32>(-1.0f))}, 4,
+                                     vk::ImageLayout::eShaderReadOnlyOptimal, type, view, 1);
+    };
+    std::array<ImageType, static_cast<size_t>(BindlessShape::Count)> nulls{
+        Null(vk::ImageType::e2D, vk::ImageViewType::e2D),
+        Null(vk::ImageType::e2D, vk::ImageViewType::e2DArray),
+        Null(vk::ImageType::e3D, vk::ImageViewType::e3D),
+        vulkan->CreateImageMips(name, 4, 1, vk::Format::eR32G32B32A32Sfloat,
+                                vk::ImageUsageFlagBits::eSampled,
+                                {std::vector<u32>(16u, std::bit_cast<u32>(-1.0f))}, 4,
+                                vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e1D,
+                                vk::ImageViewType::e1D, 1),
+        BindlessUintNull(vulkan, name, 4),
+        BindlessUintNull(vulkan, name, 5),
+        BindlessUintNull(vulkan, name, 6),
+        BindlessUintNull(vulkan, name, 7)};
+    std::vector<ImageType> textures;
+    textures.reserve(4);
+
+    const auto heap = std::span(test.initial).subspan(kBindlessHeapBase / 4u);
+    Bindless::TranslationCache cache;
+    Bindless::SlotAllocator slots;
+    VulkanHarness::BindlessFixture fixture;
+    for (u32 shape = 0; shape < fixture.images.size(); shape++) {
+      fixture.images[shape].assign(BindlessImageSlots,
+                                   {nullptr, nulls[shape].view, nulls[shape].layout});
+    }
+    std::vector<u32> arena(1u + kBindlessHeapRecords, 0u);
+    constexpr u32 kRegionBase = 1u;
+    const auto records = Bindless::HeapRecordCount(kBindlessHeapRecords * kBindlessHeapStride,
+                                                   kBindlessHeapStride, kBindlessRecordOffset,
+                                                   1u << 20u);
+    Bindless::TranslateHeap(
+        heap, kBindlessHeapStride, kBindlessRecordOffset, records, cache,
+        [&](const Bindless::TSharp &tsharp,
+            const Bindless::RecordShape &shape) -> std::optional<u32> {
+          const auto key = (tsharp[0] - 0x10000u) / 0x100u;
+          const auto slot = slots.Assign(shape.array, tsharp[0]);
+          Require(name, "slot", slot.has_value(), "an array ran out of elements");
+          if (shape.array == BindlessShape::Image3D) {
+            textures.push_back(Null(vk::ImageType::e3D, vk::ImageViewType::e3D));
+          } else if (compare) {
+            // A depth record: every texel 0.5, compared through the depth aspect.
+            textures.push_back(vulkan->CreateImageMips(
+                name, 2, 2, vk::Format::eD32Sfloat, vk::ImageUsageFlagBits::eSampled,
+                {std::vector<u32>(4u, std::bit_cast<u32>(0.5f))}, 1,
+                vk::ImageLayout::eShaderReadOnlyOptimal, vk::ImageType::e2D,
+                vk::ImageViewType::e2D, 1));
+          } else {
+            textures.push_back(
+                Texture(key, shape.numeric == Prospero::TextureNumericClass::Uint));
+          }
+          fixture.images[static_cast<size_t>(shape.array)][*slot] = {
+              nullptr, textures.back().view, textures.back().layout};
+          return Bindless::TranslationWord(shape, *slot);
+        },
+        std::span(arena).subspan(kRegionBase, records), !compare);
+    auto arena_buffer = vulkan->CreateStorageBuffer(name, arena, arena.size());
+    fixture.arena = arena_buffer.buffer;
+    fixture.arena_size = arena_buffer.size;
+    for (const auto &table : compiled.resources.bindless_tables) {
+      fixture.patches.push_back({table.srt_offset, kRegionBase, records});
+    }
+
+    const auto sampler =
+        compare ? vulkan->CreateSampler(name, 1, vk::Filter::eNearest, vk::CompareOp::eLess)
+                : vulkan->CreateSampler(name);
+    struct Probe {
+      u32 key;
+      float reference;
+    };
+    // Keys 1 and 2 name records; 3 is a volume, which no 2D-family arm takes; 99 is past the
+    // heap.
+    const std::array probes{Probe{1, 0.25f}, Probe{1, 0.75f}, Probe{2, 0.25f}, Probe{3, 0.25f},
+                            Probe{99, 0.25f}};
+    for (const auto &probe : probes) {
+      if (compare && probe.key == 2u) {
+        continue;
+      }
+      auto memory = test.initial;
+      memory[1] = probe.key;
+      memory[2] = std::bit_cast<u32>(probe.reference);
+      auto buffer = vulkan->CreateStorageBuffer(name, memory, memory.size());
+      vulkan->Dispatch(test, compiled, buffer, nullptr, nullptr, nullptr, nullptr, sampler, {},
+                       {}, {}, &fixture);
+      const auto channels = compare ? 1u : 4u;
+      const auto actual = vulkan->ReadBuffer(name, buffer, channels);
+      for (u32 channel = 0; channel < channels; channel++) {
+        u32 expected = 0;
+        if (compare) {
+          // LESS: the reference passes against a 0.5 texel only below it.
+          expected = std::bit_cast<u32>(probe.key == 1u && probe.reference < 0.5f ? 1.0f : 0.0f);
+        } else if (probe.key == 1u || probe.key == 2u) {
+          // Gather order at the centre of a 2x2 image: (0,1), (1,1), (1,0), (0,0).
+          constexpr std::array<std::array<u32, 2>, 4> order{{{0, 1}, {1, 1}, {1, 0}, {0, 0}}};
+          const auto value = Texel(probe.key, order[channel][0], order[channel][1]);
+          expected = probe.key == 2u ? value : std::bit_cast<u32>(static_cast<float>(value));
+        }
+        Require(name, compare ? "compared texel" : "gathered texel", actual[channel] == expected,
+                "key " + std::to_string(probe.key) + " channel " + std::to_string(channel) +
+                    " read " + Hex(actual[channel]) + ", expected " + Hex(expected));
+      }
+      vulkan->DestroyBuffer(&buffer);
+    }
+    vulkan->Device().destroySampler(sampler, nullptr);
+    vulkan->DestroyBuffer(&arena_buffer);
+    for (auto &texture : textures) {
+      vulkan->DestroyImage(&texture);
+    }
+    for (auto &texture : nulls) {
+      vulkan->DestroyImage(&texture);
+    }
+    std::printf("[compute] %-32s ok\n", name);
+  }
 }
 
 float BindlessLoadTexel(u32 key, u32 mip, u32 layer, u32 x, u32 y) {
@@ -54735,6 +54983,7 @@ int main(int argc, char **argv) {
     CheckBindlessImageTableSelects(&vulkan);
     CheckBindlessImageTable1D(&vulkan);
     CheckBindlessImageTableLoads(&vulkan);
+    CheckBindlessImageGatherAndCompare(&vulkan);
     CheckNull1DImageBindings(&vulkan);
     vulkan.CheckBindlessNullImages();
     vulkan.CheckBindlessHeap1DRecords();
@@ -55886,6 +56135,7 @@ int main(int argc, char **argv) {
   CheckBindlessImageTableSelects(&vulkan);
   CheckBindlessImageTable1D(&vulkan);
   CheckBindlessImageTableLoads(&vulkan);
+  CheckBindlessImageGatherAndCompare(&vulkan);
   CheckNull1DImageBindings(&vulkan);
   for (const auto &test : graphics_tests) {
     RunGraphicsCase(&vulkan, test);

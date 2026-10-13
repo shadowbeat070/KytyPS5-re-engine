@@ -4805,7 +4805,10 @@ struct RuntimeKeyHeap {
   std::array<uint32_t, 8> heap_memory {};
 };
 
-RuntimeKeyHeap MakeRuntimeKeyHeapFixture(RuntimeKey source, bool extra_reader) {
+RuntimeKeyHeap MakeRuntimeKeyHeapFixture(
+    RuntimeKey source, bool extra_reader, ValueOpcode op = ValueOpcode::ImageSampleRaw,
+    uint32_t sample_flags = 0u,
+    Decoder::ImageDimension dimension = Decoder::ImageDimension::Dim2D) {
   RuntimeKeyHeap result;
   auto &fixture = *result.fixture;
   std::array<Value, 4> key_words;
@@ -4849,13 +4852,93 @@ RuntimeKeyHeap MakeRuntimeKeyHeapFixture(RuntimeKey source, bool extra_reader) {
   const auto sampler = fixture.Sampler({Value(0u), Value(0u), Value(0u), Value(0u)}, 0x0240);
   MemoryInfo sample;
   sample.kind = ResourceKind::Image;
-  sample.image_dimension = Decoder::ImageDimension::Dim2D;
-  const auto sampled = fixture.Emit(ValueOpcode::ImageSampleRaw,
-                                    {image, sampler, fixture.ImageAddress(), Value(true)},
-                                    fixture.AddMemory(sample, 0x0240));
+  sample.image_dimension = dimension;
+  sample.image_sample_flags = sample_flags;
+  const auto sampled =
+      op == ValueOpcode::ImageGatherRaw
+          ? fixture.Emit(ValueOpcode::ImageGatherRaw,
+                         {image, sampler, fixture.ImageAddress(), Value(0u), Value(0u),
+                          Value(0u), Value(0u), Value(true)},
+                         fixture.AddMemory(sample, 0x0240))
+          : fixture.Emit(op, {image, sampler, fixture.ImageAddress(), Value(true)},
+                         fixture.AddMemory(sample, 0x0240));
   fixture.Emit(ValueOpcode::ReferenceU32,
                {fixture.Emit(ValueOpcode::CompositeExtractU32x4, {sampled, Value(0u)})});
   return result;
+}
+
+// Gathers and depth-compare samples through a GPU-selected heap are served from the bindless set,
+// as samples and reads are. A gather at an explicit LOD (which selects a per-mip view the heap does
+// not keep) and a compared volume (Vulkan has no depth comparison on 3D) stay out of it.
+void TestBindlessHeapServesGatherAndDepthCompare() {
+  using Decoder::ImageDimension;
+  struct Case {
+    const char *name;
+    ValueOpcode op;
+    uint32_t flags;
+    ImageDimension dimension;
+    bool served;
+  };
+  const std::array cases{
+      Case{"gather", ValueOpcode::ImageGatherRaw, Decoder::ImageSampleFlagLevelZero,
+           ImageDimension::Dim2D, true},
+      Case{"gather with offsets", ValueOpcode::ImageGatherRaw,
+           Decoder::ImageSampleFlagOffset, ImageDimension::Dim2DArray, true},
+      Case{"compared gather", ValueOpcode::ImageGatherRaw,
+           Decoder::ImageSampleFlagCompare | Decoder::ImageSampleFlagLevelZero,
+           ImageDimension::Dim2D, true},
+      Case{"compared sample", ValueOpcode::ImageSampleRaw, Decoder::ImageSampleFlagCompare,
+           ImageDimension::Dim2D, true},
+      Case{"compared sample at level zero", ValueOpcode::ImageSampleRaw,
+           Decoder::ImageSampleFlagCompare | Decoder::ImageSampleFlagLevelZero,
+           ImageDimension::Dim2DArray, true},
+      Case{"compared sample at an explicit LOD", ValueOpcode::ImageSampleRaw,
+           Decoder::ImageSampleFlagCompare | Decoder::ImageSampleFlagLod,
+           ImageDimension::Dim2D, true},
+      Case{"gather at an explicit LOD", ValueOpcode::ImageGatherRaw,
+           Decoder::ImageSampleFlagLod, ImageDimension::Dim2D, false},
+      Case{"compared volume", ValueOpcode::ImageSampleRaw, Decoder::ImageSampleFlagCompare,
+           ImageDimension::Dim3D, false},
+  };
+  for (const auto &test : cases) {
+    const std::string name = test.name;
+    OverrideBindlessImageHeaps(1);
+    auto heap = MakeRuntimeKeyHeapFixture(RuntimeKey::PerLane, false, test.op, test.flags,
+                                          test.dimension);
+    const auto status = heap.fixture->TryPlanAndTrack();
+    OverrideBindlessImageHeaps(0);
+    Check(status.ok, (name + ": a runtime heap key was refused").c_str());
+    auto &program = heap.fixture->program;
+    const auto &indirect =
+        program.descriptor_sources[program.info.images[0].source].indirect_descriptor;
+    Check(indirect.has_value() && indirect->bindless,
+          (name + ": the heap was not tracked for the bindless set").c_str());
+    auto plan = ExtractResourcePlan(program);
+    std::array<uint32_t, 9> user_data{0x1000u, 0u, 256u, 0u, 0x2000u, 48u << 16u, 64u, 0u, 7u};
+    LinearTestMemory memory;
+    SrtRuntime runtime{.user_data = user_data,
+                       .userdata = &memory,
+                       .read_specialization_memory = ReadLinearTestMemory};
+    ResourceSnapshot snapshot;
+    ResourceSpecialization specialization;
+    const bool materialized = MaterializeResources(plan, runtime, snapshot, specialization);
+    const bool bindless = materialized && specialization.images[0].bindless;
+    const bool applied = bindless && ApplyResourceSpecialization(program, specialization);
+    if (test.served) {
+      Check(bindless && snapshot.bindless_tables.size() == 1u &&
+                snapshot.bindless_tables[0].heap[0] == 0x2000u &&
+                snapshot.bindless_tables[0].record_offset == 16u,
+            (name + ": the heap was not materialized as a bindless table").c_str());
+      Check(applied && program.info.images[0].bindless &&
+                std::ranges::any_of(*heap.fixture->block,
+                                    [&](const Inst &inst) {
+                                      return inst.GetOpcode() == test.op;
+                                    }),
+            (name + ": the bindless specialization refused the operation").c_str());
+    } else {
+      Check(!applied, (name + ": an operation the bindless arms lack was bound bindless").c_str());
+    }
+  }
 }
 
 void TestRuntimeKeyBindlessHeap(RuntimeKey source, bool extra_reader) {
@@ -6415,6 +6498,7 @@ int main() {
     Run("bindless LDS key", [] { TestRuntimeKeyBindlessHeap(RuntimeKey::Lds, false); });
     Run("bindless key with a shared record",
         [] { TestRuntimeKeyBindlessHeap(RuntimeKey::PerLane, true); });
+    Run("bindless heap gather and depth compare", TestBindlessHeapServesGatherAndDepthCompare);
     Run("indirect image selection", TestIndirectImageSelectionResolvesEveryKey);
     Run("indirect image refusal reporting", TestIndirectImageRefusalNamesItselfAndIsMemoed);
     Run("large indirect tables read in spans", TestLargeIndirectTablesReadInSpans);

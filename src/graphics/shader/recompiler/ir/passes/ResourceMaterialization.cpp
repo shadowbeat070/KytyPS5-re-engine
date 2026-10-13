@@ -430,6 +430,11 @@ size_t IndirectBufferMappingSlot(const ResourcePlan& program, uint32_t buffer_in
 	           IndirectDirectoryStride;
 }
 
+bool BindlessTwoDimensional(Decoder::ImageDimension dimension) {
+	return dimension == Decoder::ImageDimension::Dim2D ||
+	       dimension == Decoder::ImageDimension::Dim2DArray;
+}
+
 bool ServedBindless(const ResourcePlan& program, uint32_t image_index) {
 	const auto& image  = program.info.images[image_index];
 	const auto* source = Source(program, image.source);
@@ -437,12 +442,28 @@ bool ServedBindless(const ResourcePlan& program, uint32_t image_index) {
 	    !source->indirect_descriptor->bindless) {
 		return false;
 	}
+	// The comparison arms are the 2D family's: Vulkan has no depth comparison on a volume, and
+	// the heap's 1D views are never compared.
 	return image.resource_class == ImageResourceClass::Sampled && !image.written && !image.atomic &&
-	       !image.depth_compare && !image.r128 && BindlessShapeFor(image.dimension).has_value();
+	       (!image.depth_compare || BindlessTwoDimensional(image.dimension)) && !image.r128 &&
+	       BindlessShapeFor(image.dimension).has_value();
 }
 
 bool BindlessReads(ValueOpcode opcode) {
 	return opcode == ValueOpcode::ImageSampleRaw || opcode == ValueOpcode::ImageRead;
+}
+
+// The image operations the bindless switch serves: samples (compared ones included, see
+// ServedBindless) and reads of every bindless shape, and gathers of the 2D family at the view's
+// own level. A gather at an explicit LOD selects a per-mip view, and the heap keeps one view per
+// record.
+bool BindlessServesOp(ValueOpcode opcode, const MemoryInfo& memory) {
+	if (BindlessReads(opcode)) {
+		return true;
+	}
+	return opcode == ValueOpcode::ImageGatherRaw &&
+	       BindlessTwoDimensional(memory.image_dimension) &&
+	       (memory.image_sample_flags & Decoder::ImageSampleFlagLod) == 0u;
 }
 // Why an indirect image table could not be enumerated. Every clause below refuses for a different
 // reason with a different fix - a handle the host cannot decode, a probe budget the table outgrows,
@@ -3455,11 +3476,14 @@ bool ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 	}
 	for (const auto* block: program.blocks) {
 		for (const auto& inst: *block) {
-			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None ||
-			    BindlessReads(inst.GetOpcode())) {
+			if (ImageOpcodeInfoOf(inst.GetOpcode()).access == ImageAccess::None) {
 				continue;
 			}
 			const auto index = inst.Flags<MemoryFlags>().index;
+			if (index < program.memory_info.size() &&
+			    BindlessServesOp(inst.GetOpcode(), program.memory_info[index])) {
+				continue;
+			}
 			if (index < program.memory_info.size() &&
 			    program.memory_info[index].resource < specialization.images.size() &&
 			    specialization.images[program.memory_info[index].resource].bindless) {
