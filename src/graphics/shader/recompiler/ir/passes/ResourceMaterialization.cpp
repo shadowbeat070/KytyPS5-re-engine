@@ -765,6 +765,8 @@ bool EnumerateIndirectImage(const ResourcePlan&                         program,
 		if (step == 4u && indirect.selector_offset == 0u) {
 			if (!ReadScalarTable(material.Base48(), material.GetSize(), uint64_t {first} * 4u,
 			                     runtime, keys)) {
+				failure.offset = uint64_t {first} * 4u;
+				RecheckAt(failure, material.Base48(), material.GetSize(), failure.offset);
 				return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
 			}
 		} else {
@@ -773,6 +775,7 @@ bool EnumerateIndirectImage(const ResourcePlan&                         program,
 				if (!ReadScalarTable(material.Base48(), material.GetSize(), offset, runtime,
 				                     {&keys[index], 1})) {
 					failure.offset = offset;
+					RecheckAt(failure, material.Base48(), material.GetSize(), offset);
 					return Refuse(IndirectImageFailure::Stage::MaterialRecordUnreadable);
 				}
 			}
