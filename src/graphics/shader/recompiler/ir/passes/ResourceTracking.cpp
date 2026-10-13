@@ -805,7 +805,7 @@ private:
 		if (inst->NumArgs() != 2u || inst->NumPhiBlocks() != 2u || inst->GetType() != Type::U32) {
 			return value;
 		}
-		const auto* merge = inst->Parent();
+		const auto* merge  = inst->Parent();
 		const auto* branch = inst->PhiBlock(0);
 		if (merge == nullptr || branch == nullptr || inst->PhiBlock(1) == nullptr ||
 		    branch == inst->PhiBlock(1)) {
@@ -1343,7 +1343,7 @@ private:
 					CollectScalarRead(Value(&inst), inst.Flags<MemoryFlags>().pc);
 			}
 		}
-		m_cyclic_entries = {};
+		m_cyclic_entries       = {};
 		const auto host_needed = HostEvaluatedValues();
 		m_program.data_flat_slots.clear();
 		for (auto* read: m_scalar_reads) {
@@ -2893,9 +2893,11 @@ private:
 			};
 			const auto unmatched = indirect;
 			if (MatchScalarMaterialKey(key, indirect, material_source)) {
-				// The host enumerates the guarded scalar loop; its key and T# payload stay on the
-				// GPU.
+				// The key and T# payload stay on the GPU. The bindless heap serves the loop's
+				// records directly, so their numeric classes may differ; an access it cannot serve
+				// falls back to the host enumerating the guarded scalar loop.
 				plan.reads.fill(nullptr);
+				indirect.bindless = BindlessImageHeapsEnabled() && indirect.selector_shift == 0u;
 			} else if (!match_material()) {
 				indirect        = unmatched;
 				material_source = {};
@@ -3132,7 +3134,7 @@ private:
 		const auto& term = from->terminator;
 		if (term.kind != CFG::TerminatorKind::IndirectBranch || !term.indexed) return false;
 		const auto maximum = SelectorMaximum(from->indirect_target);
-		bool found = false;
+		bool       found   = false;
 		for (const auto& branch: term.cases) {
 			if (branch.target != to) continue;
 			if (branch.value <= maximum) return false;
@@ -3179,9 +3181,11 @@ private:
 			if (ValidateSource(descriptor, bad)) {
 				// Finite inline samplers have literal leaves; live descriptor tables use the
 				// existing direct sampler planning path.
-				if (sampler && !std::ranges::all_of(
-				    std::span(descriptor.dwords).first(descriptor.dword_count),
-				    [](Value word) { return word.IsImmediate() && word.GetType() == Type::U32; }))
+				if (sampler &&
+				    !std::ranges::all_of(
+				        std::span(descriptor.dwords).first(descriptor.dword_count), [](Value word) {
+					        return word.IsImmediate() && word.GetType() == Type::U32;
+				        }))
 					return UINT32_MAX;
 				return index;
 			}
@@ -3733,7 +3737,7 @@ private:
 			return UINT32_MAX;
 		}
 		m_info.samplers.push_back({source, pc});
-		const auto root = static_cast<uint32_t>(m_info.samplers.size() - 1);
+		const auto  root       = static_cast<uint32_t>(m_info.samplers.size() - 1);
 		const auto* descriptor = Source(source);
 		if (descriptor != nullptr && descriptor->indirect_descriptor) {
 			const auto& sources = descriptor->indirect_descriptor->sources;
@@ -4048,26 +4052,26 @@ private:
 		}
 	}
 
-	Program&                                   m_program;
-	const Decoder::Program&                    m_decoded;
-	const CFG::Graph&                          m_native_cfg;
-	std::vector<Program::ScalarWrite>          m_scalar_writes;
-	std::vector<ResolvedHandle>                m_resolved_handles;
-	std::vector<const Inst*>                   m_srt_visiting;
-	std::unordered_set<const Inst*>            m_srt_visited;
-	std::vector<Inst*>                         m_scalar_reads;
-	ShaderInfo                                 m_info;
-	std::vector<DescriptorSource>              m_sources;
-	std::vector<HandlePatch>                   m_handle_patches;
-	std::vector<MemoryPatch>                   m_memory_patches;
-	mutable CyclicPhiEntryCache                m_cyclic_entries;
-	std::vector<MemoryAccessors>               m_memory_accessors;
-	std::vector<IndirectDescriptorPlan>        m_indirect_descriptors;
-	std::map<const Inst*, Value>               m_descriptor_values;
-	bool                                       m_shader_writes = false;
-	std::vector<IndirectBufferPlan>            m_indirect_buffers;
-	std::unordered_set<const Inst*>            m_applied_indirect_buffers;
-	std::unordered_set<uint32_t>               m_demoted_tables;
+	Program&                            m_program;
+	const Decoder::Program&             m_decoded;
+	const CFG::Graph&                   m_native_cfg;
+	std::vector<Program::ScalarWrite>   m_scalar_writes;
+	std::vector<ResolvedHandle>         m_resolved_handles;
+	std::vector<const Inst*>            m_srt_visiting;
+	std::unordered_set<const Inst*>     m_srt_visited;
+	std::vector<Inst*>                  m_scalar_reads;
+	ShaderInfo                          m_info;
+	std::vector<DescriptorSource>       m_sources;
+	std::vector<HandlePatch>            m_handle_patches;
+	std::vector<MemoryPatch>            m_memory_patches;
+	mutable CyclicPhiEntryCache         m_cyclic_entries;
+	std::vector<MemoryAccessors>        m_memory_accessors;
+	std::vector<IndirectDescriptorPlan> m_indirect_descriptors;
+	std::map<const Inst*, Value>        m_descriptor_values;
+	bool                                m_shader_writes = false;
+	std::vector<IndirectBufferPlan>     m_indirect_buffers;
+	std::unordered_set<const Inst*>     m_applied_indirect_buffers;
+	std::unordered_set<uint32_t>        m_demoted_tables;
 	// Why the last descriptor fold failed, kept only across the reclassification attempt that
 	// the failure hands off to.
 	std::string m_deferred_reject;

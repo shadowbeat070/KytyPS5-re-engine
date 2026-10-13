@@ -15714,7 +15714,23 @@ void TestBoundedScalarMaterialImageKeys() {
   user_data[12] = 0x1000u;
   auto options = MakeCompileOptions(ShaderType::Compute);
   options.user_data = user_data;
+  // The bindless heap serves these tables; the host enumeration below is the fallback for an
+  // access it cannot serve.
+  OverrideBindlessImageHeaps(1);
+  auto bindless_translated = ShaderRecompiler::TranslateProgram(shader, options);
+  OverrideBindlessImageHeaps(0);
   auto translated = ShaderRecompiler::TranslateProgram(shader, options);
+  OverrideBindlessImageHeaps(-1);
+  const auto bindless_plan = ExtractResourcePlan(bindless_translated.program);
+  Check(bindless_plan.info.images.size() == 2 &&
+            std::ranges::all_of(bindless_plan.info.images,
+                                [&](const auto &image) {
+                                  const auto &source =
+                                      bindless_plan.descriptor_sources[image.source]
+                                          .indirect_descriptor;
+                                  return source && source->bindless;
+                                }),
+        "scalar material image tables were not served from the bindless heap");
   auto plan = ExtractResourcePlan(translated.program);
   Check(plan.info.images.size() == 2 && plan.capture_specialization_reads,
         "scalar material fields lost their distinct image roots or clean read capture");
@@ -15833,6 +15849,14 @@ void TestBoundedScalarMaterialImageKeys() {
   memory = {.mixed = true};
   Check(!MaterializeResources(plan, runtime, snapshot, specialization),
         "selected material fields bypassed image compatibility");
+  // The bindless heap neither probes the loop nor needs one numeric class across its records.
+  memory = {.mixed = true};
+  Check(MaterializeResources(bindless_plan, runtime, snapshot, specialization) &&
+            memory.keys == 0 && memory.images == 0 && snapshot.bindless_tables.size() == 2 &&
+            std::ranges::all_of(specialization.images, [](const auto &image) {
+              return image.bindless;
+            }),
+        "bindless scalar material tables probed the heap or refused mixed numeric classes");
   memory = {};
   Check(MaterializeResources(plan, runtime, snapshot, specialization),
         "native scalar material image selection did not recover after rejected candidates");
