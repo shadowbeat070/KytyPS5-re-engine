@@ -161,6 +161,18 @@ uint32_t ReflectTessellationStride(const Decoder::Program& program, bool local,
 					if (rhs.constant == 0u && third.constant == 8u) value = constant(0u);
 				}
 				break;
+			case Opcode::V_AND_B32: {
+				const bool lhs_packed = lhs.kind == Kind::PackedControlPoint;
+				const auto mask       = lhs_packed ? rhs : lhs;
+				const bool byte_mask =
+				    mask.kind == Kind::Affine && mask.coefficient == 0u && mask.constant == 0xffu;
+				if ((lhs_packed || rhs.kind == Kind::PackedControlPoint) && byte_mask)
+					value = patch_ordinal ? Address {Kind::Affine, 1u, 0u} : constant(0u);
+				else if (lhs.kind == Kind::Affine && lhs.coefficient == 0u &&
+				         rhs.kind == Kind::Affine && rhs.coefficient == 0u)
+					value = constant(lhs.constant & rhs.constant);
+				break;
+			}
 			case Opcode::V_ADD_NC_U32: value = add(lhs, rhs); break;
 			case Opcode::V_MUL_U32_U24: value = multiply(low24(lhs), low24(rhs)); break;
 			case Opcode::V_MAD_U32_U24: value = add(multiply(low24(lhs), low24(rhs)), third); break;
