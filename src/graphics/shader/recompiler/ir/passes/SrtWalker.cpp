@@ -14,10 +14,10 @@
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
 SrtRuntime SrtReadCapture::ObservedRuntime() {
-	auto runtime = m_source;
+	auto runtime     = m_source;
 	runtime.userdata = this;
-	runtime.read_specialization_memory = m_source.read_specialization_memory != nullptr
-	                                         ? ReadStrict : nullptr;
+	runtime.read_specialization_memory =
+	    m_source.read_specialization_memory != nullptr ? ReadStrict : nullptr;
 	runtime.read_memory = ReadOrdinary;
 	return runtime;
 }
@@ -1041,6 +1041,12 @@ bool SrtWalker::EvaluateChain(const Inst& root, uint64_t& result) {
 	const auto       base = unwind.base;
 	LaneScope* const lane = DependenceScope();
 	stack.push_back({&root, 0, 0, PlainArgCount(root.GetOpcode()), false});
+	// A known false AND operand or true OR operand decides the result on its own, so an
+	// unevaluable sibling is left for EvaluateInst to judge.
+	const auto short_circuits = [](const Inst* inst) {
+		return inst->GetOpcode() == ValueOpcode::LogicalAnd ||
+		       inst->GetOpcode() == ValueOpcode::LogicalOr;
+	};
 	bool failed = false;
 	while (true) {
 		auto& frame = stack.back();
@@ -1056,8 +1062,10 @@ bool SrtWalker::EvaluateChain(const Inst& root, uint64_t& result) {
 				}
 				continue;
 			}
-			uint64_t ignored = 0;
-			failed           = !EvaluateWide(arg, ignored);
+			// EvaluateWide can re-enter this walk and grow the shared stack, so frame may dangle.
+			const Inst* const owner   = frame.inst;
+			uint64_t          ignored = 0;
+			failed                    = !EvaluateWide(arg, ignored) && !short_circuits(owner);
 			continue;
 		}
 		const auto current   = frame;
@@ -1088,8 +1096,8 @@ bool SrtWalker::EvaluateChain(const Inst& root, uint64_t& result) {
 		} else {
 			memo.generation = 0;
 		}
-		failed = !evaluated;
 		stack.pop_back();
+		failed = !evaluated && !short_circuits(stack.back().inst);
 	}
 }
 
@@ -1372,7 +1380,7 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result, uint32_t com
 		return RefuseRawRead(RawReadReject::GpuOwned);
 	}
 	const RawReadEventScope event_scope(event);
-	uint32_t word = 0;
+	uint32_t                word = 0;
 	if (m_runtime.read_memory != nullptr) {
 		if (!m_runtime.read_memory(m_runtime.userdata, address, {&word, 1})) {
 			m_refused_read     = address;
