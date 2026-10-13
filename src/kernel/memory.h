@@ -138,6 +138,9 @@ uint64_t ReadGuestMemoryPartial(uint64_t vaddr, void* data, uint64_t size);
 [[nodiscard]] const char* DescribeGpuBackingRefusal(uint64_t vaddr, uint64_t size);
 // Clips to the contiguous committed mapping at vaddr; 0 when nothing is mapped there.
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+// Clips to the end of the last committed mapping inside the range, holes included; 0 when
+// nothing is mapped at vaddr.
+[[nodiscard]] uint64_t ClampSparseRangeSize(uint64_t vaddr, uint64_t size);
 // The committed virtual range holding vaddr, as one mapping call left it; false when nothing
 // committed is mapped there.
 [[nodiscard]] bool QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size);

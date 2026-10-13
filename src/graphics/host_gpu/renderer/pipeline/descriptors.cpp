@@ -1077,7 +1077,20 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages) {
 					size = std::min({size, uint64_t {256} * 1024 * 1024, limit});
 				}
 			}
-			size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			const auto contiguous = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+			if (contiguous != 0 && contiguous < size && !program.info.buffers[resource].written) {
+				// A streamed range maps its pages piecemeal; the GPU still reaches every mapped
+				// page past a hole, and the holes upload as zeros.
+				const auto& graphics = m_context.GetGraphics();
+				const auto  limit =
+				    uint64_t {graphics.GetPhysicalDeviceProperties().limits.maxStorageBufferRange} -
+				    (graphics.StorageMinAlignment() - 1);
+				const auto sparse = Libs::LibKernel::Memory::ClampSparseRangeSize(address, size);
+				size =
+				    std::max(contiguous, std::min({sparse, uint64_t {256} * 1024 * 1024, limit}));
+			} else {
+				size = contiguous;
+			}
 			if (size == 0) {
 				source = {};
 				continue;

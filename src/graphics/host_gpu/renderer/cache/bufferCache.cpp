@@ -127,6 +127,24 @@ bool ReadGuestForUpload(uint64_t vaddr, void* destination, uint64_t size) {
 	return false;
 }
 
+// Bytes that could not be read stay dirty so the next upload retries them, except where nothing
+// is mapped: those uploaded as zeros, and mapping them later invalidates the range anyway.
+template <typename Mark>
+void RetryCommittedBytes(uint64_t vaddr, uint64_t size, Mark&& mark) {
+	constexpr uint64_t GuestPageSize = 0x4000;
+	const auto         end           = vaddr + size;
+	for (auto current = vaddr; current < end;) {
+		uint64_t start = 0, bytes = 0;
+		if (Libs::LibKernel::Memory::QueryCommittedRange(current, &start, &bytes)) {
+			const auto piece_end = std::min(end, start + bytes);
+			mark(current, piece_end - current);
+			current = piece_end;
+		} else {
+			current = std::min(end, Common::AlignDown(current, GuestPageSize) + GuestPageSize);
+		}
+	}
+}
+
 } // namespace
 
 void BufferCache::WriteDataBuffer(Buffer& buffer, uint64_t address, const void* source,
@@ -1177,7 +1195,9 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, unbacked); });
 	if (!is_written) {
 		for (const auto& [address, bytes]: unbacked) {
-			m_memory_tracker.MarkRegionAsCpuModified(address, bytes);
+			RetryCommittedBytes(address, bytes, [this](uint64_t piece, uint64_t piece_size) {
+				m_memory_tracker.MarkRegionAsCpuModified(piece, piece_size);
+			});
 		}
 	}
 	if (source && m_upload_batch) {

@@ -489,6 +489,36 @@ public:
 		return clamped_size;
 	}
 
+	// Like ClampRangeSize, but holes do not end the range: it reaches the end of the last committed
+	// mapping inside [virtual_addr, virtual_addr + size). Still 0 when the base is not committed.
+	uint64_t ClampSparseRangeSize(uint64_t virtual_addr, uint64_t size) {
+		Common::LockGuard lock(m_mutex);
+
+		if (virtual_addr == 0 || size == 0 || size > UINT64_MAX - virtual_addr) {
+			return 0;
+		}
+
+		auto vma = std::upper_bound(
+		    m_ranges.begin(), m_ranges.end(), virtual_addr,
+		    [](uint64_t value, const Range& range) { return value < range.start; });
+		if (vma == m_ranges.begin()) {
+			return 0;
+		}
+		--vma;
+		if (virtual_addr >= End(vma->start, vma->size) || !IsCommittedRangeType(vma->type)) {
+			return 0;
+		}
+
+		const auto end          = virtual_addr + size;
+		uint64_t   last_covered = End(vma->start, vma->size);
+		for (++vma; vma != m_ranges.end() && vma->start < end; ++vma) {
+			if (IsCommittedRangeType(vma->type)) {
+				last_covered = End(vma->start, vma->size);
+			}
+		}
+		return std::min(last_covered, end) - virtual_addr;
+	}
+
 	// The range covering an address plus its two neighbours. "here=none" with a populated
 	// "prev"/"next" is an address the game never mapped; one it mapped and released leaves a
 	// reservation behind.
@@ -1010,6 +1040,11 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		     vaddr, size, clamped_size, repeat);
 	}
 	return clamped_size;
+}
+
+uint64_t ClampSparseRangeSize(uint64_t vaddr, uint64_t size) {
+	EXIT_IF(g_virtual_ranges == nullptr);
+	return g_virtual_ranges->ClampSparseRangeSize(vaddr, size);
 }
 
 bool QueryCommittedRange(uint64_t vaddr, uint64_t* start, uint64_t* size) {

@@ -15915,6 +15915,140 @@ public:
     std::printf("[gpu]     %-32s ok\n", name);
   }
 
+  // RESIDENT EVIL 4 streams a material table into a 32 MB descriptor page by page, so the bound
+  // range has holes; records past the first hole must still reach the shader.
+  void CheckSparseBufferBinding() {
+    constexpr const char *name = "SparseBufferBinding";
+    constexpr uintptr_t source = 0x0000000213000000ull;
+    constexpr uintptr_t destination = 0x0000000213100000ull;
+    constexpr uint64_t page = 0x10000;
+    constexpr uint64_t span = page * 3;
+    constexpr uint32_t first_bits = 0x11111111u;
+    constexpr uint32_t last_bits = 0x33333333u;
+    constexpr uint32_t late_bits = 0x22222222u;
+    constexpr uint32_t destination_fill = 0x0badf00du;
+    EnsureRuntimeContext();
+
+    // v1 = WorkGroupID.x * 64 + lane; copy that DWORD record from s[4:7] to s[0:3].
+    static const auto copy_shader = [] {
+      std::vector<u32> code;
+      AppendVop3(&code, 0x346u, 1, 8, InlineU32(6), Vgpr(0));
+      code.push_back(EncodeMubuf0(0x0cu, 0, true, false));
+      code.push_back(EncodeMubuf1(2, 1, 1));
+      code.push_back(EncodeSopp(0x0c, 0));
+      code.push_back(EncodeMubuf0(0x1cu, 0, true, false));
+      code.push_back(EncodeMubuf1(2, 0, 1));
+      AppendEnd(&code);
+      return code;
+    }();
+    ShaderMapUserData(reinterpret_cast<uint64_t>(copy_shader.data()),
+        {.type = Prospero::ShaderBinaryType::kCs,
+         .code_size_bytes = static_cast<uint32_t>(copy_shader.size() * sizeof(u32))});
+
+    int64_t direct_offset = -1;
+    Require(name, "direct allocation",
+            Libs::LibKernel::Memory::KernelAllocateDirectMemory(
+                0, Libs::LibKernel::Memory::KernelGetDirectMemorySize(), span * 2, page, 0,
+                &direct_offset) == 0,
+            "allocation failed");
+    const auto map = [&](uintptr_t address, uint64_t size, int64_t offset, const char *check) {
+      void *mapped = reinterpret_cast<void *>(address);
+      Require(name, check,
+              Libs::LibKernel::Memory::KernelMapDirectMemory(&mapped, size, 0x3, 0x10, offset,
+                                                             page) == 0 &&
+                  mapped == reinterpret_cast<void *>(address),
+              "mapping failed");
+      return static_cast<uint32_t *>(mapped);
+    };
+    // The streamer maps into its own reservation, so a page it fills later lands on reserved
+    // address space rather than replacing a mapping.
+    void *reserved = reinterpret_cast<void *>(source);
+    Require(name, "reservation",
+            Libs::LibKernel::Memory::KernelReserveVirtualRange(&reserved, span, 0x10, page) == 0 &&
+                reserved == reinterpret_cast<void *>(source),
+            "reserving the streamed span failed");
+    // Only the first and last pages are resident; the middle one is a hole.
+    std::fill_n(map(source, page, direct_offset, "first page"), page / sizeof(uint32_t),
+                first_bits);
+    std::fill_n(map(source + page * 2, page, direct_offset + page * 2, "last page"),
+                page / sizeof(uint32_t), last_bits);
+    (void)map(destination, span, direct_offset + span, "destination");
+
+    RenderContext context(m_runtime_context);
+    context.InitializeGpu(nullptr);
+    LibKernel::Memory::InstallGpuResources(&context);
+    context.GetGpu().SendCommandSync([&] {
+      CommandProcessor processor(context, 0);
+      processor.BufferInit();
+      auto &cache = context.GetBufferCache();
+      auto &shaders = processor.GetShCtx();
+      context.MapMemory(source, page);
+      context.MapMemory(source + page * 2, page);
+      context.MapMemory(destination, span);
+
+      const auto set_buffer = [&](u32 sgpr, uint64_t address, uint64_t bytes) {
+        ShaderBufferResource descriptor{};
+        descriptor.UpdateAddress48(address);
+        descriptor.fields[1] |= static_cast<u32>(sizeof(uint32_t)) << 16u;
+        descriptor.fields[2] = static_cast<u32>(bytes / sizeof(uint32_t));
+        descriptor.fields[3] = DstSel(4, 5, 6, 7) |
+            (static_cast<u32>(Prospero::BufferFormat::k32UInt) << 12u);
+        for (u32 i = 0; i < 4; i++) {
+          shaders.SetCsUserSgpr(sgpr + i, descriptor.fields[i], HW::UserSgprType::Unknown);
+        }
+      };
+      const auto run_copy = [&] {
+        cache.FillBuffer(destination, span, destination_fill, false);
+        shaders.SetCsShader({.data_addr = reinterpret_cast<uint64_t>(copy_shader.data()),
+                             .num_thread_x = 64, .num_thread_y = 1, .num_thread_z = 1,
+                             .wave_size = 64, .user_sgpr = 8, .tgid_x_en = true});
+        set_buffer(0, destination, span);
+        set_buffer(4, source, span);
+        processor.DispatchDirect(static_cast<u32>(span / (64u * sizeof(uint32_t))), 1, 1, 0x41u);
+        cache.ReadMemory(destination, span);
+        std::vector<uint32_t> words(span / sizeof(uint32_t));
+        Require(name, "destination readback",
+                LibKernel::Memory::TryReadBacking(destination, words.data(), span),
+                "the copied records could not be read back");
+        return words;
+      };
+      const auto expect_page = [&](const std::vector<uint32_t> &words, uint64_t index,
+                                   uint32_t bits, const char *check) {
+        const auto first = words.begin() + static_cast<ptrdiff_t>(index * page / sizeof(uint32_t));
+        const auto matching = std::count(first, first + page / sizeof(uint32_t), bits);
+        Require(name, check, matching == static_cast<ptrdiff_t>(page / sizeof(uint32_t)),
+                std::to_string(matching) + " of " + std::to_string(page / sizeof(uint32_t)) +
+                    " records hold the expected value");
+      };
+
+      const auto sparse = run_copy();
+      expect_page(sparse, 0, first_bits, "first page");
+      expect_page(sparse, 1, 0u, "hole reads zero");
+      expect_page(sparse, 2, last_bits, "page past the hole");
+      Require(name, "hole stays clean", !cache.IsRegionCpuModified(source + page, page),
+              "the unmapped hole is re-uploaded on every bind");
+
+      // The streamer fills the hole later; mapping it is what tells the cache to re-read it.
+      std::fill_n(map(source + page, page, direct_offset + page, "late page"),
+                  page / sizeof(uint32_t), late_bits);
+      const auto filled = run_copy();
+      expect_page(filled, 1, late_bits, "late page reaches the shader");
+      expect_page(filled, 2, last_bits, "page past the late page");
+
+      context.UnmapMemory(source, span);
+      context.UnmapMemory(destination, span);
+      context.GetCommandScheduler().Finish();
+    });
+    LibKernel::Memory::InstallGpuResources(nullptr);
+    context.ShutdownGpu();
+    Require(name, "release",
+            Libs::LibKernel::Memory::KernelMunmap(source, span) == 0 &&
+                Libs::LibKernel::Memory::KernelMunmap(destination, span) == 0 &&
+                Libs::LibKernel::Memory::KernelReleaseDirectMemory(direct_offset, span * 2) == 0,
+            "backing release failed");
+    std::printf("[gpu]     %-32s ok\n", name);
+  }
+
   // A narrow read at the address of a wider surface with the same pitch gets its own image
   // holding the shared corner; `buffer_written_first` lands a buffer write before the render.
   void CheckLayoutAliasNarrowWidth(bool buffer_written_first = false) {
@@ -55944,6 +56078,7 @@ int main(int argc, char **argv) {
   if (argc == 2 && std::strcmp(argv[1], "--layout-alias-only") == 0) {
     VulkanHarness vulkan;
     vulkan.CheckLayoutAliasSync();
+    vulkan.CheckSparseBufferBinding();
     return 0;
   }
   if (argc == 2 && std::strcmp(argv[1], "--layout-alias-narrow-only") == 0) {
