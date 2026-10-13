@@ -2888,7 +2888,9 @@ private:
 					return false;
 				}
 				indirect.material_source = InternSource(material_source);
-				indirect.bindless = BindlessImageHeapsEnabled() && indirect.selector_shift == 0u;
+				// The heap is indexed by the key the shader computes, however it unpacks the
+				// material word; the shift and mask only shape the host enumeration.
+				indirect.bindless = BindlessImageHeapsEnabled();
 				return true;
 			};
 			const auto unmatched = indirect;
@@ -2897,13 +2899,17 @@ private:
 				// records directly, so their numeric classes may differ; an access it cannot serve
 				// falls back to the host enumerating the guarded scalar loop.
 				plan.reads.fill(nullptr);
-				indirect.bindless = BindlessImageHeapsEnabled() && indirect.selector_shift == 0u;
+				indirect.bindless = BindlessImageHeapsEnabled();
 			} else if (!match_material()) {
 				indirect        = unmatched;
 				material_source = {};
 			}
-			if (indirect.material_source == UINT32_MAX &&
-			    !MatchUniformizedBufferKey(key, handle, indirect, material_source)) {
+			const bool uniformized_key =
+			    indirect.material_source == UINT32_MAX &&
+			    MatchUniformizedBufferKey(key, handle, indirect, material_source);
+			if (uniformized_key) {
+				indirect.bindless = BindlessImageHeapsEnabled();
+			} else if (indirect.material_source == UINT32_MAX) {
 				const auto* shift = plan.reads[0]->Arg(1).Resolve().TryInstruction();
 				if (!BindlessImageHeapsEnabled() || shift == nullptr ||
 				    !UsedOnlyByReadsAndArithmetic(*shift, plan.reads)) {
