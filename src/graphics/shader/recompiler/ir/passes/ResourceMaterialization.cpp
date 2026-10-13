@@ -3114,6 +3114,11 @@ bool MaterializeInto(const ResourcePlan& program, const SrtRuntime& runtime,
 			entry.srt_offset = static_cast<uint32_t>(slot);
 			entry.stride     = indirect.heap_stride;
 			if (indirect.indexed_heap) {
+				// A vector load through a V# with format 0 reads zero, so every key of a disabled
+				// heap is null; the zeroed slot count already selects the null arm.
+				if (((table.dwords[3] >> 12u) & 0x7fu) == 0u) {
+					continue;
+				}
 				// A swizzled or ADD_TID heap has no flat record step.
 				const auto stride  = (table.dwords[1] >> 16u) & 0x3fffu;
 				const bool swizzle = ((table.dwords[1] >> 31u) & 1u) != 0u;

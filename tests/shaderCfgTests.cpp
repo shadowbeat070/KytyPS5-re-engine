@@ -7886,12 +7886,13 @@ void TestWaterfallBindlessImageRecord() {
   std::vector<uint32_t> output(64u);
   const auto heap_address = reinterpret_cast<uint64_t>(heap_words.data());
   const auto output_address = reinterpret_cast<uint64_t>(output.data());
-  const auto heap_v = [&](uint32_t stride, bool swizzle) {
+  const auto heap_v = [&](uint32_t stride, bool swizzle,
+                          Prospero::BufferFormat format = Prospero::BufferFormat::k32Float) {
     return std::array<uint32_t, 4>{
         static_cast<uint32_t>(heap_address),
         static_cast<uint32_t>((heap_address >> 32u) & 0xffffu) | (stride << 16u) |
             (swizzle ? 1u << 31u : 0u),
-        64u, 3u << 28u};
+        64u, (3u << 28u) | (static_cast<uint32_t>(format) << 12u)};
   };
 
   for (const auto &shape : shapes) {
@@ -8006,6 +8007,15 @@ void TestWaterfallBindlessImageRecord() {
           (name + ": a strideless indexed heap was served").c_str());
     Check(!materialize(heap_v(48u, true), refused_snapshot),
           (name + ": a swizzled indexed heap was served").c_str());
+    // A vector load through a format-0 V# reads zero, so a disabled heap serves null for every key,
+    // whatever its stride.
+    for (const uint32_t stride : {48u, 0u}) {
+      ResourceSnapshot disabled_snapshot;
+      Check(materialize(heap_v(stride, false, Prospero::BufferFormat::kInvalid),
+                        disabled_snapshot) &&
+                disabled_snapshot.bindless_tables.empty(),
+            (name + ": a format-0 indexed heap was sampled or refused").c_str());
+    }
     set_heap(heap_v(48u, false));
 
     const auto result = RecompileForTest(code, options);
