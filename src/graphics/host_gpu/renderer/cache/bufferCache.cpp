@@ -127,22 +127,50 @@ bool ReadGuestForUpload(uint64_t vaddr, void* destination, uint64_t size) {
 	return false;
 }
 
-// Bytes that could not be read stay dirty so the next upload retries them, except where nothing
-// is mapped: those uploaded as zeros, and mapping them later invalidates the range anyway.
-template <typename Mark>
-void RetryCommittedBytes(uint64_t vaddr, uint64_t size, Mark&& mark) {
+// Splits a range into its committed mappings and the unmapped holes between them. Mapping a hole
+// later invalidates it like any guest mapping change, so a hole needs no state of its own.
+template <typename Committed, typename Hole>
+void ForEachCommittedPiece(uint64_t vaddr, uint64_t size, Committed&& committed, Hole&& hole) {
 	constexpr uint64_t GuestPageSize = 0x4000;
 	const auto         end           = vaddr + size;
+	uint64_t           hole_begin    = 0;
+	bool               in_hole       = false;
 	for (auto current = vaddr; current < end;) {
 		uint64_t start = 0, bytes = 0;
 		if (Libs::LibKernel::Memory::QueryCommittedRange(current, &start, &bytes)) {
+			if (in_hole) {
+				hole(hole_begin, current - hole_begin);
+				in_hole = false;
+			}
 			const auto piece_end = std::min(end, start + bytes);
-			mark(current, piece_end - current);
+			committed(current, piece_end - current);
 			current = piece_end;
 		} else {
+			if (!in_hole) {
+				hole_begin = current;
+				in_hole    = true;
+			}
 			current = std::min(end, Common::AlignDown(current, GuestPageSize) + GuestPageSize);
 		}
 	}
+	if (in_hole) {
+		hole(hole_begin, end - hole_begin);
+	}
+}
+
+// True when the range starts in a committed mapping and runs into an unmapped hole. A range whose
+// base is not committed is left to the plain path.
+bool HasUnmappedHole(uint64_t vaddr, uint64_t size) {
+	uint64_t start = 0, bytes = 0;
+	if (!Libs::LibKernel::Memory::QueryCommittedRange(vaddr, &start, &bytes)) {
+		return false;
+	}
+	for (auto current = start + bytes; current < vaddr + size; current = start + bytes) {
+		if (!Libs::LibKernel::Memory::QueryCommittedRange(current, &start, &bytes)) {
+			return true;
+		}
+	}
+	return false;
 }
 
 } // namespace
@@ -1195,9 +1223,13 @@ bool BufferCache::SynchronizeBuffer(Buffer& buffer, uint64_t vaddr, uint64_t siz
 	    [&]() noexcept { source = UploadCopies(buffer, copies, total_size, unbacked); });
 	if (!is_written) {
 		for (const auto& [address, bytes]: unbacked) {
-			RetryCommittedBytes(address, bytes, [this](uint64_t piece, uint64_t piece_size) {
-				m_memory_tracker.MarkRegionAsCpuModified(piece, piece_size);
-			});
+			// Unreadable committed bytes retry on the next upload; holes keep their zeros.
+			ForEachCommittedPiece(
+			    address, bytes,
+			    [this](uint64_t piece, uint64_t piece_size) {
+				    m_memory_tracker.MarkRegionAsCpuModified(piece, piece_size);
+			    },
+			    [](uint64_t, uint64_t) {});
 		}
 	}
 	if (source && m_upload_batch) {
@@ -1294,23 +1326,42 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	}
 	auto& buffer = m_slot_buffers[id];
 	TouchBuffer(buffer);
-	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, raw_image_read);
-	if (is_written) {
-		const bool precise = CanTrackPreciseWrite(buffer, vaddr, size);
+	const auto record_write = [&](uint64_t address, uint64_t bytes) {
+		const bool precise = CanTrackPreciseWrite(buffer, address, bytes);
 		RangeSet   before;
 		if (precise) {
-			m_gpu_modified_ranges.ForEachInRange(
-			    vaddr, size, [&](uint64_t begin, uint64_t end) { before.Add(begin, end - begin); });
+			m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t begin, uint64_t end) {
+				before.Add(begin, end - begin);
+			});
 		}
-		m_gpu_modified_ranges.Add(vaddr, size);
+		m_gpu_modified_ranges.Add(address, bytes);
 		m_precise_marking = precise;
-		MarkGpuWrite(vaddr, size);
+		MarkGpuWrite(address, bytes);
 		m_precise_marking = false;
-		NoteHotWrite(vaddr, size);
-		ForgetClassifiedMetadata(vaddr, size);
+		NoteHotWrite(address, bytes);
+		ForgetClassifiedMetadata(address, bytes);
 		if (precise) {
-			TrackPreciseWrite(buffer, vaddr, size, std::move(before));
+			TrackPreciseWrite(buffer, address, bytes, std::move(before));
 		}
+	};
+	if (is_written && HasUnmappedHole(vaddr, size)) {
+		// A GPU write to an unmapped page is lost on the console. The holes only take zeros in,
+		// so nothing the shader leaves there is ever written back.
+		ForEachCommittedPiece(
+		    vaddr, size,
+		    [&](uint64_t address, uint64_t bytes) {
+			    (void)SynchronizeBuffer(buffer, address, bytes, true, is_texel_buffer,
+			                            raw_image_read);
+			    record_write(address, bytes);
+		    },
+		    [&](uint64_t address, uint64_t bytes) {
+			    (void)SynchronizeBuffer(buffer, address, bytes, false, false, false);
+		    });
+		return {&buffer, buffer.Offset(vaddr)};
+	}
+	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer, raw_image_read);
+	if (is_written) {
+		record_write(vaddr, size);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
