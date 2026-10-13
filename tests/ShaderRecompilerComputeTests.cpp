@@ -49757,6 +49757,19 @@ void CheckMaskedPatchOrdinalTessellation() {
   Require("MaskedPatchOrdinalTessellation", "decoded interface",
           tess.ls_stride == 60 && tess.hs_stride == 64,
           "a byte-masked patch ordinal must not hide the control point stride");
+  ShaderVertexInputInfo vertex;
+  vertex.logical_stage = ShaderType::TessellationControl;
+  vertex.tess = tess;
+  CompileOptions options;
+  options.stage = ShaderType::TessellationControl;
+  options.input_info.vertex = &vertex;
+  auto translated = TranslateProgram(control, options);
+  Require("MaskedPatchOrdinalTessellation", "translation", translated.status.ok,
+          translated.status.reason.c_str());
+  auto result = CompileProgram(std::move(translated), options, {});
+  Require("MaskedPatchOrdinalTessellation", "factor stores", result.status.ok,
+          result.status.reason.c_str());
+  ValidateSpirv("MaskedPatchOrdinalTessellation", result.spirv);
 }
 
 void CheckTessellationPrograms() {
