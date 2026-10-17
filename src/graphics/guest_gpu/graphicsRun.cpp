@@ -441,8 +441,15 @@ void GuestGpu::Enqueue(Submission submission) {
 void GuestGpu::WaitForIdle() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	Common::LockGuard lock(m_queue_mutex);
-	while (m_processing || !m_commands.empty() || m_submission_count != 0) {
+	while (m_processing || m_merge_pending.load(std::memory_order_acquire) || !m_commands.empty() ||
+	       m_submission_count != 0) {
 		m_idle.Wait(&m_queue_mutex);
+	}
+}
+
+void GuestGpu::FlushMergedSubmissions() {
+	if (m_merge_pending.exchange(false, std::memory_order_acq_rel)) {
+		m_renderer.GetCommandScheduler().Flush();
 	}
 }
 
@@ -484,6 +491,14 @@ void GuestGpu::ThreadRun(void* data) {
 		{
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			while (gpu->m_commands.empty() && gpu->m_submission_count == 0 && !gpu->m_stopping) {
+				if (gpu->m_merge_pending.load(std::memory_order_acquire)) {
+					gpu->m_queue_mutex.Unlock();
+					gpu->FlushMergedSubmissions();
+					gpu->m_queue_mutex.Lock();
+					gpu->m_processing = false;
+					gpu->m_idle.SignalAll();
+					continue;
+				}
 				gpu->m_processing = false;
 				gpu->m_idle.Signal();
 				gpu->m_work_available.Wait(&gpu->m_queue_mutex);
@@ -507,6 +522,12 @@ void GuestGpu::ThreadRun(void* data) {
 					}
 				}
 				if (selected_queue < 0) {
+					if (gpu->m_merge_pending.load(std::memory_order_acquire)) {
+						gpu->m_queue_mutex.Unlock();
+						gpu->FlushMergedSubmissions();
+						gpu->m_queue_mutex.Lock();
+						continue;
+					}
 					gpu->m_processing = false;
 					// A wake that came before this wait must not be lost.
 					if (!std::exchange(gpu->m_wake_pending, false) &&
@@ -533,6 +554,7 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 		if (should_stop) {
 			gpu->m_gfx_cp->BufferWait();
+			gpu->m_merge_pending.store(false, std::memory_order_release);
 			g_gpu_state  = nullptr;
 			g_gpu_thread = false;
 			return;
@@ -544,7 +566,8 @@ void GuestGpu::ThreadRun(void* data) {
 
 			Common::LockGuard lock(gpu->m_queue_mutex);
 			gpu->m_processing = false;
-			if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+			if (gpu->m_commands.empty() && gpu->m_submission_count == 0 &&
+			    !gpu->m_merge_pending.load(std::memory_order_acquire)) {
 				gpu->m_idle.SignalAll();
 			}
 			continue;
@@ -566,7 +589,8 @@ void GuestGpu::ThreadRun(void* data) {
 			}
 		}
 		gpu->m_processing = false;
-		if (gpu->m_commands.empty() && gpu->m_submission_count == 0) {
+		if (gpu->m_commands.empty() && gpu->m_submission_count == 0 &&
+		    !gpu->m_merge_pending.load(std::memory_order_acquire)) {
 			gpu->m_idle.SignalAll();
 		}
 	}
@@ -612,9 +636,13 @@ bool GuestGpu::Process(Submission& submission) {
 				}
 			}
 			if (progressed) {
-				cp.BufferFlush();
 				if (complete) {
 					m_renderer.RunGarbageCollector();
+				}
+				if (complete) {
+					m_merge_pending.store(true, std::memory_order_release);
+				} else {
+					cp.BufferFlush();
 				}
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
@@ -638,9 +666,13 @@ bool GuestGpu::Process(Submission& submission) {
 			complete = cp.Process(submission.command_execution, submission.commands) ==
 			           Pm4ProcessResult::Complete;
 			if (submission.command_execution.MadeProgress()) {
-				cp.BufferFlush();
 				if (complete) {
 					m_renderer.RunGarbageCollector();
+				}
+				if (complete) {
+					m_merge_pending.store(true, std::memory_order_release);
+				} else {
+					cp.BufferFlush();
 				}
 			} else if (complete) {
 				m_renderer.RunGarbageCollector();
